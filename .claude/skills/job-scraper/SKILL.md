@@ -105,7 +105,7 @@ site for the role and store that URL instead, or drop the candidate rather than 
 fragment link.
 
 For every candidate:
-- Skip if the URL or company+title combo already exists in `seen_jobs.json`
+- Skip if the job's canonical key (see Step 4) already exists in `seen_jobs.json`
 - Skip if the company+role already appears in `job_search_tracker.csv`
 
 ### Step 2.5: Mass-Posting Detection (within this run)
@@ -130,10 +130,10 @@ For each new job, do a rapid fit check (NOT the full evaluation from `04-job-eva
 ```json
 {
   "seen": {
-    "<url_or_company_title_key>": {
+    "url:linkedin:4000000000": {
       "title": "...",
       "company": "...",
-      "url": "...",
+      "url": "https://hu.linkedin.com/jobs/view/role-at-company-4000000000",
       "first_seen": "YYYY-MM-DD",
       "fit": "high/medium/low",
       "status": "new/skipped/ranked/expired",
@@ -142,6 +142,22 @@ For each new job, do a rapid fit check (NOT the full evaluation from `04-job-eva
   }
 }
 ```
+
+**Keys are canonical, not raw URLs.** The daily pipeline's `scripts/aggregate_jobs.py`
+derives them and publishes each one as a `dedup_key` field on the job it emits; reuse
+that value verbatim rather than re-deriving it. Three forms exist:
+
+| Form | When |
+|---|---|
+| `url:linkedin:<jobId>` | A LinkedIn posting. Collapses the country subdomains (`hu.`, `de.`, `nl.`), varying slug text, and tracking parameters that otherwise make one job look like five. |
+| `url:<url-without-query-string>` | Any other posting with a URL. |
+| `ct:<company>\|<title>` | Lowercased fallback for a job with no URL. |
+
+**Always store the `url` field too.** A canonical key is not fetchable, so the URL is
+the only thing `/rank` can link (`.claude/commands/rank.md:126`) and the only thing the
+Step 4.75 health check can read a domain from. History migrated by
+`scripts/migrate_seen_jobs.py` (one-time, idempotent) has this field backfilled from
+the old raw-URL keys.
 
 The `portal` field records which CLI skill produced the job (results are already tagged per portal in Step 1b - persist that tag here). Entries written before this field existed lack it; the health check (Step 4.75) attributes those by matching the URL's domain against each portal's base URL, so do not backfill.
 

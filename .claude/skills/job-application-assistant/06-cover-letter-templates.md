@@ -4,6 +4,21 @@ framework_version: 1.0.1
 
 # Cover Letter Templates and Tailoring Guide
 
+<!-- BEGIN ACTIVE-TEMPLATE (managed by /add-template - do not edit by hand) -->
+> **Active template override: `minimal-onepage`**
+>
+> A custom template is active. Where this block conflicts with the stock guidance below, this block wins. Structural advice below (tailoring, tone, one-page budget, no em-dashes) still applies.
+>
+> - **Template skeleton:** `templates/cover_letters/minimal-onepage/template.tex` — use this as the structural reference instead of the stock `cover.cls` letter
+> - **Manifest:** `templates/cover_letters/minimal-onepage/TEMPLATE.md` — read this for style rules and known pitfalls before drafting
+> - **Source extension:** `.tex`
+> - **Compile command:** `lualatex -interaction=nonstopmode <file>.tex` (NOT xelatex/cover.cls — this template is self-contained and does not use `cover.cls`)
+> - **Fonts:** Lato via the `lato` LaTeX package (system/distribution font — must be installed; no bundled fonts, no `OpenFonts/` dependency, nothing to copy into `cover_letters/`)
+> - **Page limit:** exactly **1 page**
+> - **Output file:** `cover_letters/cover_<company>_<role>.tex`; all packages are standard, so no class/font files need copying into the output directory
+> - **Fill rules:** replace the `[PLACEHOLDER]` tokens; top-left sender block (location, email, date); `Dear [Name],` when the posting names a person else `Dear Hiring Manager,`; 3–5 short block paragraphs (~250–320 words) separated by blank lines (do NOT add manual `\\` between paragraphs — `parskip` handles spacing); no bullet lists, no decorative header; name **Claude Code** for any AI-tooling reference; no em-dashes. The stock `cover.cls` `\lettercontent{}`/itemize pitfall does NOT apply here (there is no `\lettercontent`). **Signature closing** must use `Sincerely,\\[2pt]` followed by the name — never `\\[10pt]`, which creates an unwanted ~10pt gap between "Sincerely," and the printed name.
+<!-- END ACTIVE-TEMPLATE -->
+
 ## Template: Custom cover.cls (XeLaTeX)
 
 Cover letters use a custom LaTeX document class (`cover.cls`) with Lato/Raleway fonts.
@@ -168,6 +183,7 @@ The font wrapper is mandatory — if you just move `\begin{itemize}` outside `\l
 - [ ] Language matches the job posting language
 - [ ] Salutation is appropriate (named person if possible)
 - [ ] Headline is engaging and specific, not generic
+- [ ] **Signature closing**: `Sincerely,\\[2pt]` with name on the next line — no `\\[10pt]` gap between closing and name
 
 ## Submission Guidelines (Best Practice)
 - Submit only the documents the employer requests

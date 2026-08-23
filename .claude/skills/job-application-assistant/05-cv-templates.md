@@ -4,6 +4,22 @@ framework_version: 1.4.0
 
 # CV Templates and Tailoring Guide
 
+<!-- BEGIN ACTIVE-TEMPLATE (managed by /add-template - do not edit by hand) -->
+> **Active template override: `onepage-ats`**
+>
+> A custom template is active. Where this block conflicts with the stock guidance below, this block wins. Structural advice below (tailoring, page-budget, cutting rules) still applies.
+>
+> - **Template skeleton:** `templates/cv/onepage-ats/template.tex` — use this as the structural reference instead of the stock moderncv template
+> - **Manifest:** `templates/cv/onepage-ats/TEMPLATE.md` — read this for style rules and known pitfalls before drafting
+> - **Source extension:** `.tex`
+> - **Compile command:** `lualatex -interaction=nonstopmode <file>.tex` (this is already the stock CV engine, so nothing changes on that front; the *layout* is the one-page single-column resume, not moderncv)
+> - **Fonts:** Lato via the `lato` LaTeX package (system/distribution font — must be installed with the TeX distribution; no bundled font files, no font-path juggling, so nothing needs copying into `cv/`)
+> - **Page limit:** exactly **1 page** (this overrides the stock "exactly 2 pages" rule everywhere below and in the CLAUDE.md checklist)
+> - **Output file:** `cv/main_<company>_<role>.tex`; all packages it uses are standard, so no class/package/font files need copying into the output directory
+> - **Real-data reference:** `cv/main_example_onepage.tex` is the filled master in this format (compiles to one page, ATS-clean); read it for a concrete example of the macros in use. `cv/main_example.tex` (moderncv) remains a **fact source only** — read it for facts, never for layout while this template is active.
+> - **Fill rules:** replace the `[PLACEHOLDER]` tokens; keep the single column (never add a second column or sidebar — it breaks ATS reading order); print email/phone as literal text (never icon-only); use `--` for date ranges and never an em-dash; trim to one page with relevance-weighted cutting (drop the least posting-relevant bullets first), never by shrinking geometry or font. Do not include a separate AWARDS & CERTIFICATIONS section; certifications belong under EDUCATION via `\skillgroup{Certifications}{...}` as in the Sample CV (`cv/Sample CV/main.tex`).
+<!-- END ACTIVE-TEMPLATE -->
+
 <!-- SETUP: Profile statements and section ordering are personalized by running /setup -->
 
 ## Template: LaTeX moderncv (Banking Style)
@@ -20,7 +36,7 @@ All CVs use the moderncv LaTeX package with the "banking" style and "blue" color
 cd cv && lualatex -interaction=nonstopmode main_<company>_<role>.tex
 ```
 
-Expected output: `Output written on main_<company>_<role>.pdf (2 pages, ...)`. Any page count other than 2 is a failure that must be fixed before presenting to the user.
+Expected output: `Output written on main_<company>_<role>.pdf (1 page, ...)`. Any page count other than 1 is a failure that must be fixed before presenting to the user.
 
 ## Document Structure
 
@@ -64,8 +80,7 @@ Expected output: `Output written on main_<company>_<role>.pdf (2 pages, ...)`. A
 % 3. Education section
 % 4. Professional Experience section
 % 5. Selected Publications (if applicable)
-% 6. Honors and Awards (if applicable)
-% 7. References
+% 6. References (on one-page CV, no separate references section; add "References available upon request" under Languages if needed)
 
 \end{document}
 ```
@@ -102,7 +117,7 @@ Two related patterns are fine and should be kept:
 
 ### Section headings must match the CV's language (important)
 
-Section headings such as `\section{Core Competencies}`, `Professional Experience`, `Education`, `Languages`, `Publications`, `Honors and Awards`, `References` (and any others your template defines), plus the `Available upon request.` line under References, are all **literal English text baked into the template** - they do not translate themselves. Whenever the CV language (see `CV language` in the candidate profile) is not English, translate every one of these too, whatever they are, not just the body prose - a CV with a fully localized profile statement and bullets sitting under untouched English section headers reads as sloppy and inconsistent, and it's an easy thing to forget precisely because the prose translation is the obvious, visible part of the job. Worked example for Spanish: `Competencias Clave`, `Experiencia Profesional`, `Educaci\'on`, `Idiomas`, `Publicaciones`, `Distinciones y Premios`, `Referencias`, `Disponibles a solicitud.` The same rule applies for any other target language - check this explicitly during the verification pass.
+Section headings such as `\section{Core Competencies}`, `Professional Experience`, `Education`, `Languages`, `Publications`, `References` (and any others your template defines), plus the `Available upon request.` line under References, are all **literal English text baked into the template** - they do not translate themselves. Whenever the CV language (see `CV language` in the candidate profile) is not English, translate every one of these too, whatever they are, not just the body prose - a CV with a fully localized profile statement and bullets sitting under untouched English section headers reads as sloppy and inconsistent, and it's an easy thing to forget precisely because the prose translation is the obvious, visible part of the job. Worked example for Spanish: `Competencias Clave`, `Experiencia Profesional`, `Educaci\'on`, `Idiomas`, `Publicaciones`, `Referencias`, `Disponibles a solicitud.` The same rule applies for any other target language - check this explicitly during the verification pass. Note: the active `onepage-ats` template uses `\cvsection{...}` headings instead of `\section{...}` — those must also be translated consistently.
 
 ## Section-by-Section Tailoring
 
@@ -115,12 +130,20 @@ When the role sits outside your home domain, **lead with the domain-transfer arg
 
 **Create 2-3 profile statement templates for your main role types:**
 
-<!-- SETUP: These are populated based on your background -->
-**For [YOUR_PRIMARY_ROLE_TYPE] roles:**
-> [YOUR_PROFILE_STATEMENT_TEMPLATE_1]
+<!-- Populated by /setup. These are phrasing starting points; every factual claim still comes
+from 01-candidate-profile.md, and each statement is tailored per posting before use. -->
 
-**For [YOUR_SECONDARY_ROLE_TYPE] roles:**
-> [YOUR_PROFILE_STATEMENT_TEMPLATE_2]
+**For AI / ML Engineering roles:**
+> Computer scientist and AI/ML practitioner who turns models into business impact. At Nokia, built an Azure Document Intelligence pipeline that cut manual processing effort by ~35%, fine-tuned LLMs for internal ERP-integrated use cases, and shipped ML/GenAI initiatives across supply chain and network solutions. Strong in Python (pandas, Keras), SQL, and Azure ML, with a track record of taking AI use cases from PoC to production.
+
+**For Data Science / Data Analytics / Business Intelligence roles:**
+> Data scientist and analyst with a Computer Science degree from ELTE Budapest and hands-on experience across supply chain, procurement, finance, and telecom analytics. Combines Python/SQL modeling with Power BI/DAX dashboarding to turn messy operational data into decisions, from inventory analytics across Nokia's CNS markets to ~20% procurement cost efficiency at Wizz Air.
+
+**For AI Product Management / AI Strategy / AI Automation roles:**
+> AI-focused professional who sits at the intersection of technical depth and business strategy. Led an AI squad at Nokia developing generative-AI use cases, aligning product owners, data engineering, and operations, and automated end-to-end workflows (Selenium, Power Automate, Power BI) that removed manual handoffs. Builds the right AI solutions, grounded in business context and designed to scale.
+
+**For Supply Chain / Operations Analytics roles:**
+> Analytics professional pairing supply-chain and operations domain knowledge with modern data and AI skills. Ran tender management in SAP Ariba and deep-dive inventory analytics (WIP, DOP, LSMGIT, CSMGIT), delivered ~20% procurement cost efficiency, and now leads AI/ML initiatives that make operations measurably smarter with Python, Power BI, and Azure ML.
 
 Statements labeled *[Used for: <company>_<role>]* were extracted from archived application drafts by `/setup` Path A. They are **phrasing references, never fact sources**: when drafting from one, every factual claim still comes from `01-candidate-profile.md` - a past tailored draft does not vouch for its own accuracy.
 
@@ -130,6 +153,9 @@ Reorder and emphasize based on the role. Use bold category labels.
 List **5-7 key competencies** in bullet format, tailored to the specific job. For each competency, briefly explain how it adds value to the position.
 
 Use the posting's own core term in the matching bullet's bold label when it truthfully applies - ATS and skim-reading hiring managers match literally, and "MLOps" in a heading outperforms a paraphrase like "ML Deployment".
+
+#### Bold Density Rule (important)
+When writing experience and project bullets, aim for **approximately one `\textbf{}` call per bullet** — not zero, not three. Skill-group labels (the category names before the pipe-separated list) are always bold and exempt from this rule. The rationale: a bullet with no bold keyword is invisible to both skimming readers and ATS scanners; a bullet with three bold phrases looks like noise and dilutes emphasis. One well-placed bold token per bullet gives maximum signal for minimum visual cost.
 
 ### Education
 - Always include your highest degrees
@@ -189,8 +215,7 @@ If there is a gap in your employment history:
 ### Evidence Links
 Wherever the CV names a verifiable artifact - a public project, a hackathon entry, a publication - carry its link (`\href`) so a reader can verify the claim in one click. A CV whose strongest claims are checkable reads as more credible everywhere else too.
 
-### Honors and Awards
-- Keep format brief, one line each
+**Note:** the active `onepage-ats` template does not include a separate Honors and Awards section. Certifications are embedded under EDUCATION via `\skillgroup{Certifications}{...}` (see `cv/Sample CV/main.tex`). If a posting specifically asks for awards, mention them inline within the most relevant experience bullet rather than adding a dedicated section.
 
 ### References
 - List 2-4 references with name, title, company, and contact
@@ -202,30 +227,27 @@ Wherever the CV names a verifiable artifact - a public project, a hackathon entr
 After writing the CV and before presenting to the user, always compile and visually inspect the PDF. Iterate until the layout is clean. Workflow:
 
 1. Run `lualatex -interaction=nonstopmode main_<company>_<role>.tex`
-2. Check the output page count: must be exactly 2
-3. Read the PDF via the Read tool and visually inspect both pages
-4. Check for **orphaned entries**: a `\cventry` title line must never sit alone at the bottom of page 1 with its bullets on page 2
+2. Check the output page count: must be exactly **1**
+3. Read the PDF via the Read tool and visually inspect the single page
+4. Check for **orphaned entries**: a `\cventry` title line must never sit at the bottom of the page with its bullets spilling onto a second page
 
 ### Fixing common page-break problems
 
-**Problem: entry title on page 1, bullets orphaned to page 2**
+**Problem: entry title at the bottom of the page, bullets below the margin**
 Add `\needspace{5\baselineskip}` immediately before the problematic `\cventry`:
 ```latex
 \needspace{5\baselineskip}
-\item{\cventry{YEAR--YEAR}{Role Title}{Organization}{Location}{}{...}}
+\item{\cventry{YEAR-YEAR}{Role Title}{Organization}{Location}{}{...}}
 ```
 Include `\usepackage{needspace}` in the preamble.
 
-**Caveat - use `\needspace` before entries, never before `\section` headings.** A section-level `\needspace` pushes the entire section (heading plus content) to the next page whenever the request does not fit, stranding empty space above and typically *adding* a page instead of saving one. Apply it only to the individual `\cventry` that actually orphans, and only after a compile shows the orphan.
+**Caveat - use `\needspace` before entries, never before `\cvsection` headings.** A section-level `\needspace` pushes the entire section (heading plus content) to the next page whenever the request does not fit, stranding empty space above and typically *adding* a page instead of saving one. Apply it only to the individual `\cventry` that actually orphans, and only after a compile shows the orphan.
 
-**Problem: one trailing section spills to page 3 (e.g., References alone on page 3)**
-Add `\enlargethispage{2-3\baselineskip}` before a late section (e.g., before `\section{Honors and Awards}`) to stretch page 2 by a few lines. This is the standard LaTeX rescue for near-miss overflows.
+**Problem: one trailing section spills past the bottom margin (e.g., Languages alone pushes onto a second page)**
+Add `\enlargethispage{2-3\baselineskip}` before a late section (e.g., before `\cvsection{\faLanguage}{LANGUAGES}`) to stretch the first page by a few lines. This is the standard LaTeX rescue for near-miss overflows.
 
-**Problem: 3 pages with significant content on page 3**
-Cut content — do not compress geometry or `\vspace`. See "Relevance-weighted cutting" below for the rule.
-
-**Problem: content finishes early on page 2 (feels thin)**
-Restore the highest-relevance item that was previously cut — a CV that ends mid-page 2 looks incomplete.
+**Problem: content finishes early (feels thin)**
+Restore the highest-relevance item that was previously cut — a CV that ends mid-page looks incomplete.
 
 ## ATS Parseability
 
@@ -271,7 +293,7 @@ Two independent causes, both easy to avoid:
 
 ## Page Budget - Hard 2-Page Limit
 
-The CV **must** fit on exactly 2 pages when compiled. Use these content limits as a guide:
+The CV **must** fit on exactly 1 page when compiled. Use these content limits as a guide:
 
 | Section | Max budget |
 |---------|-----------|
@@ -282,7 +304,6 @@ The CV **must** fit on exactly 2 pages when compiled. Use these content limits a
 | Older roles | 2 bullets (1 line each) |
 | Education | 2-3 entries |
 | Publications | 2-3 entries |
-| Awards | 3 entries, single line each |
 | References | "Available upon request." (single line) |
 
 **If in doubt, cut rather than squeeze.** Reducing `\vspace` or geometry scale to force-fit content makes the CV look cramped.
@@ -312,7 +333,7 @@ Cut the lowest-total-score line first, regardless of which section it sits in.
 
 - Do not mechanically cut from the bottom of a static section list without checking relevance. "Cut the oldest role first" is wrong if that role is literally about the skill the posting asks for.
 - Do not cut the one concrete example the cover letter leans on. Relevance is measured against the cover letter you wrote, not just the job posting — interviewers will have read both.
-- Do not cut to fit if the fit is borderline (2.02 pages). Prefer `\enlargethispage{2-3\baselineskip}` on a late section for near-misses; reserve content cuts for genuine overflow (content on page 3 that is more than a single trailing section).
+- Do not cut to fit if the fit is borderline (1.02 pages). Prefer `\enlargethispage{2-3\baselineskip}` on a late section for near-misses; reserve content cuts for genuine overflow (content past the bottom margin that is more than a single trailing section).
 
 ## Recommended Section Order
 
@@ -324,13 +345,12 @@ The section order varies by role type:
 3. Professional Experience (reverse chronological)
 4. Education (reverse chronological)
 5. Languages
-6. Publications & Awards
-7. References
+6. References (only if space permits; otherwise omit and state "Available upon request" inline)
 
 **For domain-specific / specialist roles:**
 1. Profile statement / elevator pitch
 2. Core competencies / Skills
 3. Education (reverse chronological) - credentials are a key qualifier
 4. Professional Experience (reverse chronological)
-5. Publications & Awards
-6. References
+5. Languages
+6. References (only if space permits)

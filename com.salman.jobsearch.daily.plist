@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.salman.jobsearch.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/salman/Projects/ai-job-search/scripts/run_daily.sh</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/salman/Projects/ai-job-search/logs/daily/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/salman/Projects/ai-job-search/logs/daily/launchd-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/salman/Projects/ai-job-search</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/salman</string>
+        <key>TZ</key>
+        <string>Europe/Budapest</string>
+
+        <!-- SKIP_DRAFT was set here on 2026-08-22 to hold documents back for one
+             run. It is gone because the flag itself is gone: Phase 3 no longer
+             drafts anything, it offers the ranked list on Telegram and starts
+             com.salman.jobsearch.selector, which drafts only what Salman picks.
+             Withholding is now the default and selecting is the opt-in, so there
+             is nothing left for the flag to withhold. -->
+
+        <!-- Set here rather than in run_daily.sh on purpose: the default is
+             RANK_TIMEOUT=1800 and editing that default is a production-path change
+             reserved until a full run has been reviewed, whereas this override is
+             scoped to the scheduled run and reverts by deleting two lines.
+             Why it is needed for 2026-08-23: today's run ranked 15 jobs in 387s
+             (25.8s each), but the alert cap now lets the final cut fill to its full
+             25, and 13 of those will carry bodies enrichment just fetched. At the
+             68s/job measured on 2026-08-19 with full bodies, 25 jobs need ~1700s
+             against a 1800s ceiling — 5% headroom, and a Phase 2 timeout produces
+             no gate verdicts at all, which is the one outcome this run exists to
+             avoid. 4800s is the figure the sandbox runner already uses. -->
+        <key>RANK_TIMEOUT</key>
+        <string>4800</string>
+    </dict>
+</dict>
+</plist>

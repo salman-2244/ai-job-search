@@ -1,0 +1,190 @@
+%% One-page ATS-friendly resume template
+%% ----------------------------------------------------------------------------
+%% Single-column, icon section headers, dot-rated languages, pipe-separated
+%% skills. Modeled on a clean modern resume; profile-agnostic ([PLACEHOLDER]
+%% tokens) so it is safe to commit and share.
+%%
+%% Compile with: lualatex -interaction=nonstopmode <file>.tex
+%%   - Uses the `lato` package (no font-path juggling; compiles from any dir).
+%%   - Uses fontawesome5 for the section/contact icons.
+%%   - pdflatex can fail on modern MiKTeX with fontawesome5 font-expansion
+%%     errors; lualatex handles it cleanly.
+%%
+%% ATS notes (why this layout is parser-safe):
+%%   - Single column => extracted reading order matches the visual order.
+%%   - Every contact detail (email, phone) is printed as LITERAL TEXT next to
+%%     its icon, never carried by the icon alone.
+%%   - Lato embeds a proper Unicode map => no (cid:*) garbage on extraction.
+%%   - Section headings are real text; the icons are decoration only.
+%% ----------------------------------------------------------------------------
+
+\documentclass[10pt,a4paper]{article}
+
+% --- Font: Lato as the default family (sans, clean, ATS-safe) ---
+\usepackage[T1]{fontenc}
+\usepackage[default]{lato}
+\renewcommand{\familydefault}{\sfdefault}
+
+% --- Layout packages ---
+\usepackage[left=1.25cm,right=1.25cm,top=0.8cm,bottom=0.8cm]{geometry}
+\usepackage{fontawesome5}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{needspace}
+\usepackage{ifthen}
+\usepackage[hidelinks]{hyperref}
+
+% --- Accent colour (affects rendering only; irrelevant to text extraction) ---
+\definecolor{accent}{HTML}{1F3B57}   % dark slate blue
+\definecolor{dim}{HTML}{555555}      % muted grey for secondary text
+\definecolor{dotoff}{HTML}{C8CDD3}   % empty language-rating dot
+
+% --- Global spacing / no page numbers ---
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\tabcolsep}{0pt}
+\linespread{0.92}   % tight but readable; adjust 0.90–1.00 to land on exactly one page
+
+% --- Hyperlink metadata ---
+\hypersetup{
+  pdftitle={[YOUR_NAME] - Resume},
+  pdfauthor={[YOUR_NAME]},
+}
+
+% ============================================================================
+%  MACROS
+% ============================================================================
+
+% Section header: icon + bold coloured title + full-width rule.
+%   \cvsection{\faIcon}{TITLE}
+\newcommand{\cvsection}[2]{%
+  \needspace{2\baselineskip}%
+  \vspace{2pt}%
+  {\color{accent}\large\bfseries #1\hspace{6pt}#2}\par
+  \vspace{-5pt}{\color{accent}\rule{\linewidth}{0.9pt}}\par
+  \vspace{2pt}%
+}
+
+% Experience / education entry header.
+%   \cventry{Role}{Organisation}{Date range}{Location}
+% "Role, Organisation" (bold role + italic org) at left, muted "date | location"
+% flush right on the SAME line. One visual line per entry instead of a
+% three-line stack, which is where a one-pager wins back vertical space for
+% actual content (~2 lines per entry).
+% \parfillskip=0pt makes this final line fully justified so \hfill absorbs all
+% the slack; without it \parfillskip steals half and the date drifts inward.
+\newcommand{\cventry}[4]{%
+  \needspace{3\baselineskip}%
+  {\parfillskip=0pt\relax
+   \textbf{#1,}\ {\itshape\color{accent}#2}\hfill
+   {\color{dim}#3 \textbar{} #4}\par}%
+  \vspace{1pt}%
+}
+
+% Tight bullet list for achievements. Bold the metrics/keywords inside.
+% Target ~1 \textbf{} call per bullet (experience + project bullets) — more
+% than that crowds the page and weakens emphasis. Skill-group labels are
+% exempt; they are always bold by design.
+\newenvironment{cvbullets}{%
+  \begin{itemize}[leftmargin=1.35em,itemsep=0.5pt,parsep=0pt,topsep=0.5pt,%
+                  label={\color{accent}\small\textbullet}]
+}{%
+  \end{itemize}%
+}
+
+% A labelled skills line: \skillgroup{Category}{item | item | item}
+\newcommand{\skillgroup}[2]{%
+  \textbf{#1:}~ #2\par\vspace{1.5pt}%
+}
+
+% Language 5-dot rating: \rating{n} draws n filled + (5-n) empty dots.
+\newcounter{ratingdot}
+\newcommand{\rating}[1]{%
+  \setcounter{ratingdot}{0}%
+  \whiledo{\value{ratingdot} < #1}{\textcolor{accent}{\scriptsize\faCircle}\,\stepcounter{ratingdot}}%
+  \whiledo{\value{ratingdot} < 5}{\textcolor{dotoff}{\scriptsize\faCircle}\,\stepcounter{ratingdot}}%
+}
+
+% One language row: \lang{Name}{filled-dots}{Text level}
+\newcommand{\lang}[3]{%
+  \makebox[3.6cm][l]{#1}\makebox[3.2cm][l]{\rating{#2}}{\color{dim}#3}\par\vspace{1pt}%
+}
+
+% ============================================================================
+%  DOCUMENT
+% ============================================================================
+\begin{document}
+
+% ---------- HEADER ----------
+{\centering
+  {\color{accent}\fontsize{24}{28}\selectfont\bfseries [YOUR_NAME]}\par
+  \vspace{2pt}
+  {\color{dim}\normalsize [YOUR_TAGLINE]}\par   % e.g. "AI/ML Engineer | Data Science"
+  \vspace{3pt}
+  {\small
+    \faEnvelope\ \href{mailto:[YOUR_EMAIL]}{[YOUR_EMAIL]} \quad
+    \faPhone*\ [YOUR_PHONE] \quad
+    \faMapMarker*\ [YOUR_LOCATION] \\[1pt]
+    \faLinkedin\ \href{[YOUR_LINKEDIN_URL]}{[YOUR_LINKEDIN_HANDLE]} \quad
+    \faGithub\ \href{[YOUR_GITHUB_URL]}{[YOUR_GITHUB_HANDLE]}
+  }\par
+}
+\vspace{2pt}
+
+% ---------- SUMMARY ----------
+\cvsection{\faUserTie}{SUMMARY}
+[YOUR_PROFILE_STATEMENT — 2-3 lines. Tailor per role: lead with the single
+strongest match to the posting, then breadth. No first-person pronoun.]
+
+% ---------- EXPERIENCE ----------
+\cvsection{\faBriefcase}{PROFESSIONAL EXPERIENCE}
+
+\cventry{[ROLE_TITLE]}{[COMPANY]}{[START] -- [END]}{[CITY, COUNTRY]}
+\begin{cvbullets}
+  \item [Achievement with a single \textbf{bolded metric/keyword} and an action verb.]
+  \item [Achievement mapped to a posting requirement.]
+  \item [Achievement showing scope / tools.]
+\end{cvbullets}
+\vspace{3pt}
+
+\cventry{[ROLE_TITLE]}{[COMPANY]}{[START] -- [END]}{[CITY, COUNTRY]}
+\begin{cvbullets}
+  \item [Achievement.]
+  \item [Achievement.]
+\end{cvbullets}
+% ... repeat \cventry + cvbullets per role. Relevance-weighted cutting keeps
+% the whole document to one page (see 05-cv-templates.md).
+% BOLD RULE: aim for ~1 \textbf{} call per experience/project bullet — more
+% crowds the page and weakens emphasis. Skill-group labels are always bold.
+
+% ---------- SKILLS ----------
+\cvsection{\faTools}{SKILLS}
+\skillgroup{[CATEGORY_1]}{[item | item | item | item]}
+\skillgroup{[CATEGORY_2]}{[item | item | item | item]}
+\skillgroup{[CATEGORY_3]}{[item | item | item | item]}
+
+% ---------- PROJECTS ----------
+\cvsection{\faLightbulb}{PROJECTS}
+\begin{cvbullets}
+  \item \textbf{[PROJECT_NAME]} ([tech stack]) -- [one-line outcome].
+  \item \textbf{[PROJECT_NAME]} ([tech stack]) -- [one-line outcome].
+\end{cvbullets}
+
+% ---------- EDUCATION ----------
+\cvsection{\faGraduationCap}{EDUCATION}
+\cventry{[DEGREE]}{[INSTITUTION]}{[START] -- [END]}{[CITY, COUNTRY]}
+{\color{dim}[One line: thesis / focus / notable coursework.]}\par
+\vspace{3pt}
+
+% ---------- LANGUAGES ----------
+\cvsection{\faLanguage}{LANGUAGES}
+\lang{[LANGUAGE]}{5}{[Native / bilingual]}
+\lang{[LANGUAGE]}{4}{[Professional working proficiency]}
+\lang{[LANGUAGE]}{2}{[Elementary (A2)]}
+
+% Certifications can be folded into EDUCATION via \skillgroup{Certifications}{...}
+% (see Sample CV/main.tex for the pattern) rather than using a separate AWARDS section.
+
+\end{document}

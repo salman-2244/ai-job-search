@@ -1,0 +1,37 @@
+{
+  "enabled": true,
+  "schedule": {
+    "hour": 8,
+    "minute": 0,
+    "timezone": "Europe/Budapest"
+  },
+  "pipeline": {
+    "max_jobs_to_apply": 5,
+    "min_score_threshold": 60,
+    "skip_portals": []
+  },
+  "email": {
+    "enabled": false,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
+    "from_name": "Job Search Pipeline",
+    "from_email": "",
+    "to_email": "",
+    "use_tls": true
+  },
+  "_imap_comment": "OPTIONAL - delete this comment and the imap block below unless you need a separate mailbox. Phase 0b (scripts/linkedin_alerts.py) reads your LinkedIn job-alert digests over IMAP and by default reuses email.smtp_user / email.smtp_password above, because one Gmail app password grants IMAP and SMTP together - so enabling alert ingestion adds no new credential. Any value left empty here falls back: user/password to the email block, host/port to alerts.imap_host / alerts.imap_port in config/search_matrix.json, then to imap.gmail.com:993. The mailbox is opened READONLY and nothing is ever labelled, marked read, moved or deleted. Which label to read, and which alert maps to which Profile Track, live in search_matrix.json's `alerts` block rather than here.",
+  "imap": {
+    "host": "",
+    "port": 993,
+    "user": "",
+    "password": ""
+  },
+  "safety": {
+    "auto_apply": false,
+    "auto_submit": false,
+    "auto_send_messages": false,
+    "require_approval_for": ["apply", "submit", "email"]
+  }
+}

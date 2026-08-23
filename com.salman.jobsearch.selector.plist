@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.salman.jobsearch.selector</string>
+
+    <!-- The decoupled half of the daily flow. com.salman.jobsearch.daily fetches,
+         ranks and gates at 08:00 and exits; this job holds the Telegram selection
+         open afterwards so the button press can land hours later.
+
+         Deliberately NOT RunAtLoad and NOT KeepAlive=true: the selector bot's
+         token allows exactly one getUpdates consumer, so a permanently polling
+         process would 409 any manual scripts/telegram_select.py run. It is
+         started on demand by run_daily.sh (launchctl kickstart) and exits by
+         itself once generation finishes or the 20h window closes.
+
+         Note that omitting RunAtLoad does NOT stop launchd starting this: the
+         KeepAlive dict below launches the job as soon as it is bootstrapped.
+         Measured, not assumed — bootstrapping an earlier version of this plist
+         started it immediately and it posted a real job list to the chat. What
+         makes a bare start harmless is the handoff marker: the listener reads
+         /tmp/jobsearch_pending_selection.json for the rankset to offer and exits
+         0 without sending anything when it is absent. Do not give this process a
+         way to guess what to offer. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/salman/Projects/ai-job-search/.venv/bin/python</string>
+        <string>/Users/salman/Projects/ai-job-search/scripts/selector_listener.py</string>
+    </array>
+
+    <!-- Restart only on abnormal exit. The listener exits 0 for nearly every
+         outcome it decides on purpose — generated, window closed, nothing to
+         offer, misconfigured, or a previous run interrupted mid-generation —
+         precisely because launchd cannot tell a deliberate nonzero exit from a
+         crash and would relaunch straight back into the same decision every 10s.
+
+         One deliberate exception, added 2026-08-23: the listener exits 1 when it
+         detects that its own polling task has died. That failure is otherwise
+         invisible — start_polling polls in a background task, so when its socket
+         died on a network transition the process stayed alive, launchd reported
+         `state = running` with `last exit code = 0`, and Salman's button taps
+         went nowhere for hours. Nonzero is the only signal KeepAlive acts on, and
+         relaunching is the right response rather than a loop, because the restart
+         does different work: it resumes.
+
+         So nonzero here means: crash, OOM kill, a network teardown that raised,
+         or a dead poller. All are cases where the picks are still on disk and
+         resuming is correct. On restart the process reloads the state file and
+         reattaches to the messages it already sent, sending only the tail it
+         never reached, so a reboot mid-selection never double-posts the list. A
+         state file marked completed makes the restarted process exit 0 at once,
+         so KeepAlive cannot regenerate documents that already exist. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- launchd's restart floor is 10s regardless; stating it makes the throttle
+         explicit rather than incidental. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/salman/Projects/ai-job-search/logs/daily/selector-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/salman/Projects/ai-job-search/logs/daily/selector-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/salman/Projects/ai-job-search</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- lualatex lives in /Library/TeX/texbin and the drafters shell out to
+             it; claude is under the nvm bin. Both must be listed because launchd
+             jobs do not inherit a login shell's PATH. -->
+        <key>PATH</key>
+        <string>/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/salman</string>
+        <key>TZ</key>
+        <string>Europe/Budapest</string>
+    </dict>
+</dict>
+</plist>

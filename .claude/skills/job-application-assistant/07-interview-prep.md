@@ -16,26 +16,36 @@ Keep answers to 1-2 minutes. Be specific. End with what you learned or would do 
 
 <!-- These are populated by /setup from your actual experience. Below are templates showing the format. -->
 
-### 1. [PROJECT_NAME] ([SKILL_DEMONSTRATED])
-**S:** [CONTEXT - what was happening, what was the problem]
-**T:** [YOUR RESPONSIBILITY - what you specifically needed to do]
-**A:** [WHAT YOU DID - specific actions, tools, methods]
-**R:** [OUTCOME - measurable results, adoption, impact]
-**Use for:** "[QUESTION_TYPE_1]", "[QUESTION_TYPE_2]"
+<!-- Populated by /setup from Salman's CV and LinkedIn. Verify the metrics against your own
+records before quoting them in an interview. -->
 
-### 2. [PROJECT_NAME] ([SKILL_DEMONSTRATED])
-**S:** [CONTEXT]
-**T:** [YOUR RESPONSIBILITY]
-**A:** [WHAT YOU DID]
-**R:** [OUTCOME]
-**Use for:** "[QUESTION_TYPE_1]", "[QUESTION_TYPE_2]"
+### 1. Azure Document Intelligence pipeline (AI automation / business impact)
+**S:** At Nokia, a legacy process relied on slow, manual document handling that cost time and money.
+**T:** As Junior Performance Manager, own an AI solution to automate it and prove the business case.
+**A:** Designed and implemented an Azure Document Intelligence pipeline, integrated it into existing workflows, and validated output quality against the manual baseline.
+**R:** ~35% increase in process efficiency plus a measurable reduction in operational cost and turnaround time.
+**Use for:** "Tell me about an AI project with real business impact", "a time you automated a manual process", "delivering measurable results"
 
-### 3. [PROJECT_NAME] ([SKILL_DEMONSTRATED])
-**S:** [CONTEXT]
-**T:** [YOUR RESPONSIBILITY]
-**A:** [WHAT YOU DID]
-**R:** [OUTCOME]
-**Use for:** "[QUESTION_TYPE_1]", "[QUESTION_TYPE_2]"
+### 2. Leading the Nokia AI squad (leadership / cross-functional)
+**S:** Nokia's Excellence & Process Management team needed to modernize key processes with generative AI, but use cases weren't yet defined.
+**T:** Lead an AI-focused squad to identify and develop viable GenAI use cases, aligning product owners, data engineering, and operations.
+**A:** Ran use-case discovery, prioritized by business value and feasibility, drove cross-functional execution, and fine-tuned LLMs / built ERP-integrated interfaces for the chosen cases.
+**R:** Shipped GenAI initiatives adopted internally; grew from trainee to Junior Performance Manager owning the portfolio.
+**Use for:** "Tell me about a time you led a team/initiative", "working across functions", "influencing without authority"
+
+### 3. Inventory analytics with Azure ML (data science / decision impact)
+**S:** Nokia needed better visibility into inventory (WIP, DOP, LSMGIT, CSMGIT) across CNS markets to support data-driven decisions.
+**T:** Build predictive/analytical models to turn raw inventory data into actionable insight.
+**A:** Trained predictive models in Azure ML Studio, engineered features from the inventory data, and surfaced results through Power BI dashboards for stakeholders.
+**R:** Delivered actionable inventory insights that fed data-driven inventory-management decisions across markets.
+**Use for:** "a data science project end-to-end", "translating analysis into decisions", "stakeholder-facing analytics"
+
+### 4. Wizz Air procurement analytics & tender management (supply chain / operations)
+**S:** As a Supply Chain & Development Trainee at Wizz Air, procurement spend and supplier selection needed sharper analytical support.
+**T:** Run tender management and supplier analytics to identify the most cost-effective bids and negotiate better terms.
+**A:** Led tenders in SAP Ariba, built analytical reports to compare bids, and negotiated contracts, prices, and timelines with suppliers.
+**R:** Achieved ~20% cost efficiency and strengthened supplier partnerships.
+**Use for:** "supply chain / operations analytics example", "a negotiation or cost-saving win", "data informing a business decision"
 
 <!-- Add more STAR examples as needed. Aim for 4-6 covering different competencies. -->
 

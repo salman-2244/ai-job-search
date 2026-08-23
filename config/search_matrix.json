@@ -1,0 +1,218 @@
+{
+  "_comment": "Query matrix for the daily job-search pipeline. Replaces the hardcoded portal queries that used to live in scripts/run_daily.sh. Track IDs and query vocabulary must stay in sync with the Profile Tracks table in .claude/skills/job-application-assistant/01-candidate-profile.md, which is the single source of truth for both discovery and Career scoring.",
+
+  "linkedin": {
+    "enabled": true,
+
+    "_volume_comment": "max_requests_per_run is a HARD STOP on this run's TOTAL LinkedIn traffic — searches plus Phase 1c detail enrichment, which hit the same host minutes apart. build_search_plan.py reserves detail_enrich_budget out of it, so the search plan is capped at max_requests_per_run - detail_enrich_budget (currently 60 - 15 = 45 searches + up to 15 details). Requests are sequential with delay_seconds between them, using the CLI's honest non-spoofed User-Agent. A 429 or block page is honored (backoff + report), never worked around. LinkedIn's public jobs-guest pages return 10 results per page and the pipeline requests one page per query.",
+    "max_requests_per_run": 60,
+    "delay_seconds": 4,
+    "jobage_days": 14,
+    "limit_per_query": 10,
+
+    "_enrich_comment": "Other portals only hand the ranker a 500-char snippet. LinkedIn's `detail` subcommand returns the full description plus seniority, so the top N cards by preliminary title match get enriched before ranking. This is why LinkedIn jobs rank better: better evidence, not a score bonus. Raising this lowers the search count one-for-one — the two share max_requests_per_run.",
+    "detail_enrich_budget": 15,
+
+    "_rotation_comment": "13 queries x 10 geos = 130 pairs, more than one day's budget. always_include_geos are queried every run (primary market); the remainder rotate on a deterministic day-index window so every pair is covered across the week without any single day exceeding the cap.",
+    "always_include_geos": ["Hungary"],
+
+    "tracks": {
+      "T1_ai_ml": {
+        "enabled": true,
+        "queries": ["AI Engineer", "Machine Learning Engineer", "Generative AI"]
+      },
+      "T2_data_bi": {
+        "enabled": true,
+        "queries": ["Data Scientist", "Data Analyst", "Business Intelligence"]
+      },
+      "T3_ai_product": {
+        "enabled": true,
+        "queries": ["AI Product Manager", "Intelligent Automation"]
+      },
+      "T4_supply_ops": {
+        "enabled": true,
+        "queries": ["Supply Chain Analytics", "Demand Planning", "Operations Analyst"]
+      },
+      "T5_process_perf": {
+        "enabled": true,
+        "queries": ["Performance Management", "Process Improvement", "Digital Transformation"]
+      }
+    },
+
+    "_geo_comment": "Country and region values work on LinkedIn's public search - verified by live probe on 2026-08-18 ('Hungary' returned Budapest/Ullo results, 'European Union' returned NL/LT results). The older cities-only guidance in job-scraper/search-queries.md was wrong. Non-Hungarian geos are FLAGged for visa sponsorship by the Eligibility Gate, not dropped.",
+    "geos": [
+      "Hungary",
+      "Germany",
+      "Netherlands",
+      "Austria",
+      "Ireland",
+      "Finland",
+      "Sweden",
+      "Switzerland",
+      "United Kingdom",
+      "European Union"
+    ]
+  },
+
+  "_alerts_comment": "Phase 0b (scripts/linkedin_alerts.py) reads Salman's own LinkedIn job-alert emails over IMAP and feeds them in as a portal, BEFORE the searches run. This is not redundant with the `linkedin` block above: the alerts use vocabulary the 13 track queries do not ('business excellence manager', 'PMO & Automation Analyst'), which is exactly why they are worth reading. Alert jobs get more attention, never automatic approval — prerank reserves alert_budget deep-rank slots for them, enrichment fetches their descriptions first (an alert card has none at all), and gate_jobs.py drafts at 60 instead of 75. The ranker still scores them on merit. Costs zero LinkedIn requests: it reads email, and rebuilds every job URL from the numeric ID rather than following a link in the message.",
+  "alerts": {
+    "enabled": true,
+
+    "_mailbox_comment": "Gmail exposes labels as IMAP mailboxes, so a nested label is spelled exactly as it reads in Gmail. Credentials are NOT here — the script reuses email.smtp_user/smtp_password from the gitignored config/automation.json, because a Gmail app password already grants IMAP and SMTP together. The session is opened readonly and never labels, marks read, moves or deletes anything. lookback_days is 3 rather than 1 so a skipped or failed run still catches up; re-reading the same digest is idempotent because first_alerted keeps the earliest sighting.",
+    "imap_host": "imap.gmail.com",
+    "imap_port": 993,
+    "label": "JobSearch/LinkedIn-Alerts",
+    "lookback_days": 3,
+
+    "_track_map_comment": "One entry per alert created in LinkedIn, spelled as LinkedIn spells it — this is how a job card gets attributed to a Profile Track, and matching on these configured names is what keeps attribution working when LinkedIn changes its email markup. A digest email carries several alerts at once ('New jobs from your other alerts'), so attribution follows the heading above each card, not the subject line. The three 'business excellence manager' alerts (Spain, Ireland, Budapest) share one name and so need one entry. An alert name missing from here still gets its jobs ingested — with no track, and a warning in the report — because a config gap should be visible, not silently drop jobs.",
+    "track_map": {
+      "supply chain and ai": "T4_supply_ops",
+      "PMO & Automation Analyst - Technology": "T3_ai_product",
+      "Manager Business Artificial Intelligence": "T1_ai_ml",
+      "Business Insights & Performance Manager": "T5_process_perf",
+      "AI Business Analyst": "T2_data_bi",
+      "business excellence manager": "T5_process_perf"
+    }
+  },
+
+  "_prerank_comment": "Phase 1b (scripts/prerank_jobs.py) picks which fetched jobs are worth Phase 2's model pass. Fetching stays broad — coverage is unchanged — but the ranker only scores what is selected here, because it costs ~68s per job (measured 2026-08-19: 1696s for 25 jobs; earlier comments claiming ~24s were wrong by ~2.8x) and the 504-job run took 3.5h and timed out. Nothing is dropped: excluded jobs are written to the deferred list with a reason and shown in the report. This is a selection score, NOT a fit score; it awards no points and never decides whether documents get written (that stays with gate_jobs.py at 75, or 60 when alert-matched).",
+  "prerank": {
+    "enabled": true,
+
+    "_budget_comment": "deep_rank_budget is how many jobs reach the ranker in total; alert_budget is how many of those slots LinkedIn alert-matched jobs may claim before the score cut runs. Raising deep_rank_budget costs ~68s of Phase 2 wall-clock per job (measured 2026-08-19) and must stay well under RANK_TIMEOUT in scripts/run_daily.sh.",
+    "deep_rank_budget": 25,
+    "alert_budget": 10,
+
+    "_shortlist_comment": "Read only by `prerank_jobs.py --stage shortlist`, the wide first cut that Phase 1c enrichment reads bodies for before the final cut to deep_rank_budget. Deliberately several times deep_rank_budget, and it costs no model time: a job absent from the shortlist can never have its description scored, and on 2026-08-19 the 102 jobs (18% of corpus) whose AI/data signal was only in the body had a best rank of 31st, so a 25-slot first cut reached none of them. Enrichment, not this number, is the scarce resource — linkedin.detail_enrich_budget requests go first to shortlisted jobs that are UNKNOWN on the hard gates AND inside the final cut, in prerank score order, because those are the ones Phase 2 will score and gate_jobs.py may draft for on an eligibility nobody read; then to half-hybrid cards (title shows a business domain but no AI/data enabler, or the reverse), with alert-sourced as a tie-break inside that band, then an UNKNOWN verdict outside the cut, then title score and aggregation order. \"Inside the final cut\" is modelled in three passes and not as a top-N by score, because the cut is not one: the alert pool enters on attribution up to alert_budget before score is consulted, then each attributed track holds per_track_floor slots, then score fills the rest. This matters more than it sounds — replayed on the 2026-08-22 corpus a top-25-by-score model of the cut hit 14 of the real 25 rows and reached 3 of its 13 UNKNOWNs, because every alert row there scored 0-30 while non-alert rows reached 135, so score order puts all ten outside the cut and skips exactly the rows most likely to be UNKNOWN. The three-pass model hits 25 of 25 and all 13. The verification tier is bounded to that cut deliberately: UNKNOWN alone was 65 of the 80 shortlisted, so an unbounded tier would eat every request, while UNKNOWN-and-in-the-cut was 13 against a budget of 15 — the whole cut verifiable with 2 requests left for discovery. Prerank score orders that tier and nothing below it — letting it reach into the discovery tiers would put an alert card scoring 90 that already shows both halves ahead of a half-hybrid card scoring 30 whose missing half only a request can find. Alert cards are not a tier of their own: they dominate the half-hybrid band anyway, and ordering them ahead of it spent all 15 requests on 2026-08-19 with none going to discovery. The shortlist stage caps alerts at shortlist_budget - (deep_rank_budget - alert_budget), i.e. 65 of 80 here, and the cap is derived rather than configured. Above it, every alert slot is one the final cut cannot fill: that stage caps alerts at alert_budget and then wants deep_rank_budget - alert_budget non-alert jobs, so the shortlist must hand it at least that many. Uncapped on 2026-08-22 this cost 10 of 25 rankset slots — 97 live alert keys took 75 of 80 shortlist slots, 5 non-alert jobs reached a stage wanting 15, and non-alert jobs scoring up to 135 were deferred behind alert jobs scoring 30. The cap sits as high as the final cut can tolerate rather than at alert_budget, which keeps the original reason for not capping intact: alerts beyond alert_budget still reach enrichment and can still be re-scored on their bodies. Alerts cut for exceeding it are logged with their score range so a lost high scorer is visible.",
+    "shortlist_budget": 80,
+
+    "_floor_comment": "Slots guaranteed per track before the rest go to the top scores globally. This is not decoration: vocabulary hits are not comparable across tracks. 'AI Engineer' is a literal query so a T1 title scores a full phrase hit, while 'Junior Performance Manager' — the candidate's own current title — overlaps T5's 'Performance Management' on one token. A plain top-N would hand every slot to T1 and never evaluate a T5 role, which is the exact bias the five Profile Tracks exist to remove. Set to 0 for a pure top-N.",
+    "per_track_floor": 2
+  },
+
+  "_scoring_comment": "SCORING vocabulary, deliberately separate from the SEARCH vocabulary in linkedin.tracks above. Those 13 queries are few because each one costs a LinkedIn request; scoring costs nothing and should be far wider. Reusing one as the other is what buried the candidate's actual profile on 2026-08-19: 'Advanced PMO Specialist - Sourcing & Procurement Excellence' scored 0 and was dropped while 'Data Scientist / Machine Learning Engineer' scored 450 and ranked #1, because the query vocabulary had no term at all for procurement, continuous improvement, operational excellence, business process, PMO or program management. 24 of the 25 jobs that reached the ranker were pure-tech titles. Two axes are scored — business domain and technical enabler — and their overlap is what earns the most, so a business/AI hybrid outranks a research role structurally rather than by weight tuning. Categories, never job titles: nothing here names a specific posting, so a new wording is matched by kind. Scored by scripts/two_axis_score.py. enabled:false keeps the scheduled 08:00 run on the old model until a full run of this one has been reviewed; the sandbox runner turns it on with --two-axis.",
+  "scoring": {
+    "enabled": true,
+
+    "_weights_comment": "First-fit weights approved 2026-08-19, NOT tuned. domain/enabler/overlap are per matched CATEGORY, so a title carrying two domains and one enabler earns 30+30+20+35. overlap is the hybrid bonus and is intentionally the largest single term. core_tech_penalty applies only when a core_tech_only marker appears in the title AND no domain category is found anywhere in the posting, so genuine hybrids like 'Supply Chain Data Scientist' keep their score. description_bonus_cap is a HARD ceiling on everything the body can contribute: weighting description text per hit created portal bias instead of relevance — freehire and weworkremotely are the only portals that supply snippets, so per-hit weighting handed freehire 15 of the top 25 while it was 18% of the corpus. Retune from the per-job axis log in the report, not from intuition.",
+    "weights": {
+      "domain": 30,
+      "enabler": 20,
+      "overlap": 35,
+      "core_tech_penalty": -60,
+      "description_bonus_cap": 25,
+      "description_domain": 8,
+      "description_enabler": 5,
+      "hidden_hybrid_bonus": 15,
+      "strong_hybrid_bonus": 40,
+      "medium_hybrid_bonus": 20,
+      "body_only_domain_scale": 70,
+      "core_tech_exempt_min_body_domains": 2
+    },
+
+    "_hierarchy_comment": "strong_hybrid_bonus / medium_hybrid_bonus encode the stated priority order as weights rather than as a list of example titles: a business domain paired with ai or automation is the top tier, the same domain paired only with data_bi or digital is the tier below. Awarded once per posting, not per pair, so length cannot buy rank. body_only_domain_scale (percent) shades the tier bonus down when no domain word appears in the title at all - body evidence is weaker evidence about the ROLE, but it must never be zero, which was the 85/45 cliff.",
+
+    "_core_tech_exempt_comment": "core_tech_exempt_min_body_domains is how 'Machine Learning Engineer at a logistics company' stays penalised. A core-tech title is exempt only when a domain word is in the TITLE, or when this many independent domain categories appear in the body - one passing mention is the employer's industry, several are a posting describing business duties in its own words. sennder's ML Engineer role is the corpus case: one body category (supply_chain), so the penalty fires.",
+
+    "strong_enablers": ["ai", "automation"],
+
+    "_anchor_weak_comment": "anchors are specific enough to trust ANYWHERE in the posting; weak terms are generic and count ONLY in the title, where the employer chose the word deliberately. The split is load-bearing, not tidiness: matching bare words anywhere fired the `operations` category on Cognite's boilerplate 'Cognite operates at the forefront of industrial digitalization', and corpus-wide `data_bi` was 90% driven by the bare word 'data' with `operations` 100% driven by 'operations'/'operational' in prose. Put a single generic word in `weak`. Put a phrase in `anchors`. A category given as a bare list means all-anchors.",
+    "domain": {
+      "supply_chain": {
+        "anchors": ["supply chain", "demand planning", "s&op", "inventory management", "warehouse", "fulfilment", "fulfillment", "logistics"],
+        "weak": ["inventory", "materials"],
+        "_exclude_comment": "generic technical terminology must not manufacture a business domain. databricks' 'Senior Solutions Architect - Enterprise Data Warehouse' took a top-25 slot in the 2026-08-19 run purely because `warehouse` is an anchor. Excluded per category, never globally: masking these phrases from the shared text would also delete the bare word 'data' that `data_bi` legitimately matches. A real 'Warehouse Operations Manager' still matches.",
+        "exclude": ["data warehouse", "data warehousing", "datawarehouse", "dwh", "warehouse architect", "warehouse engineer"]
+      },
+      "procurement": {
+        "anchors": ["procurement", "sourcing", "category management", "purchasing", "supplier management", "vendor management", "tender"],
+        "weak": ["supplier", "vendor"]
+      },
+      "process": {
+        "anchors": ["business process", "process excellence", "process optimization", "process optimisation", "process improvement", "process management", "process analyst", "process manager", "process architect", "operational excellence", "operating model", "workflow"],
+        "weak": ["process"],
+        "_exclude_comment": "`workflow` earns its place as an anchor — 'workflow automation', 'approval workflow' and 'workflow owner' are how business-process postings describe the work. In software engineering the same word names a build pipeline, and on the 2026-08-19 corpus that put Deutsche Telekom's 'AI SWE / Agentic SDLC Workflow Engineer' at #10 of the top 25 on a process+ai hybrid it does not have. These masks keep the business readings and drop the engineering ones. Measured: 5 corpus postings matched process on `workflow` with no other process anchor present — 1 (MSCI's Business Analyst, the #1 pick) is a true hybrid and keeps its match, the other 4 are that one Deutsche Telekom posting served from four country subdomains.",
+        "exclude": ["workflow engineer", "sdlc workflow", "workflow orchestration", "ci/cd workflow", "github workflow", "workflow engine"]
+      },
+      "continuous_improvement": {
+        "anchors": ["continuous improvement", "six sigma", "lean", "kaizen", "productivity improvement"],
+        "weak": []
+      },
+      "performance": {
+        "anchors": ["performance management", "performance manager", "performance analyst", "business performance", "quality performance", "kpi", "financial controlling", "fp&a"],
+        "weak": ["controlling"]
+      },
+      "operations": {
+        "anchors": ["operations analyst", "operations manager", "operational excellence", "service delivery", "shared services", "business operations", "revenue operations", "supply operations"],
+        "weak": ["operations", "operational"]
+      },
+      "program": {
+        "anchors": ["program management", "programme management", "project manager", "programme manager", "program manager", "pmo", "transformation manager", "technical program"],
+        "weak": ["strategy"]
+      },
+      "business_analysis": {
+        "anchors": ["business analyst", "business analysis", "business excellence", "business partner", "requirements gathering"],
+        "weak": ["stakeholder"]
+      }
+    },
+
+    "enabler": {
+      "ai": {
+        "anchors": ["artificial intelligence", "generative ai", "genai", "machine learning", "llm", "copilot", "agentic"],
+        "weak": ["ai", "ml"]
+      },
+      "automation": {
+        "anchors": ["automation", "robotic process automation", "rpa", "power automate", "workflow automation", "intelligent automation", "low code", "low-code"],
+        "weak": ["automate"]
+      },
+      "data_bi": {
+        "anchors": ["business intelligence", "power bi", "data analytics", "analytics", "dashboard", "data visualization", "data visualisation", "sql"],
+        "weak": ["data", "bi", "reporting"]
+      },
+      "digital": {
+        "anchors": ["digital transformation", "digitalization", "digitalisation", "digital process", "erp", "sap"],
+        "weak": ["digital", "transformation"]
+      }
+    },
+
+    "_core_tech_comment": "Title markers for roles that are core-tech rather than business-facing. These are NOT a blocklist: the penalty applies only when no domain category is found anywhere in the posting, so 'Supply Chain Data Scientist' and 'Data Scientist, Supply Chain Optimization' keep their score while 'Research Scientist, Deep Learning' does not. The candidate is aimed at AI for business transformation, not research — this encodes that direction instead of relying on the ranker to infer it.",
+    "core_tech_only": ["machine learning engineer", "ml engineer", "data scientist", "research scientist", "ai researcher", "research engineer", "deep learning", "nlp engineer", "computer vision", "mlops engineer", "applied scientist"]
+  },
+
+  "_other_portals_comment": "Non-LinkedIn portals stay on a small fixed query set. They are broad-match APIs rather than paginated search pages, so a full matrix adds little and costs requests. Disable one by setting enabled:false here, or add its portal name to pipeline.skip_portals in config/automation.json.",
+
+  "freehire": {
+    "enabled": true,
+    "jobage_days": 14,
+    "limit_per_query": 20,
+    "queries": [
+      { "name": "freehire_ai", "q": "AI Engineer", "args": ["--region", "eu"] },
+      { "name": "freehire_ml", "q": "Machine Learning Engineer", "args": ["--country", "DE,NL,IE"] },
+      { "name": "freehire_ds", "q": "Data Scientist", "args": ["--region", "eu"] },
+      { "name": "freehire_supply", "q": "Supply Chain Analyst", "args": ["--region", "eu"] },
+      { "name": "freehire_perf", "q": "Performance Analyst", "args": ["--region", "eu"] }
+    ]
+  },
+
+  "arbeitnow": {
+    "enabled": true,
+    "jobage_days": 14,
+    "limit_per_query": 20,
+    "queries": [
+      { "name": "arbeitnow_ai", "q": "AI Engineer", "args": ["--location", "Berlin"] },
+      { "name": "arbeitnow_ml", "q": "Machine Learning", "args": ["--location", "Munich"] },
+      { "name": "arbeitnow_data", "q": "Data Analyst", "args": ["--location", "Berlin"] }
+    ]
+  },
+
+  "weworkremotely": {
+    "enabled": true,
+    "jobage_days": 14,
+    "limit_per_query": 20,
+    "queries": [
+      { "name": "wwr_ai", "q": "AI", "args": [] },
+      { "name": "wwr_ml", "q": "machine learning", "args": [] },
+      { "name": "wwr_data", "q": "data analyst", "args": [] }
+    ]
+  }
+}

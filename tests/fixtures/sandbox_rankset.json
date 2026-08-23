@@ -1,0 +1,101 @@
+{
+  "meta": {
+    "note": "SANDBOX FIXTURE — fake jobs, not real postings. Used to exercise the Telegram selector's message formatting, toggle mechanics and submit flow before pointing it at a real rankset.",
+    "generated": "2026-08-23",
+    "count": 4
+  },
+  "results": [
+    {
+      "company": "Northwind Telecom",
+      "title": "AI Engineer, Supply Chain Intelligence",
+      "location": "Budapest, Hungary (hybrid)",
+      "url": "https://example.com/sandbox/northwind-ai-engineer",
+      "portal": "linkedin-alert",
+      "dedup_key": "sandbox:northwind:1",
+      "date_posted": "2026-08-21",
+      "enriched": true,
+      "seniority": "Mid-Senior level",
+      "employmentType": "FULL_TIME",
+      "description": "SANDBOX FIXTURE POSTING — not a real job. Northwind Telecom is hiring an AI Engineer for our Supply Chain Intelligence group in Budapest. You will build and ship generative-AI and machine-learning services that plug into our ERP and planning systems, working directly with supply chain planners to turn manual processes into automated ones. Requirements: strong Python (pandas), SQL, hands-on experience fine-tuning LLMs, Azure Machine Learning, and the ability to explain a model's business impact to non-technical stakeholders. Nice to have: Power BI, document-processing pipelines, process-automation experience. English is the working language; no Hungarian required.",
+      "prerank": {
+        "score": 142,
+        "hybrid_tier": "strong",
+        "track_guess": "T1_ai_ml",
+        "gates": {
+          "language": {"verdict": "PASS", "reason": "English working language stated"},
+          "experience": {"verdict": "PASS", "reason": "mid level, 2-4 yrs"},
+          "pure_technical": {"verdict": "PASS"}
+        }
+      }
+    },
+    {
+      "company": "Kestrel Analytics",
+      "title": "Data Scientist — Operations",
+      "location": "Remote (EU)",
+      "url": "https://example.com/sandbox/kestrel-data-scientist",
+      "portal": "arbeitnow",
+      "dedup_key": "sandbox:kestrel:2",
+      "date_posted": "2026-08-20",
+      "enriched": true,
+      "seniority": "Associate",
+      "employmentType": "FULL_TIME",
+      "description": "SANDBOX FIXTURE POSTING — not a real job. Kestrel Analytics is a fully remote EU team building forecasting products for logistics operators. We are looking for a Data Scientist to own demand and inventory forecasting models end to end: framing the problem with the operations team, building the model in Python, and putting it in front of users in a dashboard they trust. Requirements: Python, SQL, applied forecasting or predictive modelling experience, comfort with messy operational data. Nice to have: Power BI or a similar BI tool, supply chain domain knowledge, experience automating reporting. We sponsor work permits for candidates already resident in the EU.",
+      "prerank": {
+        "score": 118,
+        "hybrid_tier": "strong",
+        "track_guess": "T2_data_science",
+        "gates": {
+          "language": {"verdict": "PASS", "reason": "no language requirement stated"},
+          "experience": {"verdict": "PASS", "reason": "associate level"},
+          "pure_technical": {"verdict": "PASS"}
+        }
+      }
+    },
+    {
+      "company": "Alpenhof Industrie AG",
+      "title": "Business Intelligence Specialist (m/w/d)",
+      "location": "Vienna, Austria (on-site)",
+      "url": "https://example.com/sandbox/alpenhof-bi-specialist",
+      "portal": "weworkremotely",
+      "dedup_key": "sandbox:alpenhof:3",
+      "date_posted": "2026-08-19",
+      "enriched": true,
+      "seniority": "Mid-Senior level",
+      "employmentType": "FULL_TIME",
+      "description": "SANDBOX FIXTURE POSTING — not a real job. Alpenhof Industrie AG sucht einen Business Intelligence Specialist für den Standort Wien. Aufgaben: Aufbau und Pflege von Power BI Dashboards, Datenmodellierung, Zusammenarbeit mit Controlling. Anforderungen: Power BI, DAX, SQL, mindestens drei Jahre Erfahrung im Reporting. Verhandlungssichere Deutschkenntnisse sind Voraussetzung. Englisch von Vorteil.",
+      "prerank": {
+        "score": 74,
+        "hybrid_tier": "medium",
+        "track_guess": "T4_bi",
+        "gates": {
+          "language": {"verdict": "FAIL", "reason": "requires fluent German (verhandlungssicher)"},
+          "experience": {"verdict": "PASS", "reason": "3 yrs stated"},
+          "pure_technical": {"verdict": "PASS"}
+        }
+      }
+    },
+    {
+      "company": "Vantage & Co Consulting",
+      "title": "AI Transformation Consultant",
+      "location": "Munich, Germany",
+      "url": "https://example.com/sandbox/vantage-ai-consultant",
+      "portal": "freehire",
+      "dedup_key": "sandbox:vantage:4",
+      "date_posted": "2026-08-18",
+      "enriched": false,
+      "seniority": "",
+      "employmentType": "",
+      "description_snippet": "SANDBOX FIXTURE POSTING — not a real job. AI Transformation Consultant, Munich. Help clients identify and deliver generative-AI use cases across operations and finance.",
+      "prerank": {
+        "score": 61,
+        "hybrid_tier": "medium",
+        "track_guess": "T3_ai_strategy",
+        "gates": {
+          "language": {"verdict": "UNKNOWN", "reason": "no description fetched"},
+          "experience": {"verdict": "UNKNOWN", "reason": "no description fetched"},
+          "pure_technical": {"verdict": "UNKNOWN"}
+        }
+      }
+    }
+  ]
+}

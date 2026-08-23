@@ -1,0 +1,85 @@
+%% Minimal one-page cover letter template
+%% ----------------------------------------------------------------------------
+%% Clean, modern business-letter style: a top-left sender/date block, a
+%% salutation, short body paragraphs, a closing, and a signature. No decorative
+%% header, no bullet lists, no coloured banner. Modeled on a plain professional
+%% letter. Profile-agnostic ([PLACEHOLDER] tokens) so it is safe to commit.
+%%
+%% Compile with: lualatex -interaction=nonstopmode <file>.tex
+%%   - Uses the `lato` package (same family as the onepage-ats resume, for a
+%%     cohesive pairing; no font-path juggling, compiles from any dir).
+%%
+%% Style contract:
+%%   - Exactly one page. Body is ~250-320 words / 3-5 short paragraphs.
+%%   - Block paragraphs (no first-line indent), separated by vertical space.
+%%   - Address to a named person if the posting names one; else the salutation
+%%     placeholder default "Dear Hiring Manager,".
+%%   - Any mention of agentic coding / AI tooling must name Claude Code.
+%%   - No em-dashes.
+%% ----------------------------------------------------------------------------
+
+\documentclass[11pt,a4paper]{article}
+
+% --- Font: Lato (matches the onepage-ats resume) ---
+\usepackage[T1]{fontenc}
+\usepackage[default]{lato}
+\renewcommand{\familydefault}{\sfdefault}
+
+% --- Layout ---
+\usepackage[left=2.3cm,right=2.3cm,top=2.0cm,bottom=2.0cm]{geometry}
+\usepackage{xcolor}
+\usepackage{parskip}                 % block paragraphs: no indent, space between
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{HTML}{1F3B57}   % subtle accent for the signed name only
+
+\pagestyle{empty}
+\linespread{1.05}
+\setlength{\parskip}{9pt}
+
+\hypersetup{
+  pdftitle={[YOUR_NAME] - Cover Letter},
+  pdfauthor={[YOUR_NAME]},
+}
+
+\begin{document}
+
+% ---------- SENDER / DATE BLOCK (top-left) ----------
+[YOUR_LOCATION]\\
+\href{mailto:[YOUR_EMAIL]}{[YOUR_EMAIL]}\\
+[DATE]                                  % e.g. "13 August 2026" or "August 13, 2026"
+
+\vspace{6pt}
+
+% ---------- OPTIONAL RECIPIENT BLOCK ----------
+% Include when the posting names a hiring manager / team and address.
+% Delete these lines entirely if you only have a generic salutation.
+% [HIRING_MANAGER_NAME]\\
+% [COMPANY_NAME]\\
+% [COMPANY_LOCATION]
+%
+% \vspace{6pt}
+
+% ---------- SALUTATION ----------
+Dear Hiring Manager,        % or "Dear [HIRING_MANAGER_NAME]," when known
+
+% ---------- BODY ----------
+% 3-5 short block paragraphs. Blank lines between paragraphs create the spacing.
+% Open with the single strongest match to THIS role and name the company + role.
+[OPENING PARAGRAPH: why this role at this company, led by your strongest match.]
+
+[BODY PARAGRAPH: the most relevant experience, with a concrete metric.]
+
+[BODY PARAGRAPH: a second angle -- a posting requirement you meet, or a
+company-specific reason. Acknowledge any gap honestly and bridge it.]
+
+[CLOSING PARAGRAPH: reaffirm fit, note availability / logistics if the posting
+raises them, and thank the reader.]
+
+% ---------- CLOSING ----------
+\vspace{4pt}
+
+Sincerely,\\[2pt]
+{\color{accent}\textbf{[YOUR_NAME]}}
+
+\end{document}

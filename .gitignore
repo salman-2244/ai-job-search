@@ -20,10 +20,22 @@ venv/
 
 # Personal data (never commit these)
 salary_data.json
-# Match at any depth: the job-scraper skill resolves `job_scraper/` relative to
-# its own directory, so these land at .claude/skills/job-scraper/job_scraper/*.
-# A rooted `job_scraper/...` pattern silently fails to match them.
+# Job scraper state (personal data, never commit)
+# Depth-independent: the job-scraper skill resolves `job_scraper/` relative to its
+# own directory, so the state file also lands under .claude/skills/job-scraper/ —
+# a repo-rooted rule silently fails to match that copy.
 **/job_scraper/seen_jobs.json
+# Backups of the above are the same personal data under a different name. The
+# migration script writes seen_jobs.json.pre-migration-<stamp>, and manual saves
+# tend to be .bak/.orig — without these globs a `git add .` would publish the
+# full job history that the line above exists to keep out.
+**/job_scraper/seen_jobs.json.*
+**/job_scraper/*.bak
+**/job_scraper/*.orig
+# LinkedIn alert-match store: job keys and URLs from Salman's own email alerts,
+# i.e. the same personal search history the seen_jobs rules exist to keep out.
+# Depth-independent for the same reason as the rules above.
+**/job_scraper/alert_matched.json
 **/job_scraper/notion_sync.json
 **/job_scraper/*.md
 *_BehavioralReport.pdf
@@ -33,6 +45,14 @@ linkedin_Profile.pdf
 # fetching service; the .env holding it must never be committed.
 .env
 .env.*
+# Claude Code settings: holds env.ANTHROPIC_AUTH_TOKEN (a live credential) plus
+# personal plugin/marketplace config. Untracked on 2026-08-18 via `git rm --cached`;
+# the token never reached committed history, so no rewrite was needed. Keep this
+# rule above any `git add .` — re-adding the file would publish the token.
+# The narrow reviewed permissions allowlist that used to live here is still
+# enforced from disk by tools/security_guards.py, which reads the file directly
+# rather than through git.
+.claude/settings.json
 
 # Personal photos and signatures
 *.jpg
@@ -61,11 +81,30 @@ skills-lock.json
 # The negations stay .tex-only - the stock example files are always LaTeX,
 # and a wildcard negation (!cv/main_example.*) would also re-include build
 # artifacts like main_example.pdf/.aux.
+cv/*/main.*
+# Also the flat layout: CLAUDE.md's application workflow still documents
+# `cv/main_<company>_<role>.tex`, so a tailored CV can land there. Ignoring both
+# shapes costs nothing; missing one publishes a real CV.
 cv/main_*.*
+# Depth-independent variants, for the same reason the job_scraper rules above are:
+# a pipeline run staged under its own directory writes the identical filenames one
+# level down (manual_run_2026-08-19/cv/<Company>_<Role>/main.tex), where a
+# repo-rooted `cv/` rule cannot see them. These sit ABOVE the negations below on
+# purpose — `**/cv/main_*.*` also matches cv/main_example.tex at the root, so
+# putting them after would silently un-track the two committed example files.
+**/cv/*/main.*
+**/cv/main_*.*
 !cv/main_example.tex
 cv/*.txt
+cover_letters/*/cover.*
 cover_letters/cover_*.*
+# Uppercase variant listed separately on purpose: git ignore matching is
+# case-sensitive wherever core.ignorecase is false (Linux forks), so the
+# lowercase rule above does not cover Cover_* there the way it appears to on macOS.
 cover_letters/Cover_*.*
+**/cover_letters/*/cover.*
+**/cover_letters/cover_*.*
+**/cover_letters/Cover_*.*
 !cover_letters/cover_example.tex
 
 # documents/ subfolder contents are personal — only README and folder structure are tracked
@@ -106,3 +145,40 @@ upskill/*.md
 
 # Brainstorm mockups (superpowers visual companion) - never ship
 .superpowers/
+
+# Automation
+config/automation.json
+logs/
+/tmp/jobsearch_*.json
+
+# Whole-run output directories. A manual or staged pipeline run copies the live
+# workspace into a dated directory, so one of these holds everything the rules
+# above keep out — tailored CVs and cover letters naming real employers, the
+# archived postings, the applications tracker, seen_jobs/alert_matched job
+# history, and the rendered prompts. Ignoring the directory is the only rule that
+# scales: the per-file rules are written for the repo-rooted paths and a run
+# directory reproduces the entire tree one level down.
+# Verified 2026-08-22: manual_run_2026-08-19/ was never committed on any branch
+# (`git log --all --name-only` finds no manual_run path), so this rule is
+# sufficient and no `git rm --cached` or history rewrite is required.
+manual_run_*/
+run_20*/
+staged_run_*/
+
+# Pre-change safety copies. `.backups/seen_jobs.json.<stamp>` is the job history
+# the **/job_scraper/seen_jobs.json rule exists to keep out, saved under a path
+# that rule cannot match.
+.backups/
+
+# Raw portal dumps left in the repo root by a manual CLI invocation
+# (freehire-combined-results.json, weworkremotely-combined.json). These are
+# search output — job URLs, titles and descriptions from a personal search — and
+# they land at the root where no other rule sees them.
+*-combined-results.json
+*-combined.json
+
+# Ranker scratch output. prompts/*.md are the prompt templates and are tracked on
+# purpose, but a scores file beside them is one run's verdicts on named employers
+# (`{"key": "rolex-ch-DS", "scores": {...}, "language_gate": ...}`) — the same
+# personal judgement the reports/ rule keeps out.
+prompts/*-scores.json

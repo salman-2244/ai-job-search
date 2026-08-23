@@ -83,16 +83,16 @@ Also read the most recent existing CV and cover letter files for concrete struct
 
 ### CV (`cv/main_<company>_<role><CV_EXT>`)
 - In the **CV language from the profile** (the `CV language:` line in CLAUDE.md's Identity section). When the profile does not set one, default to **English**. Never switch language per posting - the CV language is a profile-level choice, so all CVs stay consistent and reusable
-- Follow the moderncv/banking format from `05-cv-templates.md`
+- Follow the **active template's** format and style rules (the `ACTIVE-TEMPLATE` block in `05-cv-templates.md` names the template and its `TEMPLATE.md`; currently the one-page `onepage-ats` resume, whose real-data reference instance is `cv/main_example_onepage.tex`). The stock default is the 2-page moderncv/banking format
 - Tailor the profile statement and experience bullets to the specific role
 - Reframe skills and achievements to match job requirements
-- Keep to 2 pages
+- Keep to the **active template's page limit** (the `ACTIVE-TEMPLATE` block's page count in `05-cv-templates.md`; stock moderncv default is 2 pages, the `onepage-ats` template is 1 page)
 - **Grounding Audit:** Before writing to disk, audit all tailored bullet points against the union of three sources: `.claude/skills/job-application-assistant/01-candidate-profile.md` + the master CV (`cv/main_example.tex`) + `CLAUDE.md`'s Candidate Profile section to verify that all dates, roles, and metrics match exactly (zero profile drift or fabrication).
 
 ### Cover Letter (`cover_letters/cover_<company>_<role><COVER_EXT>`)
 - **Match the language of the job posting** (Danish posting -> Danish cover letter, English posting -> English cover letter)
 - Follow the structure from `06-cover-letter-templates.md`
-- Use the `cover.cls` template
+- Use the **active template** declared in the `ACTIVE-TEMPLATE` block of `06-cover-letter-templates.md` (currently the self-contained `minimal-onepage` letter, which does **not** use `cover.cls`). The stock default is the `cover.cls` template
 - Tailor the opening paragraph to the specific role and company
 - Address to a named person if available in the posting, otherwise "Dear Hiring Manager" (or equivalent in posting language)
 - Keep to approximately one page
@@ -226,15 +226,15 @@ If either compile fails, fix the error and re-compile until clean.
 Read both PDFs via the Read tool and verify:
 
 **CV (`cv/main_<company>_<role>.pdf`):**
-- [ ] Exactly 2 pages (not 1, not 3)
-- [ ] No orphaned `\cventry` titles — a job/education title line must never sit alone at the bottom of page 1 with its bullets on page 2. This is the most common failure.
-- [ ] Section headings are not isolated at the top of page 2 with only 1-2 lines below
+- [ ] Matches the active template's page limit exactly (stock moderncv: 2 pages; `onepage-ats`: 1 page — see the `ACTIVE-TEMPLATE` block in `05-cv-templates.md`)
+- [ ] No orphaned entry titles — a job/education title line must never sit alone at the bottom of a page with its bullets on the next page. This is the most common failure.
+- [ ] Section headings are not isolated at the bottom of a page with only 1-2 lines below
 - [ ] No awkward whitespace gaps
 
 **Cover letter (`cover_letters/cover_<company>_<role>.pdf`):**
 - [ ] Exactly 1 page
 - [ ] Signature block visible, not cut off or pushed to a second page
-- [ ] Bullet list font matches surrounding body text (both should be Raleway-Medium)
+- [ ] Body font is consistent throughout (active `minimal-onepage` has no bullet lists — this is automatic; stock `cover.cls` only: any bullet list must render in Raleway-Medium like the body)
 
 ### 5c. Iterate until clean
 
