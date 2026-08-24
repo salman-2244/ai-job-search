@@ -1,0 +1,167 @@
+%% One-page ATS-friendly resume - Salman Ahmed
+%% Tailored for: Materials Program Manager @ Intel (Global Operations, Foundry &
+%% Construction Sourcing), Leixlip, Ireland
+%% ----------------------------------------------------------------------------
+%% Instance of templates/cv/onepage-ats/template.tex.
+%% Facts grounded in .claude/skills/job-application-assistant/01-candidate-profile.md.
+%% Compile with: lualatex -interaction=nonstopmode Salman-Resume.tex
+%% ----------------------------------------------------------------------------
+
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[default]{lato}
+\renewcommand{\familydefault}{\sfdefault}
+
+\usepackage[left=1.25cm,right=1.25cm,top=0.8cm,bottom=0.8cm]{geometry}
+\usepackage{fontawesome5}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{needspace}
+\usepackage{ifthen}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{HTML}{1F3B57}
+\definecolor{dim}{HTML}{555555}
+\definecolor{dotoff}{HTML}{C8CDD3}
+
+\pagestyle{empty}
+\setlength{\parindent}{0pt}
+\setlength{\tabcolsep}{0pt}
+\linespread{0.94}
+
+\hypersetup{
+  pdftitle={Salman Ahmed - Resume},
+  pdfauthor={Salman Ahmed},
+}
+
+\newcommand{\cvsection}[2]{%
+  \needspace{2\baselineskip}%
+  \vspace{2pt}%
+  {\color{accent}\large\bfseries #1\hspace{6pt}#2}\par
+  \vspace{-5pt}{\color{accent}\rule{\linewidth}{0.9pt}}\par
+  \vspace{2pt}%
+}
+
+% Compact single-line entry header (see templates/cv/onepage-ats/TEMPLATE.md).
+\newcommand{\cventry}[4]{%
+  \needspace{3\baselineskip}%
+  {\parfillskip=0pt\relax
+   \textbf{#1,}\ {\itshape\color{accent}#2}\hfill
+   {\color{dim}#3 \textbar{} #4}\par}%
+  \vspace{1pt}%
+}
+
+\newenvironment{cvbullets}{%
+  \begin{itemize}[leftmargin=1.35em,itemsep=1pt,parsep=0pt,topsep=1pt,%
+                  label={\color{accent}\small\textbullet}]
+}{%
+  \end{itemize}%
+}
+
+\newcommand{\skillgroup}[2]{%
+  \textbf{#1:}~ #2\par\vspace{1.5pt}%
+}
+
+\newcounter{ratingdot}
+\newcommand{\rating}[1]{%
+  \setcounter{ratingdot}{0}%
+  \whiledo{\value{ratingdot} < #1}{\textcolor{accent}{\scriptsize\faCircle}\,\stepcounter{ratingdot}}%
+  \whiledo{\value{ratingdot} < 5}{\textcolor{dotoff}{\scriptsize\faCircle}\,\stepcounter{ratingdot}}%
+}
+
+\newcommand{\lang}[3]{%
+  \makebox[3.6cm][l]{#1}\makebox[3.2cm][l]{\rating{#2}}{\color{dim}#3}\par\vspace{1pt}%
+}
+
+% Contact-item separator: tighter than \quad so all five items fit on one line.
+\newcommand{\contactsep}{\hspace{7pt}}
+
+\begin{document}
+
+% ---------- HEADER ----------
+{\centering
+  {\color{accent}\fontsize{24}{28}\selectfont\bfseries Salman Ahmed}\par
+  \vspace{2pt}
+  {\color{dim}\normalsize Supply Chain \& Materials Analytics \textbar{} Inventory Optimization \textbar{} SAP Ariba \textbar{} Power BI}\par
+  \vspace{3pt}
+  {\small
+    \faEnvelope\ \href{mailto:cs.salman.ahmed@gmail.com}{cs.salman.ahmed@gmail.com}\contactsep
+    \faPhone*\ +36 20 596 4037\contactsep
+    \faMapMarker*\ Budapest, Hungary\contactsep
+    \faLinkedin\ \href{https://www.linkedin.com/in/iamsalmanahmed}{iamsalmanahmed}\contactsep
+    \faGlobe\ \href{https://salman.wuaze.com/?i=1}{Portfolio}%
+  }\par
+}
+\vspace{2pt}
+
+% ---------- SUMMARY ----------
+\cvsection{\faUserTie}{SUMMARY}
+Supply chain and operations analyst who turns manufacturing inventory forecasts into cost and availability decisions. Runs \textbf{inventory health and optimization analytics} (WIP, DOP, LSMGIT, CSMGIT) across all of Nokia's CNS markets and builds the SQL and Power BI data modelling layer behind them. Earlier at Wizz Air: supply chain data analytics and \textbf{SAP Ariba tender management} delivering $\sim$20\% cost efficiency through supplier negotiation. Pairs procurement domain knowledge with AI and advanced analytics for process optimization. Budapest-based, open to relocating to Leixlip.
+
+% ---------- EXPERIENCE ----------
+\cvsection{\faBriefcase}{PROFESSIONAL EXPERIENCE}
+
+\cventry{Junior Performance Manager}{Nokia}{Sep 2025 -- Present}{Budapest, Hungary}
+\begin{cvbullets}
+  \item Run deep-dive \textbf{inventory health and in-transit analytics} (WIP, DOP, LSMGIT, CSMGIT) across all CNS markets, surfacing inventory risk where stock and goods in transit tie up value and which positions are worth changing for inventory optimization.
+  \item Automated end-to-end reporting on \textbf{business intelligence tools with data modelling and transformation} (Power BI, DAX, SQL) plus Power Automate and Selenium workflows, removing manual handoffs and giving supply chain stakeholders live indicators for daily operational decisions instead of assembled spreadsheets.
+  \item Implemented an \textbf{Azure Document Intelligence} pipeline that replaced legacy manual processing, delivering a $\sim$35\% process-efficiency gain that lowered total cost to the business and turnaround time.
+  \item Lead a portfolio of \textbf{AI and advanced analytics} initiatives across Supply Chain, Cloud and Network Solutions, carrying use cases from business case through pilot to rollout with cross-organizational operations stakeholders.
+\end{cvbullets}
+\vspace{1pt}
+
+\cventry{Process Management Trainee}{Nokia}{Sep 2024 -- Jul 2025}{Budapest, Hungary}
+\begin{cvbullets}
+  \item \textbf{Trained predictive models} in Azure ML Studio to forecast inventory positions, contributing to data-driven decisions on Nokia's inventory management.
+  \item Led an AI-focused squad in the Excellence \& Process Management team, driving \textbf{standardization of indicators, processes and procedures} with cross-functional stakeholders to optimize efficiency and consistency.
+\end{cvbullets}
+\vspace{1pt}
+
+\cventry{Financial Controlling Trainee}{Wizz Air}{Jan 2024 -- Sep 2024}{Budapest, Hungary}
+\begin{cvbullets}
+  \item Supported monthly closing and \textbf{overhead-cost forecasting} for an airline division with financial modeling, prepared cost reporting for senior management, automated the models in MS Excel with VBA, and ran accrual reporting in Microsoft Dynamics AX and Power BI.
+\end{cvbullets}
+\vspace{1pt}
+
+\cventry{Supply Chain \& Development Trainee}{Wizz Air}{Dec 2022 -- Dec 2023}{Budapest, Hungary}
+\begin{cvbullets}
+  \item Led \textbf{tender management in SAP Ariba} and owned supplier relationship management across functions, identifying the most cost-competitive bids and negotiating $\sim$20\% cost efficiency on contracts, prices and timelines.
+  \item Executed in-depth \textbf{supply chain data analysis} to pinpoint trends and improvement opportunities, strengthening strategic decision-making and operational effectiveness.
+\end{cvbullets}
+
+% ---------- SKILLS ----------
+\cvsection{\faTools}{SKILLS}
+\skillgroup{Supply Chain \& Materials Operations}{Inventory Analytics \& Optimization (WIP, DOP, LSMGIT, CSMGIT) \textbar{} Inventory \& Demand Forecasting \textbar{} Procurement Analytics \textbar{} Tender Management (SAP Ariba) \textbar{} Supplier Relationship Management \textbar{} Cost Optimization}
+\skillgroup{Business Intelligence \& Data Modelling}{Power BI \textbar{} DAX \textbar{} SQL \textbar{} Data Modelling \& Transformation \textbar{} Python (pandas) \textbar{} MS Excel (Power Query, VBA) \textbar{} KPI \& Performance Reporting}
+\skillgroup{AI \& Advanced Analytics}{Predictive Modeling \textbar{} Azure ML Studio \textbar{} Azure Document Intelligence \textbar{} Generative AI \textbar{} Agentic Coding (Claude Code)}
+\skillgroup{Process Optimization \& Stakeholder Management}{Process Optimization \textbar{} Continuous Improvement \textbar{} Power Automate \textbar{} Power Apps (Low Code) \textbar{} Selenium \textbar{} Cross-Functional Stakeholder Management \textbar{} Jira}
+
+% ---------- PROJECTS ----------
+\cvsection{\faLightbulb}{PROJECTS}
+\begin{cvbullets}
+  \item \textbf{Data Mining with AI \& ML} (Python, pandas, Keras, Dash). B.Sc thesis: cleaned a large aviation dataset, ran EDA, trained ML models plus an ANN in Keras for live passenger-satisfaction prediction, and shipped the result as an interactive reporting dashboard.
+\end{cvbullets}
+
+% ---------- EDUCATION ----------
+\cvsection{\faGraduationCap}{EDUCATION}
+\cventry{B.Sc in Computer Science}{Eötvös Loránd University (ELTE)}{2021 -- 2025}{Budapest, Hungary}
+{\color{dim}Graduated June 2025. Thesis: ``Visual Representation of Data Mining with AI \& ML.'' Data mining, machine learning, data visualization.}\par
+\vspace{2pt}
+\cventry{Computer Science (transferred to ELTE)}{FAST-NUCES}{2020 -- 2021}{Islamabad, Pakistan}
+\vspace{2pt}
+\skillgroup{Certifications}{Machine Learning Specialization \textbar{} Generative AI Learning Path \textbar{} Accounting Foundations (Accrual-Basis Accounting)}
+
+% ---------- LANGUAGES ----------
+% \enlargethispage rescues the trailing section that otherwise spills a few
+% lines onto a second page (documented fix in templates/cv/onepage-ats).
+\enlargethispage{3\baselineskip}
+\cvsection{\faLanguage}{LANGUAGES}
+\lang{English}{4}{Professional working proficiency}
+\lang{Urdu}{5}{Native / bilingual}
+\lang{Punjabi}{5}{Native / bilingual}
+\lang{Hungarian}{2}{Elementary (A2)}
+
+\end{document}

@@ -149,8 +149,14 @@ def main():
 
     cv_files = []
     for item in CV_DIR.iterdir():
-        if item.is_dir() and (item / "main.tex").exists():
-            cv_files.append(item / "main.tex")
+        if not item.is_dir():
+            continue
+        # Salman-Resume.tex is what the pipeline writes now; main.tex is the
+        # legacy name still present in directories drafted before the rename.
+        for name in ("Salman-Resume.tex", "main.tex"):
+            if (item / name).exists():
+                cv_files.append(item / name)
+                break
 
     results = {
         "total": len(cv_files),
@@ -198,7 +204,7 @@ def main():
             import subprocess
             try:
                 subprocess.run(
-                    ["lualatex", "-interaction=nonstopmode", "main.tex"],
+                    ["lualatex", "-interaction=nonstopmode", cv_path.name],
                     cwd=cv_path.parent,
                     capture_output=True,
                     timeout=60

@@ -42,6 +42,7 @@ Check:
 - [ ] Profile statement is tailored to the specific role (not generic)
 - [ ] Skills section prioritizes job requirements
 - [ ] Experience bullets reframe to match role requirements
+- [ ] Top hard-skill keywords from the posting appear in the Experience/Projects bullets, and any bullet added for a keyword traces to real profile work (a keyword with no work behind it should be absent, not manufactured)
 - [ ] Cover letter connects experience to role requirements
 
 #### 3c. Consistency
@@ -61,6 +62,7 @@ Check:
 #### 3e. ATS Compliance (CV only)
 - [ ] CV text layer extracts cleanly (check with `pdftotext -layout` if available)
 - [ ] Email and phone appear as literal text
+- [ ] The contact block is a single line carrying email, phone, location, LinkedIn and Portfolio (the Portfolio URL is in the link target by design; there should be no GitHub item)
 - [ ] Reading order matches visual order
 - [ ] Job posting keywords covered or honestly absent
 
@@ -80,8 +82,8 @@ Output a JSON object:
     {
       "company": "...",
       "title": "...",
-      "cv_file": "cv/main_<company>_<role>.tex",
-      "cover_letter_file": "cover_letters/cover_<company>_<role>.tex",
+      "cv_file": "cv/<company>_<role>/Salman-Resume.tex",
+      "cover_letter_file": "cover_letters/<company>_<role>/Salman-Cover-Letter.tex",
       "cv_pages": 1,
       "cl_pages": 1,
       "factual_accuracy": "PASS",

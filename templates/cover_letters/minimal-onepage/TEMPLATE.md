@@ -9,7 +9,9 @@
 
 ## Compile command
 
-    cd <output dir> && lualatex -interaction=nonstopmode <file>.tex
+    cd <output dir> && lualatex -interaction=nonstopmode Salman-Cover-Letter.tex
+
+The source is named `Salman-Cover-Letter.tex` so the PDF LaTeX emits is `Salman-Cover-Letter.pdf` — the name a recruiter sees on the attachment. Do not name it `cover.tex` or `main.tex`. It never collides with the resume's `Salman-Resume.pdf`, even when both land in one directory.
 
 xelatex also works (fontspec-free here); lualatex is the declared/verified engine and matches the resume.
 

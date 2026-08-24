@@ -14,6 +14,11 @@
 %%   - Single column => extracted reading order matches the visual order.
 %%   - Every contact detail (email, phone) is printed as LITERAL TEXT next to
 %%     its icon, never carried by the icon alone.
+%%   - The contact block is ONE line (email, phone, location, LinkedIn,
+%%     Portfolio) so the page keeps that second line for real content. The
+%%     Portfolio item is the one deliberate exception to the literal-text rule:
+%%     its label is the word "Portfolio" and the URL lives only in the link
+%%     target, which is what Salman asked for.
 %%   - Lato embeds a proper Unicode map => no (cid:*) garbage on extraction.
 %%   - Section headings are real text; the icons are decoration only.
 %% ----------------------------------------------------------------------------
@@ -112,6 +117,13 @@
   \makebox[3.6cm][l]{#1}\makebox[3.2cm][l]{\rating{#2}}{\color{dim}#3}\par\vspace{1pt}%
 }
 
+% Separator between contact items. Deliberately tighter than \quad (1em = 9pt at
+% \small) so all five items fit on ONE line inside \textwidth. The contact block
+% is a single line by contract — the second line it used to occupy is reclaimed
+% for experience/projects content. If an item is added and the line overflows,
+% shorten an item's text rather than widening the margins.
+\newcommand{\contactsep}{\hspace{7pt}}
+
 % ============================================================================
 %  DOCUMENT
 % ============================================================================
@@ -124,11 +136,11 @@
   {\color{dim}\normalsize [YOUR_TAGLINE]}\par   % e.g. "AI/ML Engineer | Data Science"
   \vspace{3pt}
   {\small
-    \faEnvelope\ \href{mailto:[YOUR_EMAIL]}{[YOUR_EMAIL]} \quad
-    \faPhone*\ [YOUR_PHONE] \quad
-    \faMapMarker*\ [YOUR_LOCATION] \\[1pt]
-    \faLinkedin\ \href{[YOUR_LINKEDIN_URL]}{[YOUR_LINKEDIN_HANDLE]} \quad
-    \faGithub\ \href{[YOUR_GITHUB_URL]}{[YOUR_GITHUB_HANDLE]}
+    \faEnvelope\ \href{mailto:[YOUR_EMAIL]}{[YOUR_EMAIL]}\contactsep
+    \faPhone*\ [YOUR_PHONE]\contactsep
+    \faMapMarker*\ [YOUR_LOCATION]\contactsep
+    \faLinkedin\ \href{[YOUR_LINKEDIN_URL]}{[YOUR_LINKEDIN_HANDLE]}\contactsep
+    \faGlobe\ \href{[YOUR_PORTFOLIO_URL]}{Portfolio}%
   }\par
 }
 \vspace{2pt}

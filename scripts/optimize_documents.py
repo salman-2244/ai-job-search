@@ -154,8 +154,14 @@ def process_all_cvs():
     """Process all CVs in subfolders."""
     cv_files = []
     for item in CV_DIR.iterdir():
-        if item.is_dir() and (item / "main.tex").exists():
-            cv_files.append(item / "main.tex")
+        if not item.is_dir():
+            continue
+        # Salman-Resume.tex is what the pipeline writes now; main.tex is the
+        # legacy name still present in directories drafted before the rename.
+        for name in ("Salman-Resume.tex", "main.tex"):
+            if (item / name).exists():
+                cv_files.append(item / name)
+                break
 
     results = {
         "total": len(cv_files),
@@ -205,8 +211,14 @@ def process_all_cover_letters():
     """Process all cover letters in subfolders."""
     cover_files = []
     for item in COVER_DIR.iterdir():
-        if item.is_dir() and (item / "cover.tex").exists():
-            cover_files.append(item / "cover.tex")
+        if not item.is_dir():
+            continue
+        # Salman-Cover-Letter.tex is what the pipeline writes now; cover.tex is
+        # the legacy name in directories drafted before the rename.
+        for name in ("Salman-Cover-Letter.tex", "cover.tex"):
+            if (item / name).exists():
+                cover_files.append(item / name)
+                break
 
     results = {
         "total": len(cover_files),

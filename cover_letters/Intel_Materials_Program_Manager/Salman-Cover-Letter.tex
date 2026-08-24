@@ -1,0 +1,64 @@
+%% Cover letter - Salman Ahmed
+%% Tailored for: Materials Program Manager @ Intel, Leixlip, Ireland
+%% ----------------------------------------------------------------------------
+%% Instance of templates/cover_letters/minimal-onepage/template.tex.
+%% Facts grounded in .claude/skills/job-application-assistant/01-candidate-profile.md.
+%% Intel Ireland facts verified independently (not via any link in the posting):
+%% Leixlip, Co. Kildare is Intel's largest manufacturing site outside the US;
+%% Fab 34 opened 29 Sep 2023 at a cost of EUR 17bn, built for the Intel 4
+%% process; Intel has operated in Ireland since 1989.
+%% Compile with: lualatex -interaction=nonstopmode cover.tex
+%% ----------------------------------------------------------------------------
+
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[default]{lato}
+\renewcommand{\familydefault}{\sfdefault}
+
+\usepackage[left=2.3cm,right=2.3cm,top=2.0cm,bottom=2.0cm]{geometry}
+\usepackage{xcolor}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{HTML}{1F3B57}
+
+\pagestyle{empty}
+\linespread{1.05}
+\setlength{\parskip}{9pt}
+
+\hypersetup{
+  pdftitle={Salman Ahmed - Cover Letter},
+  pdfauthor={Salman Ahmed},
+}
+
+\begin{document}
+
+% ---------- SENDER / DATE BLOCK ----------
+Budapest, Hungary\\
+\href{mailto:cs.salman.ahmed@gmail.com}{cs.salman.ahmed@gmail.com}\\
+24 August 2026
+
+\vspace{6pt}
+
+% ---------- SALUTATION ----------
+Dear Hiring Manager,
+
+% ---------- BODY ----------
+I am applying for the Materials Program Manager role in Global Operations at Leixlip. Translating manufacturing inventory forecasts into stocking and risk decisions is what I do now at Nokia, where I run deep-dive inventory and in-transit analytics across all CNS markets and build the reporting layer that makes those numbers usable to the people who act on them.
+
+Intel has manufactured in Ireland since 1989, and Leixlip is the company's largest manufacturing site outside the United States. Fab 34 opened in 2023 at a cost of 17 billion euro to bring the Intel 4 process into volume production. A fab at that scale gives materials availability real consequences, since an unplanned spares shortage stops output rather than merely delaying a report. That is the environment I want the analytical work to matter in.
+
+Three parts of the role I can take on immediately. On inventory health and optimization, my current analytics cover work in progress and goods in transit across every CNS market, identifying which positions tie up value and which are worth changing. On supplier engagement, I led tender management in SAP Ariba at Wizz Air and negotiated contracts, prices and timelines to roughly 20 percent cost efficiency. On the business intelligence and data modelling requirement, I build in Power BI, DAX and SQL, and I automated end to end reporting with Power Automate and Selenium so daily operational decisions run on live data. Your preference for AI and advanced analytics in process optimization matches an Azure Document Intelligence pipeline I implemented that replaced manual processing and delivered a 35 percent efficiency gain, built with Claude Code alongside the Azure tooling.
+
+I should be straightforward about two things. My degree is in Computer Science rather than supply chain, and my manufacturing experience is telecom and aviation, not semiconductor. Fab-specific materials practice is something I would learn on site, from a base of procurement, inventory and process work.
+
+I am a non-EU national on a Hungarian permit, so an Irish role would need sponsorship. I would welcome the chance to discuss the role.
+
+% ---------- CLOSING ----------
+\vspace{4pt}
+
+Sincerely,\\[2pt]
+{\color{accent}\textbf{Salman Ahmed}}
+
+\end{document}

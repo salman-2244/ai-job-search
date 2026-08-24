@@ -34,17 +34,33 @@ For EACH job in the top 5, do the following. Process them sequentially (one at a
 Extract from the job object: company, title, location, score, strengths, gaps, posting_text.
 
 #### 2b. Draft CV
-Create `cv/<company>_<role>/main.tex` using the onepage-ats template:
+Create `cv/<company>_<role>/Salman-Resume.tex` using the onepage-ats template.
+The filename matters: LaTeX names the PDF after the source, and the PDF a
+recruiter opens must be `Salman-Resume.pdf`. Never write `main.tex` here.
 1. Read `templates/cv/onepage-ats/template.tex` for structure
 2. Replace all [PLACEHOLDER] tokens with tailored content
 3. Profile statement: tailor to THIS specific role (not generic)
 4. Skills section: prioritize skills from the posting's requirements
-5. Experience bullets: reframe to match role requirements, using posting keywords
-6. Keep to 1 page (enforce with content cutting if needed)
-7. **Grounding Audit:** Every claim must trace to `01-candidate-profile.md` or `cv/main_example.tex`. No fabrication.
+5. **Keyword population.** Extract the top 5–8 hard-skill keywords from the
+   posting (e.g. "Supply Chain", "Process Optimization", "Data Analytics",
+   "Six Sigma", "SAP", "Python", "Stakeholder Management", "Lean") and weave
+   them into the **existing** Experience and Projects bullets, replacing generic
+   phrasing with the posting's own term wherever it truthfully describes the same
+   work — "managed external partners" becomes "managed external vendors and
+   partners" for a posting asking for vendor management. No fake jobs, no fake
+   projects. If a keyword fits no existing bullet, append **at most one** concise
+   bullet to the most relevant experience entry, and only when the profile
+   genuinely supports it; otherwise the keyword stays absent.
+6. **Contact line stays one line** — email, phone, location, LinkedIn, Portfolio
+   (`https://salman.wuaze.com/?i=1`), separated by `\contactsep`. No GitHub item;
+   never restore the old two-line form.
+7. Keep to 1 page (enforce with content cutting if needed)
+8. **Grounding Audit:** Every claim must trace to `01-candidate-profile.md` or `cv/main_example.tex`. No fabrication.
 
 #### 2c. Draft Cover Letter
-Create `cover_letters/<company>_<role>/cover.tex` using the minimal-onepage template:
+Create `cover_letters/<company>_<role>/Salman-Cover-Letter.tex` using the
+minimal-onepage template. Same reason as the CV: the emitted PDF must be
+`Salman-Cover-Letter.pdf`, so never write `cover.tex` here.
 1. Read `templates/cover_letters/minimal-onepage/template.tex` for structure
 2. Opening paragraph: specific to THIS role and company
 3. Body: connect experience to role requirements using STAR-style examples
@@ -56,8 +72,8 @@ Create `cover_letters/<company>_<role>/cover.tex` using the minimal-onepage temp
 
 #### 2d. Compile PDFs
 ```bash
-cd /Users/salman/Projects/ai-job-search/cv/<company>_<role> && lualatex -interaction=nonstopmode main.tex
-cd /Users/salman/Projects/ai-job-search/cover_letters/<company>_<role> && lualatex -interaction=nonstopmode cover.tex
+cd /Users/salman/Projects/ai-job-search/cv/<company>_<role> && lualatex -interaction=nonstopmode Salman-Resume.tex
+cd /Users/salman/Projects/ai-job-search/cover_letters/<company>_<role> && lualatex -interaction=nonstopmode Salman-Cover-Letter.tex
 ```
 If compilation fails, fix the error and retry (max 2 retries). If it still fails, log the error and move to the next job.
 
@@ -95,8 +111,8 @@ Output a JSON object with the results:
       "title": "...",
       "score": 78,
       "verdict": "Strong Fit",
-      "cv_file": "cv/<company>_<role>/main.tex",
-      "cover_letter_file": "cover_letters/<company>_<role>/cover.tex",
+      "cv_file": "cv/<company>_<role>/Salman-Resume.tex",
+      "cover_letter_file": "cover_letters/<company>_<role>/Salman-Cover-Letter.tex",
       "cv_compiled": true,
       "cl_compiled": true,
       "cv_pages": 1,
