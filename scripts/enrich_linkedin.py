@@ -706,6 +706,293 @@ def fetch_detail(job_id: str, timeout: int = 90) -> dict:
     return detail
 
 
+# === The browser path ========================================================
+# Phase 1c has two clients for the same host. The guest CLI above fetches
+# `linkedin.com/jobs-guest/...` anonymously; `scripts/linkedin_extract.py` drives the
+# real logged-in browser through the WebBridge daemon. The browser is ~15x faster
+# (6.2s vs 93s per job, measured 2026-08-24) and returns marginally more text, so it
+# is the primary path — but it depends on a daemon, an extension and a live login,
+# none of which an 08:00 launchd job can guarantee.
+#
+# So the contract here is: *detect*, don't assume, and never let a missing browser
+# cost the run its descriptions. Every failure below lands on the guest CLI, which
+# needs nothing running and returns full bodies (11/11 rows, 2.5k-10.1k chars,
+# measured 2026-08-24). See docs/BROWSER_ENRICHMENT.md.
+
+# `kimi-webbridge start` only. Never stop/restart/uninstall from automation — those
+# fight the Kimi Desktop App that owns the browser this path borrows.
+WEBBRIDGE_BIN = Path.home() / ".kimi-webbridge" / "bin" / "kimi-webbridge"
+DAEMON_START_TIMEOUT = 45
+DAEMON_WAIT_ATTEMPTS = 3      # polls after `start`, per the brief
+DAEMON_WAIT_DELAY = 3.0
+
+# The canonical posting URL, built from the ID rather than taken from the card's
+# `url`. Deliberate: locale hosts (`hu.`, `se.`) carry a slug that need not agree with
+# the canonical posting id, and `linkedin_extract.job_id_from_url` has to re-parse
+# whatever it is given. The ID is what the guest CLI is keyed on too, so both paths
+# fetch provably the same posting.
+JOB_URL = "https://www.linkedin.com/jobs/view/%s/"
+
+# Consecutive browser failures that condemn the path for the rest of the phase. A
+# session can lapse *between* jobs — the 08:00 run is unattended and nobody will
+# notice — and 2 in a row is the point where "this posting is broken" becomes "this
+# browser is broken". Set to 2 rather than 1 because a single posting genuinely can
+# fail on its own (deleted, region-locked, slow mount), and condemning the fast path
+# for one bad card would cost the phase 20 minutes.
+BROWSER_FAILURE_STREAK = 2
+
+TG_NOTIFY = "tg-notify"
+
+
+class RequestLedger:
+    """The hard stop on LinkedIn requests this phase may spend.
+
+    Phase 1c's budget is not a preference, it is the other half of a subtraction:
+    `build_search_plan.py` gave the searches `max_requests_per_run -
+    detail_enrich_budget` and `run_daily.sh` re-derives the same split as a
+    defence-in-depth check. Spending 26 here does not borrow from tomorrow, it puts
+    *today* over a cap that exists because both halves hit one host minutes apart.
+
+    Which makes this necessary rather than tidy: the browser path can spend more than
+    one request per job. `linkedin_extract.extract` retries a partial mount up to
+    MAX_ATTEMPTS times and each attempt is a real navigation, so an unlucky posting
+    costs three. Charging actual attempts and refusing to hand out the 26th is what
+    keeps the phase inside the number the planner already spent against.
+    """
+
+    def __init__(self, limit: int):
+        self.limit = max(0, int(limit))
+        self.spent = 0
+
+    def left(self) -> int:
+        return max(0, self.limit - self.spent)
+
+    def spend(self, n: int = 1) -> None:
+        self.spent += max(0, int(n))
+
+
+def _load_extractor(warn):
+    """`scripts/linkedin_extract.py` as a module, or None with the reason warned.
+
+    Imported here rather than at module scope so that a syntax error, a missing file
+    or a stdlib mismatch in the extractor degrades Phase 1c to the guest CLI instead
+    of aborting it at import time. The guest path must not depend on the browser
+    path's code even loading.
+    """
+    path = REPO / "scripts" / "linkedin_extract.py"
+    name = "linkedin_extract"
+    try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        # Registered *before* exec, not after, and this is load-bearing rather than
+        # conventional. `linkedin_extract.Extraction` is a `@dataclass`, and building
+        # one makes `dataclasses` look its own module up by name —
+        # `sys.modules.get(cls.__module__).__dict__` — which is `None.__dict__` for a
+        # module that is mid-exec and unregistered. So without this line the extractor
+        # raises AttributeError on import, the except below catches it, and Phase 1c
+        # falls back to the guest CLI *every single morning* while reporting only a
+        # one-line warning. Verified: this is exactly what it did before the line
+        # existed. Tidy-looking import code, silent 15x slowdown.
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:                                    # noqa: BLE001
+        sys.modules.pop(name, None)     # never leave a half-executed module behind
+        warn(f"browser extractor at {path} would not import "
+             f"({type(exc).__name__}: {exc}) — using the guest CLI")
+        return None
+    return module
+
+
+def start_daemon(warn, run=subprocess.run, sleep=time.sleep, reachable=None):
+    """Try to bring the WebBridge daemon up. Returns (up, detail). Never raises.
+
+    `start` is idempotent and is the only lifecycle verb this may use. Then it polls,
+    because the process returning is not the port listening.
+
+    This can legitimately fail in a way no retry fixes: the daemon is only half the
+    dependency, the Kimi Desktop App and its browser extension are the other half,
+    and launchd cannot start those. A daemon that comes up without them answers
+    `list_tabs` and then fails every navigation — which is why the caller checks the
+    session afterwards rather than treating "daemon up" as "browser usable".
+    """
+    if reachable is None:
+        return False, "no reachability probe available"
+    if not WEBBRIDGE_BIN.is_file():
+        return False, f"{WEBBRIDGE_BIN} is not installed"
+    try:
+        proc = run([str(WEBBRIDGE_BIN), "start"], capture_output=True, text=True,
+                   timeout=DAEMON_START_TIMEOUT)
+    except FileNotFoundError:
+        return False, f"{WEBBRIDGE_BIN} is not executable"
+    except subprocess.TimeoutExpired:
+        return False, f"`kimi-webbridge start` timed out after {DAEMON_START_TIMEOUT}s"
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"`kimi-webbridge start` failed ({type(exc).__name__}: {exc})"
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return False, (f"`kimi-webbridge start` exited {proc.returncode}"
+                       + (f": {tail[-1][:160]}" if tail else ""))
+
+    for attempt in range(1, DAEMON_WAIT_ATTEMPTS + 1):
+        ok, detail = reachable()
+        if ok:
+            return True, f"{detail} (started, ready on poll {attempt})"
+        if attempt < DAEMON_WAIT_ATTEMPTS:
+            sleep(DAEMON_WAIT_DELAY)
+    return False, (f"started but the port never opened after {DAEMON_WAIT_ATTEMPTS} "
+                   f"polls — {detail}")
+
+
+def browser_fetch_path(budget: int, warn, log, ledger, extractor=None,
+                       run=subprocess.run, sleep=time.sleep):
+    """Run the pre-flight chain and return (module, reason). `module` None = guest.
+
+    The chain is daemon -> start it if down -> session -> one recovery if unhealthy,
+    and every rung logs its own decision so a morning's log says which path ran and
+    why. `reason` is None when the browser won, and a one-line explanation when the
+    guest path is being used instead — the string the Telegram alert carries.
+
+    Charges the ledger for what it spends: the daemon probe is local and free, the
+    session check is one LinkedIn request, the recovery is one more. Nothing else in
+    this file may assume the budget is untouched when the first job starts.
+    """
+    module = extractor if extractor is not None else _load_extractor(warn)
+    if module is None:
+        return None, "browser extractor would not import"
+
+    ok, detail = module.daemon_reachable()
+    if ok:
+        log(f"browser primary — {detail}")
+    else:
+        log(f"daemon down ({detail}) — attempting `kimi-webbridge start`")
+        ok, detail = start_daemon(warn, run=run, sleep=sleep,
+                                  reachable=module.daemon_reachable)
+        if not ok:
+            warn(f"could not start the WebBridge daemon ({detail})")
+            return None, f"WebBridge daemon unavailable ({detail})"
+        log(f"daemon started — {detail}")
+
+    if ledger.left() < 1:
+        return None, "no LinkedIn request budget left for a session check"
+    ledger.spend(1)
+    ok, detail = module.session_healthy()
+    if ok:
+        log(f"session healthy — {detail}")
+        return module, None
+
+    # A CAPTCHA is where this stops. Reloading a challenge page is the first step of
+    # hammering it, and the standing instruction is to report and let a human clear
+    # it. The guest path is unaffected — it is a different client.
+    if "CAPTCHA" in detail:
+        warn(f"{detail} — not retrying, using the guest CLI")
+        return None, detail
+
+    log(f"session unhealthy ({detail}) — one recovery attempt")
+    if ledger.left() < 1:
+        return None, f"{detail} (no budget left to attempt recovery)"
+    ledger.spend(1)
+    ok, detail = module.recover_session()
+    if ok:
+        log(f"session recovered — {detail}")
+        return module, None
+    warn(f"session unrecoverable ({detail}) — using the guest CLI")
+    return None, f"LinkedIn session unrecoverable ({detail})"
+
+
+def browser_fetcher(module, ledger, warn, log, state, guest=fetch_detail):
+    """A `fetch(job_id)` for `enrich` that reads the real posting, guest as backstop.
+
+    Returns the same `{"description": ...}` shape the guest CLI's JSON has, so
+    `merge_detail` — and therefore the host-aware cap, the degrade guard and every
+    gate downstream — is identical on both paths. The one difference is what is
+    *absent*: DETAIL_FIELDS (`seniority`, `employmentType`, ...) exist only in the
+    CLI's JSON, so browser-served rows carry no `seniority`. Accepted deliberately;
+    the seniority gate falls back to reading the body, which this path supplies in
+    full. See docs/BROWSER_ENRICHMENT.md.
+
+    `state` carries the mid-run switch. A login can lapse *between* jobs on an
+    unattended run, and after BROWSER_FAILURE_STREAK consecutive failures this stops
+    paying the browser's retry cost and finishes the phase on the guest CLI. There is
+    deliberately no *per-job* guest retry before that point: every request in this
+    phase is budgeted one-per-job, so re-fetching job 3 on the second path spends job
+    24's request. A single browser failure is therefore the same non-fatal event a
+    single guest failure already is — that job keeps its snippet, which the ranker
+    prompt (`:45`) handles by scoring on thinner evidence and saying so in `gaps`.
+    """
+    def fetch(job_id):
+        if state.get("switched"):
+            return guest(job_id)
+        if ledger.left() < 1:
+            raise DetailError(
+                f"LinkedIn request budget spent ({ledger.spent}/{ledger.limit}) — "
+                "refusing to exceed linkedin.max_requests_per_run")
+        url = JOB_URL % job_id
+        try:
+            got = module.extract(url, new_tab=False, verbose=False)
+        except module.ExtractionError as exc:
+            # Charge what it actually cost. `extract` retries a partial mount, and
+            # each attempt was a real navigation whether or not text came back.
+            ledger.spend(max(1, getattr(exc, "attempts", 1) or 1))
+            state["streak"] = state.get("streak", 0) + 1
+            if state["streak"] >= BROWSER_FAILURE_STREAK:
+                state["switched"] = True
+                state["reason"] = (f"browser failed on {state['streak']} consecutive "
+                                   f"postings (last: {exc})")
+                warn(f"fallback guest — {state['reason']}")
+                log(f"fallback guest for the rest of the phase after "
+                    f"{state['streak']} consecutive browser failures")
+            raise DetailError(str(exc))
+        except Exception as exc:                                # noqa: BLE001
+            # An unexpected shape from the daemon must not escape as something other
+            # than DetailError: `enrich` catches DetailError and only DetailError, so
+            # anything else here would abort the whole phase mid-list.
+            ledger.spend(1)
+            state["streak"] = state.get("streak", 0) + 1
+            if state["streak"] >= BROWSER_FAILURE_STREAK:
+                state["switched"] = True
+                state["reason"] = f"browser raised {type(exc).__name__}: {exc}"
+                warn(f"fallback guest — {state['reason']}")
+            raise DetailError(f"{type(exc).__name__}: {exc}")
+        ledger.spend(max(1, getattr(got, "attempts", 1) or 1))
+        state["streak"] = 0
+        state["browser_jobs"] = state.get("browser_jobs", 0) + 1
+        return {"description": got.text or ""}
+    return fetch
+
+
+def alert_fallback(reason: str, log, run=subprocess.run) -> bool:
+    """Ping Telegram once that this run is on the guest path. True if sent.
+
+    One alert per run, not per job: this is called once, from `main`, after the path
+    is settled. Best-effort by construction — a notifier that is missing, misconfigured
+    or offline must not fail a phase whose actual work succeeded, so every failure
+    here is logged and swallowed.
+
+    Reuses `tg-notify`, the same bot `run_daily.sh`'s own EXIT-trap ping goes through.
+    """
+    body = ("⚠️ Job search running in fallback mode (browser unavailable). "
+            "Processing via guest HTTP.\n\n"
+            f"reason: {reason}\n"
+            "impact: Phase 1c is slower and rows carry no structured seniority "
+            "field. Every gate still works; descriptions are still full posting "
+            "bodies. Nothing to re-run.")
+    try:
+        proc = run([TG_NOTIFY, "--title", "ai-job-search: enrichment fallback", body],
+                   capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        log(f"fallback alert not sent — {TG_NOTIFY} is not on PATH")
+        return False
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"fallback alert not sent — {type(exc).__name__}: {exc}")
+        return False
+    if proc.returncode != 0:
+        log(f"fallback alert not sent — {TG_NOTIFY} exited {proc.returncode}")
+        return False
+    log("fallback alert sent to Telegram")
+    return True
+
+
 def snippet_text(job: dict) -> str:
     """The search snippet's real characters, without the truncation marker.
 
@@ -817,10 +1104,21 @@ def main():
                         help="Per-request timeout in seconds.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Report the selection without fetching or writing.")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="Force the guest CLI even if linkedin.use_browser_extractor "
+                             "is true. For benchmarking one path against the other.")
+    parser.add_argument("--alert-on-fallback", action="store_true",
+                        help="Send one Telegram alert if the browser path is "
+                             "unavailable. run_daily.sh passes this; manual runs stay "
+                             "silent so a benchmark does not ping the phone.")
     args = parser.parse_args()
 
     def warn(message):
         print(f"  enrich: {message}", file=sys.stderr)
+
+    def log(message):
+        """Branch decisions, so a morning's log says which path ran and why."""
+        print(f"  [enrich] {message}", file=sys.stderr)
 
     data = load_json(args.jobs, "the jobs file")
     if data is None:
@@ -890,10 +1188,56 @@ def main():
         # cards still get enriched; there is simply nothing to rank search cards by.
         warn("LinkedIn has no enabled tracks — only alert cards can be enriched")
 
-    targets, stats = select_targets(jobs, queries, budget, seen_keys, warn, cut,
+    # === The path decision, made once, before a single job is selected ===
+    #
+    # Before the selection because the pre-flight *spends* LinkedIn requests: the
+    # session check is one and the recovery attempt is another, out of the same
+    # `detail_enrich_budget` the searches were already deducted for. Selecting 25
+    # targets and then discovering the budget is 23 would put the day over
+    # `max_requests_per_run`, which is the one number this phase may not exceed.
+    #
+    # Order matters the other way too — nothing here may abort the phase. Every rung
+    # of the chain returns a reason instead of raising, so the worst case is that this
+    # block logs why the browser is unusable and Phase 1c runs exactly as it did
+    # before the browser existed.
+    ledger = RequestLedger(budget)
+    use_browser = bool(linkedin.get("use_browser_extractor", False))
+    module, fallback_reason = None, None
+    if args.dry_run or budget <= 0:
+        log("path decision skipped (dry run or zero budget) — no requests spent")
+    elif args.no_browser:
+        log("fallback guest — --no-browser was passed")
+        fallback_reason = None      # an explicit choice is not an incident to alert on
+    elif not use_browser:
+        log("fallback guest — linkedin.use_browser_extractor is false")
+    else:
+        module, fallback_reason = browser_fetch_path(budget, warn, log, ledger)
+
+    if fallback_reason and args.alert_on_fallback:
+        alert_fallback(fallback_reason, log)
+
+    # What the pre-flight spent is not available to the jobs, so the selection is cut
+    # to what is actually left rather than to the configured budget.
+    job_budget = max(0, budget - ledger.spent)
+    if job_budget < budget:
+        log(f"pre-flight spent {ledger.spent} LinkedIn request(s) — "
+            f"{job_budget} of the {budget} budget left for postings")
+
+    targets, stats = select_targets(jobs, queries, job_budget, seen_keys, warn, cut,
                                     alert_budget, floor)
 
+    state = {"streak": 0, "switched": False, "browser_jobs": 0, "reason": None}
+    if module is not None:
+        fetch = browser_fetcher(module, ledger, warn, log, state,
+                                guest=timeout_wrapper(args.timeout))
+    else:
+        fetch = timeout_wrapper(args.timeout)
+
     summary = {"targeted": len(targets), "enriched": 0, "empty": 0, "failed": 0,
+               "fetch_path": "browser" if module is not None else "guest",
+               "fallback_reason": fallback_reason,
+               "budget": budget, "job_budget": job_budget,
+               "preflight_requests": ledger.spent,
                **stats}
 
     if args.dry_run:
@@ -903,10 +1247,29 @@ def main():
         return 0
 
     if targets:
-        summary.update(enrich(targets, delay, warn, timeout_wrapper(args.timeout)))
+        summary.update(enrich(targets, delay, warn, fetch))
         with open(args.jobs, "w") as handle:
             json.dump(data, handle, indent=2)
             handle.write("\n")
+
+    # Both counted from what actually happened rather than from the path decision: a
+    # run that started on the browser and switched mid-list is neither "browser" nor
+    # "guest", and a report that called it either would be wrong about the run whose
+    # explanation matters most.
+    summary["browser_jobs"] = state["browser_jobs"]
+    summary["guest_jobs"] = max(0, summary["enriched"] - state["browser_jobs"])
+    summary["requests_spent"] = ledger.spent
+    if state["switched"]:
+        summary["fetch_path"] = "browser->guest"
+        summary["fallback_reason"] = state["reason"]
+        # The mid-run switch alerts too, and only here — `alert_fallback` is called
+        # from exactly two places in this function and neither can run twice, which is
+        # what "one alert per run, not per job" means in practice.
+        if args.alert_on_fallback and not fallback_reason:
+            alert_fallback(state["reason"], log)
+    log(f"path={summary['fetch_path']} browser_jobs={summary['browser_jobs']} "
+        f"guest_jobs={summary['guest_jobs']} "
+        f"linkedin_requests={ledger.spent}/{ledger.limit}")
 
     print(json.dumps(summary))
     print(f"Enriched {summary['enriched']}/{summary['targeted']} LinkedIn cards "

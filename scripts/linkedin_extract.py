@@ -46,6 +46,14 @@ MAX_ATTEMPTS = 3
 BACKOFF_BASE = 2.0          # seconds; attempt N waits BACKOFF_BASE ** N
 NAV_TIMEOUT = 120
 
+# How long `session_healthy` gives LinkedIn's SPA to mount before it will report an
+# ambiguous verdict. Short and bounded on purpose: the poll exits the moment any
+# definitive signal appears, so a lapsed login still costs one look, and the worst
+# case adds ~4s to a once-per-run check. The values are not arbitrary — the first
+# live run of that check read 1,172 chars off a not-yet-mounted page.
+HEALTH_SETTLE_ATTEMPTS = 4
+HEALTH_SETTLE_DELAY = 1.5
+
 # Politeness between consecutive postings. Randomised because a fixed cadence is
 # itself a bot signature, and jittered around a few seconds because a human reading
 # job ads does not open them 200ms apart. This is the only rate limiting there is —
@@ -170,6 +178,179 @@ def _evaluate(code):
         except json.JSONDecodeError:
             return {"raw": value}
     return value
+
+
+def daemon_reachable(timeout: float = 5.0) -> tuple[bool, str]:
+    """(reachable, detail) for the WebBridge daemon. Costs LinkedIn nothing.
+
+    The question a scheduled run needs answered before it commits to the browser
+    path, and it has to be answerable *locally*: an 08:00 job that discovers the
+    daemon is down by watching 25 extractions fail has already spent the phase's
+    wall-clock on nothing.
+
+    `list_tabs` is the probe for that reason. The action name is not a guess — the
+    daemon rejects an unknown action by returning its available list, and a
+    2026-08-24 probe with `list_sessions` came back with exactly that: navigate,
+    find_tab, evaluate, network, snapshot, click, fill, mouse_click, cdp, key_type,
+    send_keys, screenshot, save_as_pdf, upload, close_tab, list_tabs, close_session.
+    Anything outside that set reports a healthy daemon as unreachable.
+
+    Never raises. A health check that throws is one the caller has to wrap in a try,
+    and the point is to make choosing the fallback cheap.
+    """
+    try:
+        data = _call("list_tabs", {}, timeout=timeout)
+    except ExtractionError as exc:
+        # The unreachable message already names the start command; keep the first
+        # sentence so a log line stays one line.
+        return False, str(exc).split(". Start it")[0]
+    except RuntimeError as exc:
+        # `ok: false` — the daemon answered but the extension is stale or wedged.
+        # Worth distinguishing from unreachable: the remedy is different.
+        return False, f"daemon answered but rejected list_tabs: {str(exc)[:160]}"
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"unexpected {type(exc).__name__}: {str(exc)[:160]}"
+    tabs = data if isinstance(data, list) else (data or {}).get("tabs") or []
+    return True, f"daemon up, {len(tabs)} tab(s) open"
+
+
+def session_healthy(timeout: float = NAV_TIMEOUT) -> tuple[bool, str]:
+    """(authenticated, detail) for the browser's LinkedIn session. One request.
+
+    Checks the *session* rather than a posting, and that distinction is the value: a
+    run whose login has lapsed should fall back to the guest CLI once, up front,
+    instead of rediscovering the auth wall on every job in the budget.
+
+    Probes the logged-in jobs home because it always requires a session and shows
+    the wall unambiguously when there is none. Costs one LinkedIn request per run,
+    which is why this is a run-level check and not a per-job one, and why the caller
+    must count it against linkedin.max_requests_per_run.
+
+    Never raises, same contract as `daemon_reachable`.
+    """
+    return _health_verdict(navigate=True, reload=False, timeout=timeout)
+
+
+def recover_session(timeout: float = NAV_TIMEOUT) -> tuple[bool, str]:
+    """One attempt to rescue a session that just reported unhealthy. One request.
+
+    Foregrounds the tab and hard-reloads it, then re-reads the same probe. The only
+    failure this can actually fix is a *stale render* — a tab left on a cached or
+    half-mounted page, which `session_healthy` reports with the same string as a
+    genuinely lapsed login because from the outside the two look alike. A reload
+    cannot restore an expired cookie, and nothing here tries to: there is no LinkedIn
+    credential in this repo and none is wanted (see docs/BROWSER_ENRICHMENT.md).
+
+    So this is deliberately one attempt and not a loop. It costs a LinkedIn request,
+    and spending several of them on a login that has genuinely lapsed is worse than
+    falling back immediately — the guest CLI is waiting and it works.
+
+    The caller must not call this after a CAPTCHA verdict. Reloading a challenge page
+    is the first step of hammering it, and the standing instruction is to stop and
+    report instead. `browser_fetch_path` in enrich_linkedin.py enforces that.
+    """
+    return _health_verdict(navigate=False, reload=True, timeout=timeout)
+
+
+def _health_verdict(*, navigate: bool, reload: bool,
+                    timeout: float = NAV_TIMEOUT) -> tuple[bool, str]:
+    """The shared body of `session_healthy` and `recover_session`.
+
+    One probe, two entry points, so the two can never disagree about what a
+    signed-in page looks like. That is worth a factoring: the nav-label detection
+    below is the part that already broke once when LinkedIn renamed its markup, and
+    a second copy of it would be a second thing to miss on the next rename.
+    """
+    probe_js = r"""
+      (() => {
+        const body = (document.body && document.body.innerText) || "";
+        // Signed-in state is read off the nav TEXT, not off class names. Every
+        // `global-nav__*` selector this check first shipped with matched nothing on
+        // 2026-08-24 against a session that was demonstrably logged in ("Salman
+        // Ahmed", "9 Notifications" in the body) — LinkedIn had renamed them. The
+        // authenticated nav labels are product surface rather than markup, so they
+        // churn far more slowly, and none of them appear on the jobs-guest page a
+        // logged-out visitor gets. Two of the three must be present, so one stray
+        // footer word cannot fake a session.
+        const navHits = [/\bMy Network\b/i, /\bMessaging\b/i, /\bNotifications?\b/i]
+          .filter(re => re.test(body)).length;
+        const legacyChrome = !!document.querySelector(
+          'img.global-nav__me-photo,[data-control-name=nav_settings],' +
+          '.global-nav__me,.feed-identity-module');
+        return JSON.stringify({
+          authWall: /authwall|sign in to see|join now to see|new to linkedin\?/i
+            .test(body),
+          loggedOutChrome: /\bjoin now\b/i.test(body)
+            && !!document.querySelector('form.login__form,#session_key'),
+          captcha: !!document.querySelector(
+            '[id*=captcha],[class*=captcha],iframe[src*=recaptcha],' +
+            'iframe[src*=hcaptcha]'),
+          signedIn: navHits >= 2 || legacyChrome,
+          navHits: navHits,
+          readyState: document.readyState,
+          chars: body.length
+        });
+      })()
+    """
+    result = {}
+    try:
+        if navigate:
+            _call("navigate", {"url": "https://www.linkedin.com/jobs/",
+                               "newTab": False}, timeout=timeout)
+        # Mirrors the foregrounding in `extract` — see the comment on that call, which
+        # calls it the single most important line in the module. It matters just as
+        # much here, and finding that out cost a false negative: the first live run of
+        # this check read 1172 chars off a hidden tab and reported a perfectly good
+        # session as unauthenticated, because LinkedIn's SPA never mounts in a
+        # background tab.
+        _call("cdp", {"method": "Page.bringToFront", "params": {}})
+        if reload:
+            # ignoreCache because the one failure a reload can fix is a stale render,
+            # and a from-cache reload re-serves exactly the page that just failed.
+            _call("cdp", {"method": "Page.reload", "params": {"ignoreCache": True}},
+                  timeout=timeout)
+            time.sleep(HEALTH_SETTLE_DELAY)
+        # And then let it mount. A verdict read off a half-rendered page is worse than
+        # no verdict: it forces the guest fallback for the whole run on a session that
+        # was fine. Any definitive signal ends the poll early, so a genuinely lapsed
+        # login is still detected on the first look.
+        for attempt in range(HEALTH_SETTLE_ATTEMPTS):
+            if attempt:
+                time.sleep(HEALTH_SETTLE_DELAY)
+            probed = _evaluate(probe_js)
+            if not isinstance(probed, dict):
+                return False, (f"health probe returned {type(probed).__name__}, "
+                               "not an object")
+            result = probed
+            if (result.get("authWall") or result.get("captcha")
+                    or result.get("loggedOutChrome") or result.get("signedIn")):
+                break
+    except ExtractionError as exc:
+        return False, str(exc).split(". Start it")[0]
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"unexpected {type(exc).__name__}: {str(exc)[:160]}"
+
+    # A CAPTCHA is reported as unhealthy rather than raised: the caller's correct
+    # response is the same as for a lapsed session (use the guest CLI), and nothing
+    # here attempts to pass it.
+    if result.get("captcha"):
+        return False, "CAPTCHA on the LinkedIn session probe — not attempting to pass it"
+    if result.get("authWall"):
+        return False, "LinkedIn session is not authenticated (auth wall on /jobs/)"
+    if result.get("loggedOutChrome"):
+        return False, "LinkedIn session is not authenticated (logged-out jobs page)"
+    if not result.get("signedIn"):
+        # No wall and no authenticated nav either, after foregrounding and settling.
+        # Ambiguous, so it fails closed: the guest CLI returns full bodies for these
+        # postings anyway (measured 2026-08-24, 11 of 11 rows, 2.5k-10.1k chars), so
+        # the safe branch is cheap.
+        return False, (f"no auth wall but no authenticated nav either "
+                       f"({result.get('chars', 0)} chars, "
+                       f"{result.get('navHits', 0)}/3 nav labels, "
+                       f"readyState={result.get('readyState')}) — "
+                       "treating as unauthenticated")
+    return True, (f"LinkedIn session authenticated "
+                  f"({result.get('navHits', 0)}/3 nav labels)")
 
 
 def job_id_from_url(url: str) -> str | None:

@@ -510,8 +510,13 @@ if [[ "$RESUME" == "1" ]]; then
     log "Phase 1c: SKIPPED (RESUME=1) — no new LinkedIn requests; the rankset keeps whatever the earlier run enriched"
 elif (( ${ENRICH_BUDGET:-0} > 0 )) && (( SHORTLIST_JOBS > 0 )); then
     log "Phase 1c: enriching up to $ENRICH_BUDGET of the $SHORTLIST_JOBS shortlisted LinkedIn cards with full descriptions..."
+    # --alert-on-fallback only on this path. The unattended 08:00 run is the one where
+    # nobody is watching the log, so a browser that is down has to announce itself;
+    # a manual or benchmark run passing the same flag would ping the phone about a
+    # condition the operator is already looking at.
     if python3 scripts/enrich_linkedin.py --jobs "$SHORTLIST_FILE" \
             --matrix "$MATRIX" --delay "$LINKEDIN_DELAY" \
+            --alert-on-fallback \
             > "$ENRICH_FILE" 2>>"$LOG_FILE"; then
         # Read the summary through a file and a quoted heredoc, never by
         # interpolating the script's output into a Python literal: the summary is
@@ -526,12 +531,27 @@ except Exception as exc:
     print(f"summary unreadable ({exc})")
     sys.exit(0)
 
-print(f"{s.get('enriched', 0)}/{s.get('targeted', 0)} enriched, "
+print(f"{s.get('enriched', 0)}/{s.get('targeted', 0)} enriched "
+      f"via {s.get('fetch_path', 'guest')} "
+      f"({s.get('requests_spent', '?')} LinkedIn requests), "
       f"{s.get('alert_targets', 0)} alert-first, "
       f"{s.get('domain_only_targets', 0)} domain-only, "
       f"{s.get('failed', 0)} failed, {s.get('empty', 0)} empty, "
       f"{s.get('over_budget', 0)} over budget, "
       f"{s.get('already_seen', 0)} already known")
+
+# The browser path was unavailable, so the phase ran on guest HTTP. Not an error —
+# every gate still works on guest bodies — but it belongs in the report, because the
+# cause is usually something only a human can fix (a lapsed LinkedIn login, a
+# stopped desktop app) and it will otherwise recur silently every morning.
+if s.get("fallback_reason"):
+    with open(sys.argv[2], "a") as warn:
+        warn.write(
+            f"LinkedIn enrichment ran in fallback mode (guest HTTP) — "
+            f"{s['fallback_reason']}. Descriptions are still full posting bodies, so "
+            "every gate and score below is sound; the costs are a slower Phase 1c and "
+            "no structured seniority field on those rows. See "
+            "docs/BROWSER_ENRICHMENT.md to restore the browser path.\n")
 
 # A total wipeout means the detail endpoint is not answering. Surface it in the
 # report: silence would read as "LinkedIn postings are short today".
