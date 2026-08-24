@@ -85,10 +85,15 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 linkedin_alerts.py sets its own 60s socket timeout, so this is the
 #                 second line of defense rather than the first: it bounds the phase
 #                 whichever call blocks, including one that never touches that socket.
-#                 Normal duration is ~11s, so 300s cannot fire on a merely slow
+#                 Normal duration is ~11s, so 480s cannot fire on a merely slow
 #                 mailbox. The 2026-08-22 08:00 run needed this and had neither: it
 #                 sat in a single IMAP fetch for six hours, holding the lock and
-#                 producing no corpus, no ranking and no digest.
+#                 producing no corpus, no ranking and no digest. On timeout the phase
+#                 logs IMAP_TIMEOUT and Phase 1 continues with an empty alert list.
+#   QUERY_TIMEOUT seconds one portal search may run before it is stopped. Logs
+#                 TIMEOUT_EXCEEDED, records the query as zero results, and moves on
+#                 without retrying it in the same run — the plan budgets one request
+#                 per query, so a retry would spend a later query's request.
 KEEP_TEMP="${KEEP_TEMP:-0}"
 RANK_TIMEOUT="${RANK_TIMEOUT:-1800}"
 RANK_ATTEMPTS="${RANK_ATTEMPTS:-3}"
@@ -96,7 +101,21 @@ RANK_BACKOFF="${RANK_BACKOFF:-20}"
 RESUME="${RESUME:-0}"
 SKIP_ALERTS="${SKIP_ALERTS:-0}"
 SKIP_NOTIFY="${SKIP_NOTIFY:-0}"
-ALERT_TIMEOUT="${ALERT_TIMEOUT:-300}"
+# Phase 0b's total wall-clock ceiling: 8 minutes. Raised from 300s on 2026-08-24 after
+# a run in which Phase 0b occupied 45m44s and this watchdog never fired. The cause was
+# not the number: the loop accumulated `sleep 5` units, and accumulated sleep is not
+# elapsed time on a laptop that suspends mid-run. Every watchdog in this script now
+# measures elapsed wall clock with `date +%s` instead, so a suspend cannot stretch a bound.
+ALERT_TIMEOUT="${ALERT_TIMEOUT:-480}"
+# Per-query wall-clock ceiling for one portal search, 5 minutes. On 2026-08-24 a single
+# LinkedIn query hung 20 minutes and Phase 1 ran 1h33m; the search CLI's own per-request
+# deadline does not cover a stalled DNS lookup or TLS handshake. A query that trips this
+# is abandoned for the whole run, never retried — see the note at the call site.
+QUERY_TIMEOUT="${QUERY_TIMEOUT:-300}"
+# How many queries tripped QUERY_TIMEOUT this run. Initialised here rather than in
+# run_portal because `set -u` would reject the increment on the first fire, and the
+# Phase 1 summary reads it after the plan loop.
+QUERY_TIMEOUTS=0
 # Read out of the module rather than restated here, so the Phase 0b warning cannot
 # quote a socket timeout the code no longer uses. Grepped rather than imported: this
 # runs on every invocation and wants no side effects.
@@ -248,13 +267,22 @@ else
             --jobs-out "$ALERT_JOBS_FILE" --store "$ALERT_STORE" \
             --today "$TODAY" >>"$LOG_FILE" 2>&1 &
     ALERT_PID=$!
+    # Deadline, not a counter. This loop used to do ALERT_WAIT=$((ALERT_WAIT + 5)) after
+    # each `sleep 5` and treat the total as elapsed seconds. It is not: `sleep 5` can
+    # cover far more than five seconds of wall clock when the machine suspends, so the
+    # counter undercounts and the bound silently stretches. On 2026-08-24 Phase 0b ran
+    # 45m44s against a 300s ceiling and this watchdog never fired — the counter had not
+    # reached 300 in sleep-units by the time the child died on its own, which is why the
+    # run landed in the `failed` branch below instead of the 124 branch. Comparing
+    # elapsed wall clock against ALERT_TIMEOUT cannot be stretched that way.
+    ALERT_START=$(date +%s)
     ALERT_WAIT=0
     ALERT_TIMED_OUT=0
     while kill -0 $ALERT_PID 2>/dev/null; do
         sleep 5
-        ALERT_WAIT=$((ALERT_WAIT + 5))
+        ALERT_WAIT=$(( $(date +%s) - ALERT_START ))
         if (( ALERT_WAIT >= ALERT_TIMEOUT )); then
-            log "Phase 0b TIMEOUT after ${ALERT_WAIT}s — killing the mailbox read"
+            log "Phase 0b TIMEOUT (IMAP_TIMEOUT) after ${ALERT_WAIT}s — killing the mailbox read, Phase 1 continues with an empty alert list"
             kill $ALERT_PID 2>/dev/null || true
             sleep 2
             kill -9 $ALERT_PID 2>/dev/null || true
@@ -284,7 +312,7 @@ else
         # than "failed" — a phase that was killed mid-read is not a verdict about
         # the mailbox's contents.
         if (( ALERT_EXIT == 124 )); then
-            log "WARNING: Phase 0b was stopped after ${ALERT_TIMEOUT}s — continuing with search results only. See $LOG_FILE."
+            log "WARNING: Phase 0b IMAP_TIMEOUT — stopped after ${ALERT_TIMEOUT}s, continuing with search results only. See $LOG_FILE."
             echo "The LinkedIn alert read (Phase 0b) did not finish within ${ALERT_TIMEOUT}s and was stopped, so today's alert emails went unread and the corpus is search-only. This is the phase-level watchdog, which means linkedin_alerts.py's own ${IMAP_TIMEOUT_HINT}s socket timeout did not catch whatever blocked — worth looking at rather than just raising ALERT_TIMEOUT. Jobs alerted on earlier days keep their 30-day window; anything alerted only today is judged at the standard 75." >> "$WARN_FILE"
         else
             log "WARNING: Phase 0b failed — continuing with search results only. Today's alerts went unread, so any job alerted only today misses the gate's 60 tier; see $LOG_FILE."
@@ -341,11 +369,50 @@ run_portal() {
     done
 
     log "  $name: searching..."
-    if bun run ".agents/skills/${portal}-search/cli/src/cli.ts" "$@" > "$outfile" 2>>"$LOG_FILE"; then
+    # Backgrounded with a watchdog for the same reason as Phase 0b: macOS ships no
+    # `timeout`, and the search CLI's own per-request deadline does not cover a stalled
+    # DNS lookup or TLS handshake. On 2026-08-24 one LinkedIn query sat for 20 minutes
+    # and Phase 1 took 1h33m. Deadline-based, not a sleep counter — see the note in the
+    # Phase 0b block for why an accumulated counter is not elapsed time.
+    #
+    # Both `set -e` hazards from Phase 0b apply here too: the timeout branch reaps the
+    # PID itself and must `break` rather than fall through to a second `wait`, and the
+    # normal path's `wait` is guarded with `|| rc=$?`.
+    local query_pid query_start query_waited=0 query_timed_out=0 rc=0
+    bun run ".agents/skills/${portal}-search/cli/src/cli.ts" "$@" > "$outfile" 2>>"$LOG_FILE" &
+    query_pid=$!
+    query_start=$(date +%s)
+    while kill -0 $query_pid 2>/dev/null; do
+        sleep 2
+        query_waited=$(( $(date +%s) - query_start ))
+        if (( query_waited >= QUERY_TIMEOUT )); then
+            kill $query_pid 2>/dev/null || true
+            sleep 1
+            kill -9 $query_pid 2>/dev/null || true
+            wait $query_pid 2>/dev/null || true
+            query_timed_out=1
+            break
+        fi
+    done
+
+    if (( query_timed_out == 1 )); then
+        # Abandoned for the whole run, deliberately not retried: build_search_plan.py
+        # budgets one request per plan entry against max_requests_per_run, so retrying
+        # this query here would spend a later query's request and push the run over the
+        # cap. The day loses this slice of the corpus; the next run re-queries it.
+        log "  $name: TIMEOUT_EXCEEDED after ${query_waited}s — abandoned for this run (no retry)"
+        echo '{"meta":{"count":0},"results":[]}' > "$outfile"
+        QUERY_TIMEOUTS=$(( QUERY_TIMEOUTS + 1 ))
+        return 0
+    fi
+
+    wait $query_pid || rc=$?
+    if (( rc == 0 )); then
         PORTAL_COUNT=$(python3 -c "import json; print(json.load(open('$outfile')).get('meta',{}).get('count', 0))" 2>/dev/null || echo "0")
         log "  $name: $PORTAL_COUNT results"
     else
-        local rc=$?
+        # `rc` was captured off `wait` above; re-reading `$?` here would pick up the
+        # arithmetic test's own status, not the CLI's.
         log "  $name: CLI failed (exit $rc)"
         echo '{"meta":{"count":0},"results":[]}' > "$outfile"
     fi
@@ -395,6 +462,12 @@ while IFS=$'\t' read -r -a plan_row; do
         sleep "$LINKEDIN_DELAY"
     fi
 done < "$PLAN_FILE"
+
+# Surfaced as its own line so a run's HTTP timeout count is greppable without
+# counting TIMEOUT_EXCEEDED occurrences by hand.
+if (( QUERY_TIMEOUTS > 0 )); then
+    log "Phase 1: $QUERY_TIMEOUTS query/queries hit TIMEOUT_EXCEEDED (${QUERY_TIMEOUT}s each) and were abandoned for this run"
+fi
 
 # A total LinkedIn shutout means a fetch problem (block page, changed markup, no
 # network), not an empty European job market. Say so instead of reporting "0 jobs"
