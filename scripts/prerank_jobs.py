@@ -108,10 +108,14 @@ them from over-reaching:
   * The employer's country is not a language requirement. A Munich role advertised
     in English passes.
 
-Eligibility and sponsorship are still **not** screened here. A sponsorship-flagged
-job still qualifies for documents, so a country test would silently drop jobs the
-real Eligibility Gate would have FLAGged and kept. That gate stays in the ranker
-(prompt Step 3). Jobs already in `seen_jobs.json` are excluded outright, since the
+Sponsorship *is* screened here as of the gate tribunal, but only the arithmetically
+impossible half of it: a posting that refuses sponsorship outright, or that demands a
+passport, citizenship or pre-existing unrestricted work rights, cannot be won by a
+Pakistani passport holder no matter how the ranker reads it. Everything softer than
+that — a country preference, a relocation question, an unstated permit situation —
+still belongs to the real Eligibility Gate in the ranker (prompt Step 3), which
+FLAGs rather than drops, because a sponsorship-flagged job still qualifies for
+documents. Jobs already in `seen_jobs.json` are excluded outright, since the
 ranker discards them at Step 2 anyway and giving them a slot buys nothing.
 
 Alert-matched jobs

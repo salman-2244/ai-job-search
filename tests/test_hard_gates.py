@@ -1414,5 +1414,446 @@ class TestUnverifiedJobsStayTargetableByEnrichment(unittest.TestCase):
                          "unverified is not a failure and must discard nothing")
 
 
+class SponsorshipGate(unittest.TestCase):
+    """The bar this profile cannot clear by trying harder.
+
+    The candidate holds a Pakistani passport. A posting that refuses sponsorship, or
+    that demands a passport, citizenship or pre-existing work rights, is an absolute
+    disqualifier — unlike a language line, there is no "preferred" reading of it. Two
+    real 2026-08-24 postings reached Telegram because no gate in the module read work
+    authorisation at all; both are pinned below.
+
+    The gate distinguishes two bars, recorded in `bar`:
+
+      * ``sponsorship_denied`` — the employer says it will not sponsor. Nothing
+        pardons this.
+      * ``authorisation_wall`` — the employer demands papers. An explicit offer of
+        sponsorship elsewhere in the same posting pardons it, because the wall is
+        then describing the destination state rather than a precondition.
+    """
+
+    def verdict(self, text, title="Business Analyst"):
+        return hg.sponsorship_verdict(title, text)["verdict"]
+
+    def test_mcs_group_no_sponsorship_available(self):
+        """MCS Group, third line of the posting — the cleanest possible statement.
+
+        The typo "Please not" for "Please note" is in the original, which is why the
+        pattern anchors on the ``no sponsorship available`` core and not on the
+        polite preamble wrapped around it.
+        """
+        got = hg.sponsorship_verdict(
+            "Digital Transformation & Automation Manager",
+            "Please not there is no sponsorship available for this role - all "
+            "candidates must be in a commutable distance to Dundalk.")
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertEqual(got["bar"], "sponsorship_denied")
+        self.assertIn("no sponsorship available", got["quote"])
+        self.assertFalse(got["sponsorship_offered"],
+                         "a denial sentence must never be read as an offer")
+
+    def test_baker_hughes_eu_passport(self):
+        """Baker Hughes: "...and hold an EU passport".
+
+        Stated bare, with no "must" — the demand is carried by the list it sits in.
+        The language gate correctly passes this sentence (Italian genuinely *is*
+        preferred), so the passport clause is the only thing standing between this
+        posting and a drafted CV.
+        """
+        got = hg.sponsorship_verdict(
+            "Supplier Fulfillment Specialist",
+            "Be fluent in English (Italian knowledge is also preferred) and hold "
+            "an EU passport")
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertEqual(got["bar"], "authorisation_wall")
+        self.assertIn("passport", got["quote"])
+
+    def test_the_denials_that_must_all_convict(self):
+        for text in ("Please note we do not offer visa sponsorship for this "
+                     "position.",
+                     "We are unable to sponsor candidates for this role.",
+                     "Sponsorship is not available.",
+                     "No visa sponsorship is provided.",
+                     "We cannot sponsor work permits at this time.",
+                     "This role is not eligible for immigration sponsorship.",
+                     "Candidates must be able to work without sponsorship."):
+            with self.subTest(text):
+                self.assertEqual(self.verdict(text), hg.FAIL)
+
+    def test_the_walls_that_must_all_convict(self):
+        for text in ("You must have the right to work in the EU.",
+                     "Applicants must be EU citizens.",
+                     "Must hold an EU passport.",
+                     "You must be a national of an EU member state.",
+                     "Only Irish applicants will be considered.",
+                     "Candidates must have permanent residency in Germany.",
+                     "You must be legally authorized to work in the United "
+                     "States without sponsorship.",
+                     "Applicants must already have the right to work in the UK.",
+                     "You must have unrestricted work authorisation.",
+                     "A valid work permit is required."):
+            with self.subTest(text):
+                self.assertEqual(self.verdict(text), hg.FAIL)
+
+    def test_a_negated_requirement_is_pardoned(self):
+        """"No citizenship requirement" is the opposite of a citizenship bar.
+
+        The negator is read in a short run-up window before the match, so the
+        pardon cannot be borrowed from an unrelated earlier clause.
+        """
+        for text in ("No passport or citizenship requirement - we welcome all "
+                     "applicants.",
+                     "You do not need a work permit before applying.",
+                     "We consider applicants regardless of citizenship.",
+                     "Applications are welcome irrespective of nationality."):
+            with self.subTest(text):
+                self.assertEqual(self.verdict(text), hg.PASS)
+
+    def test_an_explicit_offer_pardons_a_wall_but_never_a_denial(self):
+        offer = ("We are happy to provide visa sponsorship and relocation "
+                 "support. A valid work permit is required before your start "
+                 "date.")
+        self.assertEqual(self.verdict(offer), hg.PASS,
+                         "an offer reframes a papers clause as the destination")
+        denial = ("We provide visa sponsorship for most roles. For this role "
+                  "there is no sponsorship available.")
+        got = hg.sponsorship_verdict("Business Analyst", denial)
+        self.assertEqual(got["verdict"], hg.FAIL,
+                         "a boilerplate offer must not pardon a stated refusal")
+        self.assertEqual(got["bar"], "sponsorship_denied")
+
+    def test_an_ordinary_posting_states_no_bar(self):
+        got = hg.sponsorship_verdict(
+            "Data Analyst",
+            "You will build dashboards in Power BI and partner with supply "
+            "chain stakeholders across our European sites. We offer a hybrid "
+            "working model and a competitive package.")
+        self.assertEqual(got["verdict"], hg.PASS)
+        self.assertEqual(got["reason"], "no sponsorship or citizenship bar stated")
+
+    def test_no_text_is_unknown_not_pass_and_not_fail(self):
+        """Same asymmetry as every other gate: absent evidence is not innocence."""
+        self.assertEqual(hg.sponsorship_verdict("Data Analyst", "")["verdict"],
+                         hg.UNKNOWN)
+
+    def test_a_card_snippet_cannot_clear_the_bar(self):
+        """A truncated card is where a sponsorship clause hides — it is usually
+        in the small print at the bottom, which a snippet never reaches."""
+        got = hg.sponsorship_verdict("Data Analyst",
+                                     "Join our team and make an impact.",
+                                     full_text=False)
+        self.assertEqual(got["verdict"], hg.UNKNOWN)
+
+    def test_a_stated_bar_still_convicts_from_a_snippet(self):
+        """The downgrade only softens PASS. Evidence that is present is used."""
+        got = hg.sponsorship_verdict("Data Analyst",
+                                     "No visa sponsorship available.",
+                                     full_text=False)
+        self.assertEqual(got["verdict"], hg.FAIL)
+
+
+class TheGateTribunal(unittest.TestCase):
+    """The six 2026-08-24 postings that put the gates on trial.
+
+    Five reached Telegram and should not have; one reached Telegram and was right
+    to. Each row below is the exact wording from
+    ``/tmp/jobsearch_rankset_2026-08-24.json``, the artifact the run itself gated
+    on, so this class is the regression suite for the tribunal's four laws.
+
+    Two of the five are pinned as UNKNOWN rather than FAIL on purpose. Google and
+    Coca-Cola were never gated at all: LinkedIn served 1456-byte skeletons and no
+    body was ever retrieved, so those rows are an enrichment-coverage defect, not a
+    gate defect. The gate returns the right verdict the moment text exists, which
+    is what the two ``*_with_text`` tests below assert.
+    """
+
+    # Coca-Cola's real body was never served, so this is a representative Spanish
+    # posting of realistic length rather than the original text. What it pins is
+    # the LAW 3 behaviour the missing body would have triggered.
+    SPANISH = (
+        "En Coca-Cola Europacific Partners buscamos un Tecnico/a de Operational "
+        "Excellence para nuestra planta. Tu mision sera liderar los proyectos de "
+        "mejora continua y el desarrollo de los indicadores de gestion de la "
+        "fabrica. Que buscamos en ti: titulacion universitaria en ingenieria, "
+        "experiencia previa en entornos industriales y conocimientos de "
+        "metodologias Lean y Six Sigma. Ofrecemos un plan de desarrollo "
+        "profesional, formacion continua y un paquete retributivo competitivo, "
+        "ademas de las ventajas sociales de la compania. Si te apasiona la mejora "
+        "de los procesos y quieres formar parte de un equipo diverso, inscribete "
+        "en la oferta y te contaremos mucho mas."
+    )
+
+    GOOGLE = ("5 years of experience in operations or business management, and "
+              "vendor management.\n"
+              "5 years of experience using analytics or applying project "
+              "management tools to address business issues.")
+
+    def test_perpetrator_1_brp_rotax_very_good_german(self):
+        """"Very good German and English skills" — the one true pattern gap.
+
+        ``REQUIRED_MARKERS`` had no "very good", ``OPTIONAL_MARKERS`` had none
+        either, so the sentence was filed as neither and the posting was stamped
+        PASS with the reason "no language condition stated".
+        """
+        got = hg.language_verdict("Strategic Maintenance - Data Analytics & "
+                                  "Asset Strategy (m/f/d)",
+                                  "Very good German and English skills")
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertEqual(got["languages_required"], ["german"])
+        self.assertIn("German", got["quote"])
+
+    def test_perpetrator_2_baker_hughes_is_caught_by_sponsorship_not_language(self):
+        """Both halves of the verdict matter.
+
+        Convicting this posting on language grounds would have been *wrong* —
+        Italian is genuinely preferred. The passport clause is the disqualifier,
+        and it needed a gate that did not exist.
+        """
+        text = ("Be fluent in English (Italian knowledge is also preferred) and "
+                "hold an EU passport")
+        self.assertEqual(hg.language_verdict("Supplier Fulfillment Specialist",
+                                             text)["verdict"], hg.PASS)
+        self.assertEqual(hg.sponsorship_verdict("Supplier Fulfillment Specialist",
+                                                text)["verdict"], hg.FAIL)
+
+    def test_perpetrator_3_mcs_group_no_sponsorship(self):
+        got = hg.sponsorship_verdict(
+            "Digital Transformation & Automation Manager",
+            "Please not there is no sponsorship available for this role - all "
+            "candidates must be in a commutable distance to Dundalk.")
+        self.assertEqual(got["verdict"], hg.FAIL)
+
+    def test_perpetrator_4_google_with_text_reads_the_maximum_figure(self):
+        """Two bullets, each stating five years. The policy is the maximum.
+
+        The gate was never defective here — it was never given the text. Given the
+        text it takes ``max(found)``, so neither bullet can be excused by the other.
+        """
+        got = hg.experience_verdict("Vendor Operations Manager", self.GOOGLE)
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertEqual(got["years_required"], 5)
+
+    def test_perpetrator_4_google_as_the_run_actually_saw_it(self):
+        """No description, no snippet — UNKNOWN, and UNKNOWN is not failure.
+
+        Pinned so the enrichment-coverage defect stays visible as itself. If this
+        ever flips to FAIL, a gate has started convicting on absent evidence.
+        """
+        got = hg.evaluate({"title": "Vendor Operations Manager"}, None)
+        self.assertEqual(got["overall"], hg.UNKNOWN)
+        self.assertEqual(got["failed"], [])
+
+    def test_perpetrator_5_coca_cola_with_text_is_read_as_spanish(self):
+        """The body is Spanish, and the evidence must say *spanish*.
+
+        Before LAW 3 the overlapping stopword lists made a Spanish posting report
+        as Portuguese — a gate that names the wrong language is hard to audit.
+        """
+        detected = hg.detect_posting_language("Tecnico/a Operational Excellence",
+                                              self.SPANISH)
+        self.assertEqual(detected["language"], "spanish")
+        self.assertEqual(detected["verdict"], hg.FAIL)
+        got = hg.language_verdict("Tecnico/a Operational Excellence",
+                                  self.SPANISH)
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertEqual(got["reason"], "posting is written in spanish")
+
+    def test_perpetrator_5_coca_cola_as_the_run_actually_saw_it(self):
+        got = hg.evaluate({"title": "Tecnico/a Operational Excellence"}, None)
+        self.assertEqual(got["overall"], hg.UNKNOWN)
+        self.assertEqual(got["failed"], [])
+
+    def test_the_acquittal_leica_english_and_preferably_german(self):
+        """NOT GUILTY. "English and preferably German" is a preference.
+
+        This is the case the LAW 2 conjunction rule most endangers: the sentence
+        matches "English and <language>" *and* contains "preferably". Optional is
+        tested before required, so the preference wins. If this flips to FAIL the
+        rewrite has converted a correct acquittal into a false conviction.
+        """
+        got = hg.language_verdict(
+            "Global Service Process & AI Enablement Manager",
+            "The essential requirements of the job include: English and "
+            "preferably German.")
+        self.assertEqual(got["verdict"], hg.PASS)
+        self.assertEqual(got["reason"], "only optional language preferences stated")
+        self.assertEqual(got["languages_optional"], ["german"])
+        self.assertEqual(got["languages_required"], [])
+
+    def test_the_acquittal_survives_every_other_gate_too(self):
+        got = hg.evaluate(
+            {"title": "Global Service Process & AI Enablement Manager",
+             "description": "The essential requirements of the job include: "
+                            "English and preferably German. 3 years of "
+                            "experience in service process management. We offer "
+                            "relocation support and visa sponsorship."},
+            {"domain_in_title": ["process"], "domain_from_description": [],
+             "enabler_in_title": ["ai"], "enabler_from_description": []})
+        self.assertEqual(got["overall"], hg.PASS)
+        self.assertEqual(got["failed"], [])
+
+
+class TheLawsEdgeCases(unittest.TestCase):
+    """The named edge cases from the tribunal brief, both directions.
+
+    The must-PASS half is the more important one. Every rule added by the four laws
+    widens the net, and a gate that convicts an eligible job removes it silently.
+    """
+
+    def test_the_wordings_that_must_all_fail(self):
+        for gate, text in (
+                (hg.language_verdict, "Candidates must be a native speaker."),
+                (hg.language_verdict, "Mother tongue German."),
+                (hg.language_verdict, "Native level Dutch is expected."),
+                (hg.language_verdict, "English and German."),
+                (hg.sponsorship_verdict,
+                 "Please note we do not offer visa sponsorship for this "
+                 "position."),
+                (hg.sponsorship_verdict,
+                 "You must have the right to work in the EU."),
+                (hg.experience_verdict, "3-5 years of experience in analytics."),
+                (hg.experience_verdict,
+                 "5 years in ops. 5 years in analytics."),
+                (hg.experience_verdict, "5 years of relevant background."),
+                (hg.experience_verdict, "A proven history of 5 years.")):
+            with self.subTest(f"{gate.__name__}: {text}"):
+                self.assertEqual(gate("Business Analyst", text)["verdict"],
+                                 hg.FAIL)
+
+    def test_the_wordings_that_must_all_pass(self):
+        for gate, text in (
+                (hg.experience_verdict, "2-3 years of experience in analytics."),
+                (hg.experience_verdict,
+                 "2 years of experience in X. 3 years of experience in Y."),
+                (hg.language_verdict, "English (German a plus)."),
+                (hg.language_verdict, "English required, German preferred."),
+                (hg.language_verdict,
+                 "We are looking for a native English speaker."),
+                (hg.language_verdict,
+                 "We are an English-speaking company with German and French "
+                 "offices."),
+                (hg.language_verdict,
+                 "You will support our German and Austrian markets."),
+                (hg.language_verdict,
+                 "Strong analytical skills and very good stakeholder "
+                 "management."),
+                (hg.sponsorship_verdict,
+                 "We provide visa sponsorship and relocation support."),
+                (hg.sponsorship_verdict,
+                 "We consider applicants regardless of citizenship."),
+                (hg.sponsorship_verdict,
+                 "Only shortlisted applicants will be contacted."),
+                (hg.sponsorship_verdict,
+                 "We will support your relocation and help you obtain a work "
+                 "permit; a work permit is required to start."),
+                (hg.sponsorship_verdict,
+                 "You will work with our German and Austrian colleagues on "
+                 "European rollouts."),
+                (hg.sponsorship_verdict,
+                 "A valid driving licence is required for site visits.")):
+            with self.subTest(f"{gate.__name__}: {text}"):
+                self.assertEqual(gate("Business Analyst", text)["verdict"],
+                                 hg.PASS)
+
+    def test_a_company_age_is_not_a_tenure_requirement(self):
+        """The regression that the Amaris case caught during the rewrite.
+
+        Suppressing company-age prose with prepositional phrases like "in
+        business" silently ate Amaris's "At least 15 years of experience in
+        business analysis" — a fifteen-year floor read as boilerplate. The
+        suppressor is therefore checked in the *lookbehind only*: a corporate
+        subject precedes the figure, a requirement's domain follows it.
+        """
+        floor = hg.experience_verdict(
+            "Business Analyst",
+            "At least 15 years of experience in business analysis.")
+        self.assertEqual(floor["verdict"], hg.FAIL)
+        self.assertEqual(floor["years_required"], 15)
+        for prose in ("Our company has 18 years in business.",
+                      "We have grown over 20 years in the market.",
+                      "The company was founded 30 years ago."):
+            with self.subTest(prose):
+                self.assertEqual(
+                    hg.experience_verdict("Business Analyst", prose)["verdict"],
+                    hg.PASS)
+
+    def test_a_native_demand_needs_the_demand_and_not_just_the_word(self):
+        """"native English speaker" passes; "must be a native speaker" fails.
+
+        The rule is language-agnostic because its trigger sentence often names no
+        language at all — which is exactly why it must not fire on every use of
+        the word "native".
+        """
+        self.assertEqual(
+            hg.language_verdict("Data Analyst",
+                                "Native English speaker preferred.")["verdict"],
+            hg.PASS)
+        got = hg.language_verdict("Data Analyst", "Must be a native speaker.")
+        self.assertEqual(got["verdict"], hg.FAIL)
+        self.assertIn("native-speaker", got["languages_required"])
+
+    def test_the_conjunction_rule_is_anchored_on_adjacency(self):
+        """"English and German" is a requirement. Two languages in one paragraph
+        are not. The pattern requires them adjacent, optionally joined by one
+        connective — co-occurrence anywhere in the sentence is not enough."""
+        self.assertEqual(
+            hg.language_verdict("Data Analyst",
+                                "English and German.")["verdict"], hg.FAIL)
+        self.assertEqual(
+            hg.language_verdict(
+                "Data Analyst",
+                "You will report in English to stakeholders across our German "
+                "and Nordic sites.")["verdict"], hg.PASS)
+
+
+class TheCombinedBlockRunsFiveGates(unittest.TestCase):
+    """`evaluate()` gained a fifth gate, and the consumers read it by name.
+
+    `prerank_jobs.gate_reason` iterates ``verdict["failed"]`` and looks each name up
+    in the block, so a gate that fails without appearing in both places renders no
+    reason in the daily report.
+    """
+
+    AXES = {"domain_in_title": ["supply_chain"], "domain_from_description": [],
+            "enabler_in_title": [], "enabler_from_description": []}
+
+    def test_the_block_carries_all_five_gates(self):
+        got = hg.evaluate({"title": "Business Analyst",
+                           "description": "You will build Power BI dashboards "
+                                          "for our supply chain teams."},
+                          self.AXES)
+        for gate in ("language", "experience", "sponsorship", "seniority",
+                     "pure_technical"):
+            with self.subTest(gate):
+                self.assertIn(gate, got)
+                self.assertIn("verdict", got[gate])
+
+    def test_a_sponsorship_failure_is_named_in_the_failed_list(self):
+        got = hg.evaluate({"title": "Business Analyst",
+                           "description": "You will build Power BI dashboards "
+                                          "for our supply chain teams. Please "
+                                          "note there is no sponsorship "
+                                          "available for this role."},
+                          self.AXES)
+        self.assertEqual(got["overall"], hg.FAIL)
+        self.assertIn("sponsorship", got["failed"])
+        self.assertEqual(got["sponsorship"]["bar"], "sponsorship_denied")
+
+    def test_every_named_failure_resolves_to_a_block_with_a_reason(self):
+        """The contract `gate_reason` depends on, pinned against all five gates."""
+        got = hg.evaluate({"title": "Senior Data Scientist",
+                           "description": "Fluent German required. 8 years of "
+                                          "experience in ML. We do not sponsor "
+                                          "visas."},
+                          {"domain_in_title": [], "domain_from_description": [],
+                           "enabler_in_title": [], "enabler_from_description": []})
+        self.assertEqual(got["overall"], hg.FAIL)
+        self.assertTrue(got["failed"])
+        for name in got["failed"]:
+            with self.subTest(name):
+                self.assertIn(name, got)
+                self.assertTrue(got[name].get("reason"))
+
+
 if __name__ == "__main__":
     unittest.main()

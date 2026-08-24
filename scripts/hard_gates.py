@@ -123,12 +123,38 @@ BLOCKED_LANGUAGES = {
 }
 
 # Wording that makes a language a hard job condition.
+#
+# The intensifier block on the second row is the 2026-08-24 repair. BRP-Rotax's
+# "Very good German and English skills" matched the `german` alias, then missed
+# *both* marker lists — no "very good" in either — so it fell through to the tail
+# and was stamped PASS with "no language condition stated", about a posting that
+# states one in plain words. Probing found the same hole under "excellent",
+# "strong", "working knowledge", "good command of" and a bare "needed". Real
+# postings reach for an adjective far more often than for the word "required".
 REQUIRED_MARKERS = (
     "required", "requirement", "require", "mandatory", "must have", "must speak",
+    "very good", "excellent", "strong", "good command", "command of", "advanced",
+    "working knowledge", "needed", "solid", "good knowledge", "sound knowledge",
     "fluent", "fluency", "native", "proficient", "proficiency", "business level",
     "business fluent", "c1", "c2", "b2", "verhandlungssicher", "essential",
     "is a must", "a must", "necessary", "obligatory", "compulsory",
 )
+
+# Native-speaker demands, scanned *without* reference to any language name.
+#
+# "Must be a native speaker." names no language, so the `for lang, aliases in
+# BLOCKED_LANGUAGES.items()` loop never enters its body and no marker list can ever
+# reach it. It is still an absolute bar: the profile's native languages are Urdu and
+# Punjabi, and no European employer writing this sentence means those. Same for
+# "mother tongue" and "native level" used without naming the tongue — in context
+# they always mean the local one.
+_NATIVE_DEMAND = tuple(re.compile(p) for p in (
+    r"\bnative\s+(?:speaker|level|proficiency|fluency|command|tongue)\b",
+    r"\bmother\s+tongue\b",
+    r"\bmothertongue\b",
+    r"\bnative\s+or\s+bilingual\b",
+    r"\bmust\s+be\s+(?:a\s+)?native\b",
+))
 
 # Wording that makes it optional. Checked FIRST and it wins: "Hungarian knowledge
 # is an advantage" and "Hungarian (preferred)" are both passes, and a sentence can
@@ -139,6 +165,35 @@ OPTIONAL_MARKERS = (
     "bonus", "asset", "welcome", "appreciated", "ideally", "optional",
     "not required", "no need", "not necessary", "not mandatory", "would be great",
 )
+
+
+# A bare conjunction of English with a blocked language, with no marker either way.
+#
+# "English and German." and "English, German." carry no marker at all, required or
+# optional, so both marker lists missed them and the tail stamped PASS. A
+# requirements list that names two languages side by side is asking for both — the
+# instruction here is to err cautious.
+#
+# Anchored on *adjacency*, not co-occurrence, and that distinction is what keeps the
+# rule usable: "We are an English-speaking company with German and French offices"
+# contains both names in one sentence but never puts them next to each other, so it
+# does not match. `_norm` deletes commas, so "English, German" arrives as
+# "english german" — bare adjacency is the normalised form of the comma list, which
+# is why the joiner group is optional.
+#
+# It is still the loosest rule in this gate, and it is deliberately checked LAST,
+# after both marker lists. "English and preferably German" is broken up by the
+# adverb so it does not match the adjacency either — but even if it did, the
+# optional branch has already claimed it. Belt and braces on the Leica acquittal.
+_CONJUNCTION_JOINERS = r"(?:\s+(?:and|&|/|or|plus|with))?\s+"
+
+
+@lru_cache(maxsize=None)
+def _conjunction_pattern(lang: str) -> re.Pattern:
+    alias = "|".join(re.escape(a) for a in BLOCKED_LANGUAGES[lang])
+    return re.compile(
+        rf"\benglish{_CONJUNCTION_JOINERS}(?:{alias})\b"
+        rf"|\b(?:{alias}){_CONJUNCTION_JOINERS}english\b")
 
 # Sentence splitter. A language condition and its qualifier live in the same
 # sentence or the same bullet; scanning the whole posting at once would let one
@@ -234,6 +289,230 @@ def _unverified(block: dict, caveat: str = SNIPPET_CAVEAT) -> dict:
             "reason": f"{block['reason']}, but {caveat} — unverified, not a pass"}
 
 
+# ------------------------------------------- sponsorship & citizenship gate
+#
+# LAW 1. The highest-priority gate, and the only one that reads work authorisation.
+# It exists because on 2026-08-24 two postings reached Telegram whose text stated an
+# absolute bar in plain English, three lines from the top in one case, and this
+# module had no code path capable of noticing:
+#
+#   Baker Hughes  "...and hold an EU passport"
+#   MCS Group     "Please not there is no sponsorship available for this role"
+#
+# The profile is a Pakistani passport holder on a Hungarian residence permit. A role
+# demanding an EU passport, EU citizenship, permanent residency, or pre-existing
+# unrestricted work rights is not a stretch application — it is arithmetically
+# impossible, and spending a rank slot on it is pure waste. See docs/GATE_TRIBUNAL.md.
+#
+# Two families of pattern, and they treat negation in *opposite* ways, which is why
+# they are separate tuples rather than one list:
+#
+#   _SPONSORSHIP_DENIED — negation is the disqualifier and is baked into the pattern.
+#   "no sponsorship" IS the bar. Nothing pardons these.
+#
+#   _AUTHORISATION_WALL — the requirement is the disqualifier, so a negator sitting
+#   just ahead of it *pardons* it. "No EU passport required" is the opposite of
+#   "EU passport required", and a naive substring match on the latter reads the
+#   former as a rejection.
+#
+# Deliberately anchored on the disqualifying core, never on the polite preamble
+# wrapped around it. MCS Group typed "Please not" for "Please note"; a pattern
+# keyed on "please note there is no sponsorship" would have missed the real posting
+# that motivated this gate. Corporate euphemism is the norm here, so the patterns
+# are paranoid by instruction: match the claim, ignore the framing.
+_SPONSORSHIP_DENIED = tuple(re.compile(p) for p in (
+    # "no sponsorship", "no visa sponsorship", "no work visa sponsorship"
+    r"\bno\s+(?:visa\s+|work\s+|immigration\s+)*sponsorship\b",
+    r"\bno\s+(?:visa|work\s+permit|immigration)\s+(?:support|assistance)\b",
+    # "we do not sponsor", "does not sponsor", "will not sponsor", "won't sponsor"
+    r"\b(?:do|does|will|can|could|shall)\s+not\s+sponsor\b",
+    r"\bwon\s+t\s+sponsor\b",          # `_norm` strips the apostrophe
+    r"\bcan\s*not\s+sponsor\b",
+    r"\bunable\s+to\s+(?:sponsor|offer\s+sponsorship|provide\s+sponsorship)\b",
+    r"\bnot\s+(?:able|in\s+a\s+position)\s+to\s+(?:sponsor|offer|provide)\b",
+    # "sponsorship is not provided/available/offered/possible"
+    r"\bsponsorship\s+(?:is\s+|are\s+)?not\s+"
+    r"(?:provided|available|offered|possible|supported)\b",
+    r"\bsponsorship\s+(?:cannot|can\s*not)\s+be\s+(?:offered|provided)\b",
+    # "we do not offer visa sponsorship", "does not provide sponsorship"
+    r"\bnot\s+(?:offer|provide|support)\w*\s+(?:any\s+)?"
+    r"(?:visa\s+|work\s+|immigration\s+)*sponsorship\b",
+    # "candidates must be eligible to work ... without sponsorship"
+    r"\bwithout\s+(?:visa\s+|the\s+need\s+for\s+)*sponsorship\b",
+    # "this role is not eligible for immigration sponsorship" — the euphemism that
+    # refuses nothing out loud. The role is the grammatical subject, so no verb of
+    # refusal ever appears and every "we do not sponsor" pattern above misses it.
+    r"\bnot\s+eligible\s+for\s+(?:\w+\s+){0,3}sponsorship\b",
+))
+
+# Nationality adjectives, for the bars that are stated as a demonym rather than as
+# a country name — "an Irish passport", "only German applicants". Hoisted into one
+# alternation so a new nationality is added in one place rather than five.
+#
+# "local" is deliberately absent. "Only local candidates" is a commuting
+# constraint, not a citizenship one; conflating them would reject Budapest-eligible
+# postings that merely name a preferred office.
+_NATIONALITY = (r"(?:eu|eea|european|uk|british|us|usa|american|irish|swiss|"
+                r"german|austrian|dutch|belgian|french|spanish|italian|"
+                r"hungarian|polish|czech|portuguese|finnish|swedish|danish|"
+                r"norwegian|canadian|australian)")
+
+# The requirement family. A negator in the short run-up pardons these — see the
+# _NEGATORS note below.
+_AUTHORISATION_WALL = tuple(re.compile(p) for p in (
+    # Passports. The bare "hold an EU passport" form is required, not optional:
+    # Baker Hughes stated it with no "must" anywhere in the sentence.
+    rf"\b(?:hold|holding|possess|have)\s+(?:an?\s+|a\s+valid\s+)?"
+    rf"{_NATIONALITY}\s+passport\b",
+    rf"\b{_NATIONALITY}\s+passport\s+(?:is\s+)?"
+    rf"(?:required|mandatory|essential|a\s+must)\b",
+    # Citizenship and nationality. Plural matters: real postings address a pool of
+    # applicants ("Applicants must be EU citizens"), not one candidate.
+    rf"\bmust\s+be\s+(?:an?\s+)?{_NATIONALITY}\s+(?:citizens?|nationals?)\b",
+    rf"\b{_NATIONALITY}\s+citizenship\s+(?:is\s+)?"
+    rf"(?:required|mandatory|essential)\b",
+    r"\bmust\s+be\s+a\s+(?:citizen|national)\s+of\b",
+    r"\bonly\s+(?:\w+\s+)?(?:citizens|nationals|passport\s+holders)\b",
+    # "Only Irish applicants will be considered." Anchored on the nationality, not
+    # on "only ... applicants" — "only shortlisted applicants will be contacted" is
+    # boilerplate on half the corpus and must not be read as a citizenship bar.
+    rf"\bonly\s+{_NATIONALITY}\s+(?:applicants|candidates|residents)\b",
+    # Pre-existing, unrestricted work rights. These are the polite euphemisms:
+    # nothing is refused, the bar is simply assumed.
+    r"\b(?:must|should|need\s+to)\s+(?:already\s+)?(?:have|hold|possess)\s+"
+    r"(?:the\s+|an?\s+|a\s+valid\s+|an?\s+existing\s+|unrestricted\s+)*"
+    r"(?:legal\s+)?right\s+to\s+work\b",
+    r"\b(?:applicants|candidates|you)\s+must\s+(?:already\s+)?have\s+"
+    r"(?:the\s+)?right\s+to\s+work\b",
+    r"\bright\s+to\s+work\s+in\s+[\w\s]{1,20}?\s+(?:is\s+)?"
+    r"(?:required|essential|mandatory)\b",
+    r"\bmust\s+be\s+eligible\s+to\s+work\s+(?:in\s+[\w\s]{1,20}?\s+)?"
+    r"without\s+(?:restriction|sponsorship|limitation)\b",
+    r"\bmust\s+be\s+(?:legally\s+)?authoris\w*\s+to\s+work\b",
+    r"\bmust\s+be\s+(?:legally\s+)?authoriz\w*\s+to\s+work\b",
+    r"\bmust\s+(?:have|hold)\s+(?:a\s+|an?\s+|a\s+valid\s+)?"
+    r"work\s+(?:permit|visa|authoris\w+|authoriz\w+)\b",
+    # "A valid work permit is required." Same bare shape as Baker Hughes: the demand
+    # is carried by "is required", with no modal verb anywhere near the candidate.
+    r"\b(?:a\s+|an\s+)?(?:valid\s+|current\s+)?"
+    r"work\s+(?:permit|visa|authoris\w+|authoriz\w+)\s+(?:is\s+)?"
+    r"(?:required|mandatory|essential|a\s+must)\b",
+    r"\bmust\s+have\s+unrestricted\s+work\s+authoris\w*\b",
+    r"\bmust\s+have\s+unrestricted\s+work\s+authoriz\w*\b",
+    r"\bmust\s+have\s+permanent\s+resid\w+\b",
+))
+
+# Words that flip an _AUTHORISATION_WALL match from a bar into a waiver. Checked in
+# the run-up only: "no EU passport required" and "we do not require an EU passport"
+# are reassurances, and reading them as rejections would discard exactly the
+# sponsorship-friendly postings this profile most wants to see.
+_NEGATORS = ("no ", "not ", "without ", "dont ", "don t ", "doesn t ", "need not ",
+             "regardless of ", "irrespective of ")
+_NEGATOR_LOOKBEHIND = 40
+
+# Wording that says sponsorship IS on offer. Consulted only to pardon an
+# _AUTHORISATION_WALL hit elsewhere in the same posting — never to pardon an
+# explicit denial, because "no sponsorship available" contains the substring
+# "sponsorship available" and a naive offer check would acquit the very posting
+# that motivated this gate.
+_SPONSORSHIP_OFFERED = tuple(re.compile(p) for p in (
+    r"\b(?:we|company)\s+(?:can|will|do|may)\s+sponsor\b",
+    r"\b(?:visa\s+)?sponsorship\s+(?:is\s+)?(?:available|provided|offered)\b",
+    r"\bwe\s+(?:offer|provide)\s+(?:visa\s+)?sponsorship\b",
+    r"\b(?:happy|open|willing)\s+to\s+sponsor\b",
+    # "happy to provide visa sponsorship" — the offer stated as a noun. The verb
+    # forms above miss it, and missing an offer is not neutral: it lets an ordinary
+    # "a work permit is required before your start date" line convict a posting
+    # that is explicitly sponsorship-friendly.
+    r"\b(?:happy|open|willing|able|prepared|glad)\s+to\s+"
+    r"(?:offer|provide|support|arrange)\s+"
+    r"(?:visa\s+|work\s+|immigration\s+)*sponsorship\b",
+    r"\bwe\s+(?:will|can|do)\s+(?:offer|provide|support|arrange)\s+"
+    r"(?:visa\s+|work\s+|immigration\s+)*sponsorship\b",
+    r"\bwill\s+consider\s+sponsorship\b",
+    r"\brelocation\s+and\s+visa\s+support\b",
+    r"\bvisa\s+sponsorship\s+for\s+the\s+right\s+candidate\b",
+    r"\binternational\s+(?:applicants|candidates)\s+(?:are\s+)?welcome\b",
+    # "we will help you obtain a work permit" — an offer stated as assistance rather
+    # than as the word "sponsorship". Without this, the employer's own promise to
+    # help sits in the same sentence as the papers clause and the clause convicts.
+    r"\b(?:help|assist|support)\s+(?:you\s+|candidates\s+|with\s+)*(?:to\s+)?"
+    r"(?:obtain|obtaining|apply|applying|secure|securing|arrange|arranging|"
+    r"get|getting)\s+(?:a\s+|the\s+|your\s+)*"
+    r"(?:work\s+permit|work\s+visa|visa|residence\s+permit)\b",
+))
+
+
+def sponsorship_verdict(title, description="", *, full_text=True,
+                        caveat=SNIPPET_CAVEAT) -> dict:
+    """Does the posting bar a candidate who needs sponsorship?
+
+    Capped at UNKNOWN on incomplete evidence for the same reason as language and
+    experience: a snippet that does not mention sponsorship is not evidence that
+    the posting allows it. See `_unverified`.
+    """
+    block = _sponsorship_verdict(title, description)
+    return block if full_text else _unverified(block, caveat)
+
+
+def _sponsorship_verdict(title, description="") -> dict:
+    """Is this role open to a candidate who needs a work permit sponsored?
+
+    Sentence-scoped like the language gate, and for the same reason: a bar and the
+    thing that waives it live in one sentence, and a posting-wide scan would let one
+    bullet's "we sponsor visas" excuse another bullet's "must hold an EU passport".
+    The offer check is the one deliberate exception — an employer who states
+    sponsorship anywhere is offering it for the role, not for a paragraph.
+    """
+    text = f"{title}\n{description}"
+    normed = [(s, _norm(s)) for s in _sentences(text)]
+
+    # An offer only counts from a sentence that is not itself a denial. Measured on
+    # the real MCS Group posting: "no sponsorship available" contains the substring
+    # "sponsorship available", so a posting-wide offer scan recorded
+    # sponsorship_offered=True on the very job being rejected for having none. The
+    # verdict was still right (denials are checked first and nothing pardons them),
+    # but the evidence was a lie, and this block gets persisted to
+    # job["prerank"]["gates"] for humans to audit.
+    offered = any(any(p.search(n) for p in _SPONSORSHIP_OFFERED)
+                  and not any(d.search(n) for d in _SPONSORSHIP_DENIED)
+                  for _, n in normed)
+
+    for sentence, n in normed:
+        for pattern in _SPONSORSHIP_DENIED:
+            if pattern.search(n):
+                return {"verdict": FAIL,
+                        "reason": "posting states sponsorship is not available",
+                        "quote": _excerpt(sentence, pattern),
+                        "bar": "sponsorship_denied",
+                        "sponsorship_offered": offered}
+
+    if not offered:
+        for sentence, n in normed:
+            for pattern in _AUTHORISATION_WALL:
+                m = pattern.search(n)
+                if not m:
+                    continue
+                run_up = n[max(0, m.start() - _NEGATOR_LOOKBEHIND): m.start()]
+                if any(neg in run_up for neg in _NEGATORS):
+                    continue
+                return {"verdict": FAIL,
+                        "reason": "posting requires citizenship, a passport or "
+                                  "pre-existing work rights this profile lacks",
+                        "quote": _excerpt(sentence, pattern),
+                        "bar": "authorisation_wall",
+                        "sponsorship_offered": offered}
+
+    if description:
+        return {"verdict": PASS,
+                "reason": ("posting states sponsorship is available" if offered
+                           else "no sponsorship or citizenship bar stated"),
+                "quote": None, "bar": None, "sponsorship_offered": offered}
+    return {"verdict": UNKNOWN,
+            "reason": "no description text to read a sponsorship condition from",
+            "quote": None, "bar": None, "sponsorship_offered": offered}
+
+
 def language_verdict(title, description="", posting_language=None,
                      *, full_text=True, caveat=SNIPPET_CAVEAT) -> dict:
     """Is this role workable in English (plus Urdu/Punjabi, plus A2 Hungarian)?
@@ -261,15 +540,31 @@ def _language_verdict(title, description="", posting_language=None) -> dict:
 
     for sentence in _sentences(text):
         n = _norm(sentence)
+
+        # Language-agnostic native-speaker bar. Runs before the per-language loop
+        # because its trigger sentence may name no language at all.
+        for pattern in _NATIVE_DEMAND:
+            if pattern.search(n) and not any(mk in n for mk in OPTIONAL_MARKERS):
+                hits.append(("native-speaker", _excerpt(sentence, pattern)))
+                break
+
         for lang, aliases in BLOCKED_LANGUAGES.items():
             if not any(f" {a} " in n for a in aliases):
                 continue
             # Centred on the language name, not cut from the head of the span. A
             # 4,800-char bullet run quoted from its head says nothing about German.
             quote = _excerpt(sentence, _alias_pattern(lang))
+            # Optional wins, always and first. This ordering is the entire mechanism
+            # behind the Leica acquittal ("English and preferably German") and must
+            # never be reordered — see docs/GATE_TRIBUNAL.md.
             if any(mk in n for mk in OPTIONAL_MARKERS):
                 optional_hits.append((lang, quote))
             elif any(mk in n for mk in REQUIRED_MARKERS):
+                hits.append((lang, quote))
+            # No marker either way: a bare "English and German" adjacency is a
+            # requirement. Checked last, and only when optional has already been
+            # ruled out for this sentence, so it can never overturn an acquittal.
+            elif _conjunction_pattern(lang).search(n):
                 hits.append((lang, quote))
 
     if hits:
@@ -335,7 +630,22 @@ _STOPWORDS = {
     "german": ("und", "der", "die", "das", "mit", "fur", "von", "bei", "wir",
                "sie", "unser", "erfahrung", "kenntnisse", "aufgaben"),
     "spanish": ("los", "las", "para", "con", "que", "una", "nuestro",
-                "empresa", "experiencia", "trabajo", "conocimientos"),
+                "empresa", "experiencia", "trabajo", "conocimientos",
+                # LAW 3, 2026-08-24. Spanish was losing its own postings to
+                # Portuguese, which reported a Spanish body as "written in
+                # portuguese" — a correct FAIL naming the wrong language, which is
+                # unauditable. The cause was one token: "de" sat in the Portuguese
+                # list and not here, despite being the most frequent word in both.
+                # Measured tallies on Spanish prose were portuguese 35 / spanish 24,
+                # and `max(counts, key=counts.get)` duly picked portuguese.
+                #
+                # Fixed by giving each list the shared high-frequency words *and* its
+                # own exclusive discriminators, so the winner is decided by what
+                # actually separates the two rather than by which list forgot a word.
+                # Spanish-exclusive: el/y/del/es/muy/tambien/ademas versus
+                # Portuguese o/e/do/da/nao/sao/mais/tambem.
+                "de", "el", "y", "del", "es", "un", "en", "por", "su", "sus",
+                "como", "muy", "tambien", "ademas", "desarrollo", "gestion"),
     "hungarian": ("es", "az", "egy", "hogy", "vagy", "nem", "munka", "tapasztalat",
                   "feladatok", "elvarasok", "cegunk", "csapat"),
     "french": ("les", "des", "pour", "avec", "que", "une", "notre",
@@ -370,8 +680,14 @@ _STOPWORDS = {
                 "kokemus", "kokemusta", "osaaminen", "tehtavat", "tyo"),
     "czech": ("je", "se", "pro", "ve", "nebo", "nase", "praxe", "znalost",
               "zkusenosti", "pozadujeme", "nabizime"),
+    # Paired with the Spanish list above — see the LAW 3 note there. These are the
+    # tokens that are Portuguese and *not* Spanish: da/dos/das/nao/sao/mais/tambem.
+    # "do" is deliberately absent: it is an ordinary English verb and the Polish
+    # list's over-fire on English postings was traced to exactly that token.
     "portuguese": ("de", "para", "com", "que", "uma", "nossa", "empresa",
-                   "experiencia", "trabalho", "conhecimentos", "voce"),
+                   "experiencia", "trabalho", "conhecimentos", "voce",
+                   "da", "dos", "das", "nao", "sao", "mais", "tambem", "em",
+                   "seu", "seus", "como", "desenvolvimento", "gestao"),
     "romanian": ("si", "pentru", "cu", "care", "este", "sau", "nostru",
                  "experienta", "cunostinte", "echipa", "cerinte"),
 }
@@ -519,10 +835,17 @@ AMBIGUITY_MARKERS = (
 DOMAIN_SCOPED_MARKERS = ("industry", "sector", "domain", "vertical")
 
 # Wording that makes a years figure a hard requirement.
+#
+# "background" and "track record" are the 2026-08-24 additions. The list keyed on
+# the literal word "experience", so stripping that one word — "5 years of relevant
+# background", "a track record of 6 years" — turned a hard requirement into prose the
+# gate filed as incidental and passed. They are synonyms in job-ad register, not
+# hedges, and nothing else in the pipeline was reading them.
 MANDATORY_MARKERS = (
     "required", "requirement", "must", "minimum", "min", "at least",
     "no less than", "we require", "you have", "you bring", "candidates must",
     "essential", "mandatory", "proven", "demonstrated", "solid", "experience",
+    "background", "track record", "history of", "hands on", "hands-on",
 )
 
 # How far from the number a marker has to sit to be about the number. This is the
@@ -557,6 +880,37 @@ _NOT_TENURE = (
     "for the past", "anniversary", "history", "contract", "fixed term",
     "fixed-term", "duration", "graduated within", "warranty", "years old",
 )
+
+# Company-age prose, recognised by its *subject* rather than by its preposition.
+#
+# These exist to contain the bare "N years in <domain>" rule added below: once a
+# preposition alone can make a figure count, "our company has 18 years in business"
+# reads as a candidate requirement. The first attempt at this suppressed the
+# prepositional phrases instead ("in business", "in the market") and immediately ate
+# a real requirement — Amaris's "At least 15 years of experience in business
+# analysis" contains the substring "in business", so the figure was discarded and a
+# 15-year floor passed. `tests/test_hard_gates.py::ExperienceGate` caught it.
+#
+# Checked in the lookbehind only. A corporate subject sits ahead of the figure; a
+# requirement's domain sits after it, which is exactly what keeps the two apart.
+COMPANY_AGE_MARKERS = (
+    "our company has", "the company has", "we have been", "we have over",
+    "company was", "we celebrate", "celebrating", "we have grown", "has grown",
+    "our journey", "in business for", "on the market for", "operating for",
+)
+
+# ...and the mirror case: when the phrase that made a figure look like company
+# history is in fact the phrase that makes it a requirement.
+#
+# A genuine precedence conflict, not a gap: "proven" is a MANDATORY_MARKER and
+# "history" is a _NOT_TENURE suppressor, so "A proven history of 5 years" hit both
+# and the suppressor's `continue` won — the figure was discarded and the posting
+# passed with "no years requirement stated". `_NOT_TENURE` exists to skip "our
+# company history"; "a proven history of N years" is the opposite claim. Checked
+# ahead of the suppressor so the more specific phrase decides.
+TENURE_OVERRIDE_MARKERS = ("proven history", "track record", "demonstrated history",
+                           "documented history", "history of delivering",
+                           "history of leading", "history of building")
 
 
 def experience_verdict(title, description="", *, full_text=True,
@@ -621,8 +975,21 @@ def _experience_verdict(title, description="") -> dict:
             # stated after it. See HARD_FLOOR_MARKERS.
             hard_floor = (any(mk in before for mk in HARD_FLOOR_MARKERS)
                           and not any(mk in before for mk in AMBIGUITY_MARKERS))
-            if any(p in window for p in _NOT_TENURE):
+            # The more specific phrase decides — see TENURE_OVERRIDE_MARKERS.
+            if (any(p in window for p in _NOT_TENURE)
+                    and not any(mk in window for mk in TENURE_OVERRIDE_MARKERS)):
                 continue
+            # A bare tenure preposition, with no requirement noun anywhere. Google's
+            # "5 years of experience in operations" states the noun; plenty of
+            # postings do not — "5 years in operations", "6 years within supply
+            # chain" — and those were filed as "years stated without a mandatory
+            # marker" and passed. "N years <preposition> <domain>" in a job ad is a
+            # tenure requirement; the noun is elided, not absent. Company-age prose
+            # that shares the shape is excluded by `_NOT_TENURE` above.
+            tenure_phrase = bool(re.match(
+                r"\s*(?:in|of|within|as|leading|managing|working|supporting|driving|"
+                r"delivering|building)\b", after)) and not any(
+                mk in before for mk in COMPANY_AGE_MARKERS)
             # `low` is kept only so the reason string can say a range was read at its
             # top rather than quoting a figure the posting never printed alone.
             item = {"required": required, "low": min(low, high),
@@ -638,7 +1005,8 @@ def _experience_verdict(title, description="") -> dict:
                 blocked.append({**item,
                                 "why": "years scoped to an adjacent domain, not the "
                                        "role's core work"})
-            elif any(mk in window for mk in MANDATORY_MARKERS) or "+" in match.group(0):
+            elif (any(mk in window for mk in MANDATORY_MARKERS)
+                    or "+" in match.group(0) or tenure_phrase):
                 found.append(item)
             else:
                 blocked.append({**item,
@@ -788,7 +1156,7 @@ def pure_technical_verdict(axes: dict, min_body_domains: int = 2) -> dict:
 # ------------------------------------------------------------------ combined
 
 def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
-    """Run all four gates over one job and return a single verdict block.
+    """Run all five gates over one job and return a single verdict block.
 
     `overall` is FAIL if any gate failed, PASS if all decided and none failed, and
     UNKNOWN when the text was too thin to judge and nothing failed. The caller uses
@@ -838,11 +1206,15 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
 
     language = language_verdict(title, body, full_text=full_text, caveat=caveat)
     experience = experience_verdict(title, body, full_text=full_text, caveat=caveat)
+    # Same completeness cap as language and experience, and for the same reason: a
+    # snippet that says nothing about sponsorship is not evidence that the role
+    # offers it. See the `_unverified` note above.
+    sponsorship = sponsorship_verdict(title, body, full_text=full_text, caveat=caveat)
     seniority = seniority_verdict(title, body)
     technical = pure_technical_verdict(axes, min_body_domains)
 
-    verdicts = (language["verdict"], experience["verdict"], seniority["verdict"],
-                technical["verdict"])
+    verdicts = (language["verdict"], experience["verdict"], sponsorship["verdict"],
+                seniority["verdict"], technical["verdict"])
     if FAIL in verdicts:
         overall = FAIL
     elif UNKNOWN in verdicts:
@@ -852,6 +1224,7 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
 
     failed = [name for name, block in
               (("language", language), ("experience", experience),
+               ("sponsorship", sponsorship),
                ("seniority", seniority), ("pure_technical", technical))
               if block["verdict"] == FAIL]
     return {
@@ -859,6 +1232,7 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
         "failed": failed,
         "language": language,
         "experience": experience,
+        "sponsorship": sponsorship,
         "seniority": seniority,
         "pure_technical": technical,
         "evidence_chars": len(body),
