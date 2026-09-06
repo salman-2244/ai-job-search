@@ -19,8 +19,35 @@ You are a job ranking engine for Salman Ahmed's automated daily job search pipel
 5. Read `.claude/skills/job-application-assistant/04-job-evaluation.md` for scoring rules
 6. Read `.claude/skills/job-application-assistant/01-candidate-profile.md` for candidate data, the **five Profile Tracks**, and the **Experience Baseline**
 
-### Step 2: Deduplicate
-Skip any job whose `dedup_key` is already in `seen_jobs.json`, or whose company+role is already in `job_search_tracker.csv`.
+### Step 2: Mark repeats — do NOT skip them
+
+**Score every job, including ones you have seen before.** This step used to drop any job
+whose `dedup_key` was in `seen_jobs.json` or whose company+role was in
+`job_search_tracker.csv`. That was removed on 2026-09-06 by instruction: a posting that
+still passes the gates is still worth applying to, and whether to re-apply is Salman's
+decision rather than the pipeline's.
+
+Instead, annotate. A job arriving with a `repeat` object (Phase 1b writes it) keeps that
+object untouched. For a job that has no `repeat` but whose `dedup_key` *is* in
+`seen_jobs.json`, add one:
+
+```json
+"repeat": {"runs_ago": 2, "last_seen": "2026-08-30", "label": "🔁 seen 2 runs ago"}
+```
+
+`runs_ago` is the count of **distinct `rank_date` values in `seen_jobs.json` that are
+later than this job's own `last_seen`** — the number of ranking runs since, not the
+number of days. Runs are on-demand, so days and runs are not interchangeable. If
+`runs_ago` is 0, label it `🔁 seen in the last run (<date>)`. If the entry carries no
+usable `rank_date`, use `🔁 seen before` and set `runs_ago` to `null`.
+
+Carry `repeat.label` into the report and the Telegram selector text for that job, so a
+repeat is visible before Salman spends a selection on it. Never let a repeat marker
+change a job's score — it is provenance, not a scoring dimension.
+
+`job_search_tracker.csv` is no longer a filter either. A company+role already in the
+tracker may be annotated `"in_tracker": true` inside the same `repeat` object, but it
+must still be scored.
 
 ### Step 3: Run the gates — before scoring
 

@@ -115,8 +115,10 @@ Pakistani passport holder no matter how the ranker reads it. Everything softer t
 that — a country preference, a relocation question, an unstated permit situation —
 still belongs to the real Eligibility Gate in the ranker (prompt Step 3), which
 FLAGs rather than drops, because a sponsorship-flagged job still qualifies for
-documents. Jobs already in `seen_jobs.json` are excluded outright, since the
-ranker discards them at Step 2 anyway and giving them a slot buys nothing.
+documents. Jobs already in `seen_jobs.json` compete for a slot on exactly the same
+terms as new ones — they used to be excluded outright, which reversed by instruction
+on 2026-09-06 ("already-sent jobs are re-included") — and carry a `repeat` marker
+naming how many runs ago they were last seen.
 
 Alert-matched jobs
 ------------------
@@ -487,6 +489,68 @@ def annotate_bare(job: dict, selected: bool, reason: str) -> None:
                       "description_hits": 0, "selected": selected, "reason": reason}
 
 
+def run_dates(seen: dict) -> list:
+    """Every distinct `rank_date` in seen_jobs.json, newest first.
+
+    This is the run ledger, reconstructed. There is no run counter anywhere in the
+    repo — `seen_jobs.json` records only `rank_date` per key (written by the Phase 2
+    ranker, `prompts/pipeline_phase1_rank.md` Step 6) — so "how many runs ago" has to
+    be derived. Counting *distinct dates* is the honest reading: it says "two ranking
+    runs have happened since", which is true whether those runs were two days or two
+    weeks apart. Counting days would say "seen 43 runs ago" for a job last seen in
+    July, which is false — runs became on-demand on 2026-09-06 and are no longer
+    one-per-day.
+
+    Malformed or missing dates are skipped rather than sorted as empty strings: an
+    entry with no `rank_date` cannot place itself in the ledger, and letting `""` sort
+    in would shift every real run's index by one.
+    """
+    dates = set()
+    for entry in (seen or {}).get("seen", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        date = str(entry.get("rank_date") or "").strip()
+        if len(date) == 10 and date[4] == "-" and date[7] == "-":
+            dates.add(date)
+    return sorted(dates, reverse=True)
+
+
+def repeat_marker(seen: dict, key: str, today: str, ledger=None) -> dict:
+    """The "🔁 seen X runs ago" annotation for a job that ran before.
+
+    Returns a block, never None, because the caller only reaches here for keys already
+    known to be in the ledger — the absence of a usable date is a fact worth carrying
+    ("seen before"), not a reason to drop the marker and let the job read as new.
+
+    `runs_ago` counts distinct ranking runs strictly *after* `last_seen`, so a job last
+    seen in the most recent prior run is "1 run ago". A job last seen today (a re-run
+    on the same date) is 0, which renders as "seen earlier today" rather than a count —
+    "seen 0 runs ago" would be nonsense to read in Telegram.
+    """
+    entry = (seen or {}).get("seen", {}).get(key)
+    last_seen = ""
+    if isinstance(entry, dict):
+        last_seen = str(entry.get("rank_date") or "").strip()
+    if ledger is None:
+        ledger = run_dates(seen)
+    # `main` holds `today` as a `date`; the ledger is ISO strings. Compare like with
+    # like — `date >= str` raises TypeError, which would take the whole run down over
+    # a cosmetic label.
+    today = today.isoformat() if hasattr(today, "isoformat") else str(today)
+
+    if not last_seen:
+        return {"runs_ago": None, "last_seen": None, "label": "🔁 seen before"}
+    runs_ago = sum(1 for date in ledger if date > last_seen)
+    if last_seen >= today and runs_ago == 0:
+        label = "🔁 seen earlier today"
+    elif runs_ago == 0:
+        # Dated in the past but no later run recorded: the ledger has not moved on yet.
+        label = f"🔁 seen in the last run ({last_seen})"
+    else:
+        label = f"🔁 seen {runs_ago} run{'s' if runs_ago != 1 else ''} ago"
+    return {"runs_ago": runs_ago, "last_seen": last_seen, "label": label}
+
+
 def role_signature(title: str) -> frozenset:
     """The set of tokens that identify the *role*, with grade and noise removed.
 
@@ -815,7 +879,7 @@ def main():
     parser.add_argument("--matrix", type=Path, default=DEFAULT_MATRIX,
                         help="Search matrix: supplies vocabulary and budgets.")
     parser.add_argument("--seen", type=Path, default=DEFAULT_SEEN,
-                        help="seen_jobs.json; an already-ranked job costs no slot.")
+                        help="seen_jobs.json; marks repeats, no longer excludes them.")
     parser.add_argument("--alerts", type=Path, default=DEFAULT_ALERTS,
                         help="alert_matched.json. Missing is normal (no Phase 6 yet).")
     parser.add_argument("--budget", type=int, default=None,
@@ -952,22 +1016,32 @@ def main():
              f"{len(model.enabler)} enabler categories); scores are not comparable "
              "with earlier runs")
 
+    # Read for the repeat *marker*, no longer to exclude anything. The ledger is
+    # computed once here rather than per job: `run_dates` walks every entry, and the
+    # corpus has hundreds of jobs.
     seen_keys = set()
     seen = load_json(args.seen, "seen_jobs.json", warn)
     if isinstance(seen, dict) and isinstance(seen.get("seen"), dict):
         seen_keys = set(seen["seen"])
     elif seen is not None:
-        warn(f"{args.seen} is not a seen-jobs file; every job will look new")
+        warn(f"{args.seen} is not a seen-jobs file; repeats will not be marked")
+    ledger = run_dates(seen if isinstance(seen, dict) else {})
 
     store = load_json(args.alerts, "alert_matched.json", warn) or {}
     live_alerts, alert_stats = _gate.live_alert_keys(store, today,
                                                     args.expiry_days, warn)
 
-    stats = {"total": len(jobs), "malformed": 0, "already_seen": 0, "no_signal": 0,
+    stats = {"total": len(jobs), "malformed": 0, "repeats": 0, "no_signal": 0,
              "near_duplicates": 0, "alert_selected": 0, "alert_over_budget": 0,
              "gate_failed": 0, "gate_unknown": 0,
+             # One counter per gate `evaluate()` can name in `failed`. A missing key
+             # is not a missing statistic — the increment below is unguarded, so a
+             # gate added to `hard_gates.evaluate` without a counter here takes the
+             # whole of Phase 1b down with a KeyError the first time it fires.
              "gate_failed_language": 0, "gate_failed_experience": 0,
-             "gate_failed_seniority": 0, "gate_failed_pure_technical": 0}
+             "gate_failed_sponsorship": 0,
+             "gate_failed_seniority": 0, "gate_failed_pure_technical": 0,
+             "gate_failed_closed": 0}
 
     # The gates run only under the two-axis model, for the same reason the slot fixes
     # do (see `preference_key`), and because `pure_technical_verdict` reads the axis
@@ -991,10 +1065,18 @@ def main():
             continue
         key = job.get("dedup_key") or ""
 
+        # NOT a filter any more. Being seen before used to end a job's run right here.
+        # That reversed by instruction on 2026-09-06: "Remove the two dedup filters
+        # (pre-rank and rank) so already-sent jobs are re-included, and add the
+        # '🔁 seen X runs ago' marker." A posting worth applying to last week is worth
+        # applying to today, and whether to re-apply is Salman's call rather than the
+        # pipeline's — so the history is now an annotation and not a verdict.
+        #
+        # The marker rides on the job itself (not on `prerank`, which `annotate`
+        # rewrites wholesale further down) so it survives to every downstream surface.
         if key and key in seen_keys:
-            stats["already_seen"] += 1
-            annotate_bare(job, False, "already ranked in a previous run")
-            continue
+            stats["repeats"] += 1
+            job["repeat"] = repeat_marker(seen, key, today, ledger)
 
         row = score_row(job, position, tracks, every_query, model=model)
         alerted = bool(key) and key in live_alerts
@@ -1034,8 +1116,10 @@ def main():
         warn(f"{stats['gate_failed']} jobs failed a hard gate before ranking "
              f"({stats['gate_failed_language']} language, "
              f"{stats['gate_failed_experience']} experience, "
+             f"{stats['gate_failed_sponsorship']} sponsorship, "
              f"{stats['gate_failed_seniority']} seniority, "
-             f"{stats['gate_failed_pure_technical']} pure-technical). Each carries the "
+             f"{stats['gate_failed_pure_technical']} pure-technical, "
+             f"{stats['gate_failed_closed']} closed). Each carries the "
              "quoted wording it was discarded on in its deferred entry.")
     if stats["gate_unknown"]:
         warn(f"{stats['gate_unknown']} jobs could not be gated on the text available "
@@ -1242,7 +1326,7 @@ def main():
     print(f"Pre-rank ({args.stage}): {len(selected_jobs)}/{len(jobs)} selected "
           f"({stats['alert_selected']} alert-matched, {select_stats['floor_slots']} "
           f"by per-track floor, {select_stats['score_slots']} by score); "
-          f"{stats['already_seen']} already seen, {stats['no_signal']} no vocabulary "
+          f"{stats['repeats']} re-included repeats, {stats['no_signal']} no vocabulary "
           f"match, {stats['near_duplicates']} near-duplicates, "
           f"{len(deferred_jobs)} deferred", file=sys.stderr)
     return 0

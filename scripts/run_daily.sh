@@ -611,7 +611,7 @@ print(f"{s.get('enriched', 0)}/{s.get('targeted', 0)} enriched "
       f"{s.get('domain_only_targets', 0)} domain-only, "
       f"{s.get('failed', 0)} failed, {s.get('empty', 0)} empty, "
       f"{s.get('over_budget', 0)} over budget, "
-      f"{s.get('already_seen', 0)} already known")
+      f"{s.get('already_seen', 0)} re-included repeats")
 
 # The browser path was unavailable, so the phase ran on guest HTTP. Not an error —
 # every gate still works on guest bodies — but it belongs in the report, because the
@@ -684,11 +684,13 @@ fi
 SELECTED_JOBS=$(python3 -c "import json; print(len(json.load(open('$RANKSET_FILE'))['results']))" 2>/dev/null || echo "0")
 log "Phase 1b-final complete: $SELECTED_JOBS of $TOTAL_JOBS jobs selected for deep ranking"
 if (( SELECTED_JOBS == 0 )); then
-    # Not fatal: zero selected is a legitimate answer when every fetched job was
-    # already ranked on an earlier day. The run continues so the report still gets
-    # written and still lists why each job was cut.
+    # Not fatal, but it now means more than it used to. Until 2026-09-06 the benign
+    # explanation was "every fetched job was already ranked on an earlier day" — that
+    # filter is gone, so a previously-seen job no longer accounts for an empty cut.
+    # What is left is a hard gate discarding everything, or a vocabulary/config
+    # problem. The run continues so the report still lists why each job was cut.
     log "Phase 1b-final: nothing selected — Phase 2 has no jobs to score"
-    echo "Pre-ranking selected 0 of the $TOTAL_JOBS fetched jobs for deep ranking, so no job was scored today. The deferral reasons are listed below — if they are all \"already ranked in a previous run\" this is normal; anything else points at a vocabulary or config problem." >> "$WARN_FILE"
+    echo "Pre-ranking selected 0 of the $TOTAL_JOBS fetched jobs for deep ranking, so no job was scored today. Since already-seen jobs are re-included rather than skipped, this is no longer routine — read the deferral reasons below. A wall of hard-gate discards means the corpus genuinely did not qualify; anything else points at a vocabulary or config problem." >> "$WARN_FILE"
 fi
 
 # === Phase 2: Rank jobs via Claude Code ===
@@ -1190,11 +1192,14 @@ if deferred:
         lines.append(f"- **{count}** — {reason}")
 
     # The highest-scoring deferrals: if a genuinely strong role sits here, that is the
-    # signal to raise prerank.deep_rank_budget. Two reasons are excluded because
-    # raising the budget would not help either one — an already-ranked job was
-    # evaluated on an earlier day, and a near-duplicate's role is already in today's
-    # rankset under a different URL. Both stay counted in the histogram above.
-    skip = ("already ranked", "near-duplicate")
+    # signal to raise prerank.deep_rank_budget. Near-duplicates are excluded because
+    # raising the budget would not help them — the role is already in today's rankset
+    # under a different URL. They stay counted in the histogram above.
+    #
+    # "already ranked" was the other exclusion until 2026-09-06, when the dedup filters
+    # were removed and previously-seen jobs started flowing through to scoring. Nothing
+    # emits that reason any more, so matching on it filtered nothing.
+    skip = ("near-duplicate",)
     near = [j for j in deferred
             if (j.get("prerank") or {}).get("score")
             and not any(s in ((j.get("prerank") or {}).get("reason") or "")

@@ -465,6 +465,28 @@ class PipelineWiring(unittest.TestCase):
     def test_the_prompt_forbids_scoring_a_bonus_for_alert_match(self):
         self.assertIn("Do not add points for it", self.PROMPT)
 
+    def test_the_prompt_no_longer_tells_the_ranker_to_skip_seen_jobs(self):
+        """The dedup reversal has to land in the prompt too, or Python and the
+        ranker disagree: Phase 1b re-includes a repeat and Phase 2 drops it.
+
+        Instruction, 2026-09-06: "Remove the two dedup filters (pre-rank and rank)
+        so already-sent jobs are re-included, and add the '🔁 seen X runs ago'
+        marker."
+        """
+        self.assertNotIn("Skip any job whose `dedup_key`", self.PROMPT,
+                         "the old skip instruction must be gone, not just amended")
+        self.assertIn("Score every job, including ones you have seen before",
+                      self.PROMPT)
+
+    def test_the_prompt_specifies_the_repeat_marker(self):
+        self.assertIn("🔁 seen", self.PROMPT)
+        self.assertIn("runs_ago", self.PROMPT)
+        self.assertIn("rank_date", self.PROMPT)
+
+    def test_the_prompt_keeps_the_marker_out_of_the_score(self):
+        """A repeat is provenance. Scoring it would re-implement the filter softly."""
+        self.assertIn("Never let a repeat marker", self.PROMPT)
+
     def test_the_gate_no_longer_decides_what_gets_drafted(self):
         """SKIP_DRAFT is retired because pipeline-time drafting is retired.
 

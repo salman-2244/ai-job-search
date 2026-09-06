@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -868,6 +869,89 @@ class NearDuplicateSimilarity(unittest.TestCase):
         self.assertEqual([k[pr.POSITION] for k in keepers], [0, 1, 2])
 
 
+class RepeatMarker(unittest.TestCase):
+    """The "🔁 seen X runs ago" annotation that replaced the dedup filter.
+
+    "X runs" is derived, not stored. Nothing in the repo counts runs — `seen_jobs.json`
+    records only a `rank_date` per key — so `runs_ago` counts *distinct ranking dates
+    later than this job's own*. That is the honest reading now that runs are on-demand:
+    counting days would report "seen 43 runs ago" for a job last ranked in July.
+    """
+
+    def seen(self, **entries):
+        return {"seen": {key: {"rank_date": date} for key, date in entries.items()}}
+
+    def test_the_ledger_is_the_distinct_rank_dates_newest_first(self):
+        ledger = pr.run_dates(self.seen(a="2026-08-17", b="2026-09-01", c="2026-08-17"))
+        self.assertEqual(ledger, ["2026-09-01", "2026-08-17"],
+                         "two jobs ranked on one date are one run, not two")
+
+    def test_the_ledger_skips_entries_with_no_usable_date(self):
+        """A dateless entry cannot place itself; letting "" in shifts every index."""
+        seen = {"seen": {"a": {"rank_date": "2026-08-17"}, "b": {"rank_date": None},
+                         "c": {"status": "ranked"}, "d": "not a dict",
+                         "e": {"rank_date": "17/08/2026"}}}
+        self.assertEqual(pr.run_dates(seen), ["2026-08-17"])
+
+    def test_the_ledger_of_an_empty_or_malformed_file_is_empty(self):
+        for seen in ({}, {"seen": {}}, None, {"nope": 1}):
+            with self.subTest(seen=seen):
+                self.assertEqual(pr.run_dates(seen), [])
+
+    def test_runs_ago_counts_ranking_runs_not_days(self):
+        """Three runs since, spread over three weeks: "3 runs ago", never "21"."""
+        seen = self.seen(target="2026-08-10", r1="2026-08-17",
+                         r2="2026-08-24", r3="2026-09-01")
+        marker = pr.repeat_marker(seen, "target", "2026-09-06")
+        self.assertEqual(marker["runs_ago"], 3)
+        self.assertEqual(marker["last_seen"], "2026-08-10")
+        self.assertEqual(marker["label"], "🔁 seen 3 runs ago")
+
+    def test_one_run_ago_is_singular(self):
+        seen = self.seen(target="2026-08-24", r1="2026-09-01")
+        self.assertEqual(pr.repeat_marker(seen, "target", "2026-09-06")["label"],
+                         "🔁 seen 1 run ago")
+
+    def test_the_most_recent_run_reads_as_the_last_run_not_zero(self):
+        """"seen 0 runs ago" is nonsense to read in Telegram."""
+        seen = self.seen(target="2026-09-01")
+        marker = pr.repeat_marker(seen, "target", "2026-09-06")
+        self.assertEqual(marker["runs_ago"], 0)
+        self.assertIn("last run", marker["label"])
+        self.assertIn("2026-09-01", marker["label"])
+
+    def test_a_job_seen_today_says_so(self):
+        seen = self.seen(target="2026-09-06")
+        self.assertEqual(pr.repeat_marker(seen, "target", "2026-09-06")["label"],
+                         "🔁 seen earlier today")
+
+    def test_a_date_field_returns_a_marker_rather_than_none(self):
+        """The caller only reaches here for known keys; "seen before" is still a fact."""
+        seen = {"seen": {"target": {"status": "ranked"}}}
+        marker = pr.repeat_marker(seen, "target", "2026-09-06")
+        self.assertEqual(marker["runs_ago"], None)
+        self.assertEqual(marker["last_seen"], None)
+        self.assertIn("🔁", marker["label"])
+
+    def test_a_date_object_for_today_does_not_raise(self):
+        """`main` holds `today` as a `date`; `date >= str` would raise TypeError."""
+        seen = self.seen(target="2026-09-06")
+        marker = pr.repeat_marker(seen, "target", date(2026, 9, 6))
+        self.assertEqual(marker["label"], "🔁 seen earlier today")
+
+    def test_every_label_carries_the_repeat_glyph(self):
+        """The glyph is what makes a repeat scannable in a Telegram list."""
+        cases = (self.seen(target="2026-08-10", r="2026-09-01"),
+                 self.seen(target="2026-09-01"),
+                 self.seen(target="2026-09-06"),
+                 {"seen": {"target": {}}})
+        for seen in cases:
+            with self.subTest(seen=seen):
+                self.assertTrue(
+                    pr.repeat_marker(seen, "target", "2026-09-06")["label"]
+                    .startswith("🔁"))
+
+
 class EndToEnd(unittest.TestCase):
     """The CLI contract `run_daily.sh` Phase 1b depends on."""
 
@@ -973,14 +1057,39 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(r["rankset"]["meta"]["unique"], 1,
                          "the original meta must survive")
 
-    def test_an_already_seen_job_is_skipped_not_ranked_again(self):
+    def test_an_already_seen_job_is_re_included_and_marked(self):
+        """The reverse of what this test asserted until 2026-09-06.
+
+        It used to pin `already_seen == 1` and a rankset of just the new job. The
+        filter was removed by instruction — "Remove the two dedup filters (pre-rank
+        and rank) so already-sent jobs are re-included, and add the '🔁 seen X runs
+        ago' marker" — because a posting that still passes the gates is still worth
+        applying to, and re-applying is Salman's decision to make.
+        """
         seen_job = job("AI Engineer", company="Old", key="url:old")
         r = self.run_cli([seen_job, job("AI Engineer", company="New", key="url:new")],
                          "--budget", "5",
-                         seen={"seen": {"url:old": {"status": "ranked"}}})
-        self.assertEqual(r["summary"]["already_seen"], 1)
-        self.assertEqual([j["dedup_key"] for j in r["rankset"]["results"]],
-                         ["url:new"])
+                         seen={"seen": {"url:old": {"status": "ranked",
+                                                    "rank_date": "2026-08-17"}}})
+        self.assertEqual(r["summary"]["repeats"], 1)
+        self.assertEqual(sorted(j["dedup_key"] for j in r["rankset"]["results"]),
+                         ["url:new", "url:old"],
+                         "a seen job must reach the rankset, not be dropped")
+        by_key = {j["dedup_key"]: j for j in r["rankset"]["results"]}
+        self.assertIn("🔁", by_key["url:old"]["repeat"]["label"])
+        self.assertEqual(by_key["url:old"]["repeat"]["last_seen"], "2026-08-17")
+        self.assertNotIn("repeat", by_key["url:new"],
+                         "a job never seen before carries no marker")
+
+    def test_a_repeat_is_scored_exactly_like_a_new_job(self):
+        """The marker is provenance. It must not act as a score penalty."""
+        fresh = job("AI Engineer", company="Fresh", key="url:fresh")
+        repeat = job("AI Engineer", company="Repeat", key="url:repeat")
+        r = self.run_cli([fresh, repeat], "--budget", "5",
+                         seen={"seen": {"url:repeat": {"rank_date": "2026-08-17"}}})
+        scores = {j["dedup_key"]: j["prerank"]["score"]
+                  for j in r["rankset"]["results"]}
+        self.assertEqual(scores["url:fresh"], scores["url:repeat"])
 
     def test_a_job_matching_no_vocabulary_is_deferred_with_that_reason(self):
         r = self.run_cli([job("Zookeeper", company="Zoo")], "--budget", "5")
@@ -1639,6 +1748,56 @@ class HardGateWiring(unittest.TestCase):
                               description="English, and Hungarian (preferred).")])
         self.assertEqual(r["summary"]["gate_failed"], 0)
         self.assertEqual(len(r["rankset"]["results"]), 1)
+
+    def test_a_closed_posting_is_discarded_before_the_cut(self):
+        """Requirement 9. A closed posting costs a slot, a request, and a CV."""
+        r = self.run_cli([job("Business Process Analyst", company="Closed Co",
+                              description="You will own supply chain process "
+                                          "improvement. No longer accepting "
+                                          "applications.")])
+        self.assertEqual(r["summary"]["gate_failed_closed"], 1)
+        self.assertEqual(r["rankset"]["results"], [])
+        self.assertIn("closed", r["deferred"][0]["reason"])
+
+    def test_every_gate_evaluate_can_name_has_a_counter(self):
+        """The bug this pins actually shipped.
+
+        The increment is `stats[f"gate_failed_{name}"] += 1`, unguarded, over the names
+        in ``evaluate()["failed"]``. `gate_failed_sponsorship` was never added when the
+        sponsorship gate landed, so the first posting to state "no sponsorship" would
+        have taken the whole of Phase 1b down with a KeyError — the run would have
+        produced no shortlist at all. It survived only because no run happened to hit
+        one. Any future gate must fail here, not in production.
+        """
+        _hg_spec = importlib.util.spec_from_file_location(
+            "hard_gates_for_counters", REPO / "scripts" / "hard_gates.py")
+        hg = importlib.util.module_from_spec(_hg_spec)
+        _hg_spec.loader.exec_module(hg)
+
+        got = hg.evaluate(
+            {"title": "Business Analyst", "description": "Supply chain analytics."},
+            {"domain_in_title": [], "domain_from_description": [],
+             "enabler_in_title": [], "enabler_from_description": []})
+        gates = [name for name in got
+                 if isinstance(got.get(name), dict) and "verdict" in got[name]]
+        self.assertTrue(gates, "evaluate() must expose its gates by name")
+
+        r = self.run_cli([job("Business Process Analyst",
+                              description="Supply chain process improvement.")])
+        for name in gates:
+            with self.subTest(gate=name):
+                self.assertIn(f"gate_failed_{name}", r["summary"],
+                              f"{name} can appear in evaluate()['failed'] but has no "
+                              f"counter — the increment would raise KeyError")
+
+    def test_a_sponsorship_denial_does_not_crash_the_stage(self):
+        """The concrete case the missing counter would have crashed on."""
+        r = self.run_cli([job("Business Process Analyst", company="No Sponsor Co",
+                              description="You will own supply chain process "
+                                          "improvement. We do not offer visa "
+                                          "sponsorship for this role.")])
+        self.assertEqual(r["proc"].returncode, 0, r["proc"].stderr[-500:])
+        self.assertEqual(r["summary"]["gate_failed_sponsorship"], 1)
 
     def test_the_gates_override_the_alert_exemption(self):
         """The behaviour change worth being explicit about.

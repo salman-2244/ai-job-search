@@ -187,13 +187,53 @@ class SelectionSpendsNothingItCanSkip(unittest.TestCase):
         self.assertEqual(targets, [])
         self.assertEqual(stats["linkedin_cards"], 0)
 
-    def test_already_seen_cards_cost_no_request(self):
-        """The ranker drops them as duplicates, so their description buys nothing."""
+    def test_an_already_seen_card_is_still_enriched_but_sorts_last(self):
+        """Inverted on 2026-09-06, and the old version was masking a real bug.
+
+        It used to assert a seen card got no request, because the ranker dropped it as
+        a duplicate at prompt Step 2. That drop is gone by instruction ("Remove the two
+        dedup filters (pre-rank and rank) so already-sent jobs are re-included"), so a
+        repeat now reaches the hard gates and the LLM — and `seen_jobs.json` caches no
+        description (its entries are status/rank_score/rank_verdict/rank_date/location/
+        url), so skipping the fetch would send it there with an empty body. Every gate
+        that needs the body would read UNKNOWN, the closed-posting gate included, which
+        is the one gate a re-included job most needs read.
+
+        Fresh cards still come first, so the ordering the old test asserted survives as
+        a preference rather than an exclusion.
+        """
         jobs = [card(job_id="4000000000"), card(job_id="4000000001")]
         targets, stats = enr.select_targets(
             jobs, QUERIES, 15, {"url:linkedin:4000000000"}, quiet)
+        self.assertEqual([t[1] for t in targets], ["4000000001", "4000000000"],
+                         "the repeat is still fetched, just behind the fresh card")
+        self.assertEqual(stats["already_seen"], 1,
+                         "the counter now reports repeats enriched, not skipped")
+
+    def test_a_repeat_loses_to_a_fresh_card_when_the_budget_is_one(self):
+        """Re-including repeats must not cost a new posting its request."""
+        jobs = [card(job_id="4000000000"), card(job_id="4000000001")]
+        targets, _ = enr.select_targets(
+            jobs, QUERIES, 1, {"url:linkedin:4000000000"}, quiet)
         self.assertEqual([t[1] for t in targets], ["4000000001"])
-        self.assertEqual(stats["already_seen"], 1)
+
+    def test_repeat_status_never_outranks_verification_need(self):
+        """A repeat about to be re-ranked on an unread gate still comes first.
+
+        Repeat-last is a discovery preference, so it sits below the verification tier.
+        A seen job inside the rank cut with an UNKNOWN verdict is one Phase 2 will
+        score and gate_jobs.py may draft documents for; the fetch that settles its
+        language and tenure risk is worth more than a fresh card that will not be
+        ranked this run at all.
+        """
+        repeat = card(job_id="4000000000",
+                      prerank={"score": 90, "gates": {"overall": "UNKNOWN"}})
+        fresh = card(job_id="4000000001",
+                     prerank={"score": 10, "gates": {"overall": "PASS"}})
+        targets, _ = enr.select_targets(
+            [fresh, repeat], QUERIES, 15, {"url:linkedin:4000000000"}, quiet)
+        self.assertEqual(targets[0][1], "4000000000",
+                         "verification need outranks freshness")
 
     def test_cards_that_already_carry_a_description_are_skipped(self):
         jobs = [card(description="already full text here")]
@@ -610,14 +650,23 @@ class AlertCardsLeadTheirBand(unittest.TestCase):
         self.assertEqual(first[0], "4123456781",
                          "among alert cards, title match still breaks the tie")
 
-    def test_an_already_seen_alert_card_still_costs_nothing(self):
-        """Priority does not override the cheaper skips ahead of it."""
+    def test_an_already_seen_alert_card_is_re_included(self):
+        """Inverted on 2026-09-06, and an alert repeat is the strongest case for it.
+
+        A seen card used to be skipped outright, so this asserted that alert priority
+        could not buy a wasted request. The skip is gone by instruction ("already-sent
+        jobs are re-included") and it was never really cheap: an alert card carries no
+        description at all, and `seen_jobs.json` caches none, so skipping sent a card
+        Salman's own alert matched to the ranker on its bare title. It keeps its alert
+        slot now.
+        """
         jobs = [alert_card(job_id="4123456781")]
         targets, stats = enr.select_targets(
             jobs, QUERIES, 15, {"url:linkedin:4123456781"}, quiet)
-        self.assertEqual(targets, [])
+        self.assertEqual([t[1] for t in targets], ["4123456781"])
         self.assertEqual(stats["already_seen"], 1)
-        self.assertEqual(stats["alert_targets"], 0)
+        self.assertEqual(stats["alert_targets"], 1,
+                         "a repeat keeps the alert priority it earned")
 
     def test_an_alert_card_that_already_has_a_description_is_not_refetched(self):
         jobs = [alert_card(job_id="4123456781", description="already full text")]
@@ -823,16 +872,24 @@ class TheHalfHybridBandClaimsTheBudgetFirst(unittest.TestCase):
         self.assertEqual(first[0], "4000000011",
                          "inside the band, title match still breaks the tie")
 
-    def test_the_cheaper_skips_still_come_first(self):
-        """Priority buys a place in the queue, never a wasted request."""
+    def test_a_card_that_already_has_its_body_still_costs_nothing(self):
+        """Priority buys a place in the queue, never a wasted request.
+
+        Narrowed on 2026-09-06: this used to assert that a *seen* card was skipped too.
+        Being seen is no longer a skip (the dedup filters were removed by instruction,
+        and `seen_jobs.json` caches no description to skip *to*), so the repeat is
+        fetched and lands in the band. Carrying a full body already is still a real
+        skip — there is nothing left to fetch.
+        """
         already = self.domain_card(job_id="4000000010", description="full text")
         seen = self.domain_card(job_id="4000000011")
         targets, stats = enr.select_targets(
             [already, seen], QUERIES, 15, {"url:linkedin:4000000011"}, quiet)
-        self.assertEqual(targets, [])
+        self.assertEqual([t[1] for t in targets], ["4000000011"],
+                         "only the body-less repeat is worth a request")
         self.assertEqual(stats["already_full"], 1)
         self.assertEqual(stats["already_seen"], 1)
-        self.assertEqual(stats["domain_only_targets"], 0)
+        self.assertEqual(stats["domain_only_targets"], 1)
 
 
 class BothDirectionsShareTheBand(unittest.TestCase):
@@ -1294,16 +1351,23 @@ class VerificationComesBeforeDiscovery(unittest.TestCase):
         self.assertEqual(stats["no_title_match"], 0)
         self.assertEqual(stats["verify_targets"], 1)
 
-    def test_the_cheaper_skips_still_come_first(self):
-        """Priority buys a place in the queue, never a wasted request."""
+    def test_a_card_that_already_has_its_body_still_costs_nothing(self):
+        """Priority buys a place in the queue, never a wasted request.
+
+        Narrowed on 2026-09-06 for the same reason as its namesake in the half-hybrid
+        band: a seen card is no longer skipped, so the repeat here enters the
+        verification tier — correctly, since it is in the cut with an UNKNOWN verdict
+        and is about to be re-ranked on an eligibility nobody has read.
+        """
         already = self.top(job_id="4000000040", description="full body text")
         seen = self.top(job_id="4000000041")
         targets, stats = enr.select_targets(
             [already, seen], QUERIES, 15, {"url:linkedin:4000000041"}, quiet, 25)
-        self.assertEqual(targets, [])
+        self.assertEqual([t[1] for t in targets], ["4000000041"])
         self.assertEqual(stats["already_full"], 1)
         self.assertEqual(stats["already_seen"], 1)
-        self.assertEqual(stats["verify_targets"], 0)
+        self.assertEqual(stats["verify_targets"], 1,
+                         "a repeat in the cut with an unread gate is worth the request")
 
     def test_an_unreachable_in_cut_job_is_counted_apart_from_the_budget(self):
         """No budget raise verifies a freehire posting — this loop cannot fetch it.

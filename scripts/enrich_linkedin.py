@@ -19,13 +19,16 @@ Each enrichment costs one LinkedIn request, so the selection is deliberately mea
 
   * LinkedIn cards only — a job with no `url:linkedin:<jobId>` key and no parseable
     LinkedIn URL cannot be enriched by this CLI at all.
-  * Already-seen jobs are skipped. The ranker drops them as duplicates (ranker
-    prompt Step 2), so fetching their descriptions buys nothing.
+  * Already-seen jobs are *not* skipped any more. They were until 2026-09-06, on the
+    grounds that the ranker dropped them as duplicates anyway — it no longer does
+    ("already-sent jobs are re-included"), and `seen_jobs.json` holds no cached
+    description, so skipping would hand the gates a body-less repeat. They sort last
+    inside each band instead, so a tight budget still reads new postings first.
   * Jobs whose title matches none of the matrix's track queries are skipped, unless
     they are alert-sourced or half-hybrid. They still reach the ranker, scored from
     the snippet.
   * What is left is ranked by verification need, then by band, then by source, then
-    by title match, and cut to `detail_enrich_budget`.
+    by repeat status, then by title match, and cut to `detail_enrich_budget`.
 
 Verification before discovery
 -----------------------------
@@ -446,9 +449,9 @@ def rank_cut(jobs: list, cut: int, alert_budget: int = DEFAULT_ALERT_BUDGET,
 # derived from these rows must move whenever a key is inserted — leaving a counter on
 # a stale offset is exactly how `half_hybrid_targets` came to report 0 on a shortlist
 # holding 20 of them.
-_VERIFY, _RANK, _BAND, _ALERTED, _UNVERIFIED, _SCORE, _POSITION = range(7)
-_KEYS = 7
-_JOB, _JOB_ID, _HALF = 7, 8, 9
+_VERIFY, _RANK, _BAND, _ALERTED, _UNVERIFIED, _REPEAT, _SCORE, _POSITION = range(8)
+_KEYS = 8
+_JOB, _JOB_ID, _HALF = 8, 9, 10
 
 
 def select_targets(jobs: list, queries: list, budget: int, seen_keys, warn,
@@ -513,9 +516,22 @@ def select_targets(jobs: list, queries: list, budget: int, seen_keys, warn,
         if (job.get("description") or "").strip():
             stats["already_full"] += 1
             continue
-        if (job.get("dedup_key") or "") in seen_keys:
+        # Being seen before is no longer a reason to skip the request. It was, until
+        # 2026-09-06, and it was safe then only because Phase 1b dropped seen jobs
+        # outright — an unenriched repeat never reached a gate or the ranker. The dedup
+        # filters were removed by instruction ("Remove the two dedup filters (pre-rank
+        # and rank) so already-sent jobs are re-included"), so repeats now flow all the
+        # way through, and `seen_jobs.json` stores no description to fall back on: its
+        # entries are status/rank_score/rank_verdict/rank_date/location/url. Skipping
+        # here would hand the gates and the LLM a body-less repeat, which reads as
+        # UNKNOWN on every gate that needs the body — the closed-posting gate above all,
+        # which is exactly the gate a re-included job most needs read.
+        #
+        # Still counted, and still ordered behind fresh cards below, so a tight budget
+        # spends on new postings first.
+        repeat = (job.get("dedup_key") or "") in seen_keys
+        if repeat:
             stats["already_seen"] += 1
-            continue
 
         alerted = is_alert_sourced(job)
         half = missing_half(job)
@@ -592,9 +608,16 @@ def select_targets(jobs: list, queries: list, budget: int, seen_keys, warn,
         # Then an unverified gate verdict outside the cut, because that request
         # answers two questions at once — whether the hybrid completes, and whether
         # the posting demands a language or a tenure that would have discarded it.
+        #
+        # Then fresh cards ahead of repeats. Repeats stopped being skipped on
+        # 2026-09-06, so they now compete for this budget; placing them last inside
+        # each band means a tight budget still reads every new posting first, while a
+        # roomy one reads the repeats too. It sits *below* `_VERIFY` on purpose: a
+        # repeat inside the rank cut with an unread gate is about to be re-ranked and
+        # possibly re-drafted, so it outranks a fresh discovery that will not be.
         scored.append((0 if verify else 1, -rank_score if verify else 0,
                        0 if half else 1, 0 if alerted else 1,
-                       0 if unverified else 1, -score, position,
+                       0 if unverified else 1, 1 if repeat else 0, -score, position,
                        job, job_id, half))
 
     # Verification tier, then pre-rank score *inside that tier*, then band, then
@@ -1281,7 +1304,7 @@ def main():
           f"({summary['missing_enabler_targets']} missing the AI/data half, "
           f"{summary['missing_domain_targets']} missing the business half), "
           f"{summary['gate_unknown_targets']} with unverified gates, "
-          f"{summary['already_seen']} already known, "
+          f"{summary['already_seen']} re-included repeats, "
           f"{summary['no_title_match']} off-track, "
           f"{summary['over_budget']} over budget, "
           f"{summary['failed']} failed, {summary['empty']} empty)", file=sys.stderr)
