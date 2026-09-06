@@ -5,7 +5,7 @@
     "enabled": true,
 
     "_volume_comment": "max_requests_per_run is a HARD STOP on this run's TOTAL LinkedIn traffic — searches plus Phase 1c detail enrichment, which hit the same host minutes apart. build_search_plan.py reserves detail_enrich_budget out of it, so the search plan is capped at max_requests_per_run - detail_enrich_budget (currently 60 - 25 = 35 searches + up to 25 details). Requests are sequential with delay_seconds between them, using the CLI's honest non-spoofed User-Agent. A 429 or block page is honored (backoff + report), never worked around. LinkedIn's public jobs-guest pages return 10 results per page and the pipeline requests one page per query. Enrichment counts against this cap whichever path fetches it: the authenticated browser and the guest CLI are different clients but the same host and the same IP, so switching Phase 1c to the browser buys the real authenticated posting and a second independent client, not extra request budget — and measured per fetch the browser is the slower of the two.",
-    "max_requests_per_run": 60,
+    "max_requests_per_run": 90,
     "delay_seconds": 4,
     "jobage_days": 14,
     "limit_per_query": 10,
@@ -53,7 +53,15 @@
       "Sweden",
       "Switzerland",
       "United Kingdom",
-      "European Union"
+      "European Union",
+      "Spain",
+      "France",
+      "Belgium",
+      "Malta",
+      "Portugal",
+      "Czech Republic",
+      "Estonia",
+      "Luxembourg"
     ]
   },
 

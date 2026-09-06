@@ -206,11 +206,26 @@ class RealMatrixTests(unittest.TestCase):
         self.assertTrue(MATRIX_PATH.is_file(), "config/search_matrix.json missing")
 
     def test_linkedin_volume_matches_the_agreed_moderate_band(self):
+        """The cap is an exposure limit, so every raise is a recorded decision.
+
+        40-60 was the original band. Raised to a 40-90 band on 2026-09-06, by
+        instruction, because the geo list went from 10 countries to 18 (Spain,
+        France, Belgium, Malta, Portugal, Czech Republic, Estonia, Luxembourg
+        added). 14 queries x 18 geos is 252 pairs against 21 rotating slots per
+        run — 12 runs for full coverage at a cap of 60, where it used to be 6.
+        Runs are now on-demand rather than daily, so "12 runs" is no longer
+        "12 days" and a country could go a month unqueried. 90 restores roughly
+        the old cadence.
+
+        Raising this further needs another decision: requests stay sequential with
+        `delay_seconds` between them, and the cap is what keeps one run's traffic
+        inside a normal browsing footprint.
+        """
         cap = self.matrix["linkedin"]["max_requests_per_run"]
         self.assertGreaterEqual(cap, 40,
-                                "the user chose a moderate ~40-60 request/day band")
-        self.assertLessEqual(cap, 60,
-                             "60 is the agreed ceiling; raising it needs a decision")
+                                "the user chose a moderate request/day band")
+        self.assertLessEqual(cap, 90,
+                             "90 is the agreed ceiling; raising it needs a decision")
 
     def test_requests_are_delayed(self):
         self.assertGreaterEqual(
@@ -253,6 +268,55 @@ class RealMatrixTests(unittest.TestCase):
                   "Netherlands", "Ireland", "Switzerland", "United Kingdom"):
             with self.subTest(geo=g):
                 self.assertIn(g, geos, f"{g} is a stated priority market")
+
+    def test_the_western_european_expansion_is_present(self):
+        """Added 2026-09-06 by instruction, naming each country.
+
+        "Add Spain, France, Belgium, Malta, Netherlands, Portugal, Spain, UK,
+        Ireland, Czech Republic, Estonia, Finland, Luxembourg to the location list."
+        Netherlands, UK, Ireland and Finland were already there; the rest are new.
+        Pinned individually so a config edit that drops one is a test failure and not
+        a country that quietly stops being searched.
+        """
+        geos = set(self.matrix["linkedin"]["geos"])
+        for g in ("Spain", "France", "Belgium", "Malta", "Portugal",
+                  "Czech Republic", "Estonia", "Luxembourg"):
+            with self.subTest(geo=g):
+                self.assertIn(g, geos, f"{g} was added by instruction on 2026-09-06")
+
+    def test_the_hungary_bias_is_gone_from_the_rotation(self):
+        """Requirement 8: "drop Hungary bias".
+
+        Hungary keeps its `always_include_geos` slot — it is the one market needing no
+        sponsorship, which is a reason and not a bias. What must NOT happen is Hungary
+        crowding the rotation: every other geo has to be reachable.
+        """
+        linkedin = self.matrix["linkedin"]
+        self.assertEqual(linkedin["always_include_geos"], ["Hungary"],
+                         "only Hungary earns a guaranteed slot")
+        self.assertGreaterEqual(len(linkedin["geos"]), 18,
+                                "the expanded list must survive")
+
+    def test_every_geo_is_reached_within_a_bounded_number_of_runs(self):
+        """A country that is never queried is a country Salman never sees jobs from.
+
+        18 geos x 14 queries against a per-run slot count is the reason the cap moved
+        to 90. This pins that full coverage is actually reachable, and how long it
+        takes, so a future geo addition that pushes it out of range shows up here.
+        """
+        geos = set(self.matrix["linkedin"]["geos"])
+        seen, runs = set(), 0
+        for index in range(40):
+            runs = index + 1
+            for name, _portal, args in bsp.build_plan(self.matrix, index, warn=quiet):
+                seen.update(g for g in geos if bsp.slug(g) in name)
+            if seen >= geos:
+                break
+        self.assertEqual(seen, geos,
+                         f"never queried within 40 runs: {sorted(geos - seen)}")
+        self.assertLessEqual(runs, 20,
+                             f"full geo coverage took {runs} runs; the cap exists to "
+                             "keep this in a range where no country goes stale")
 
     def test_todays_plan_respects_the_cap(self):
         plan = bsp.build_plan(self.matrix, bsp.day_index(date.today()), warn=quiet)
