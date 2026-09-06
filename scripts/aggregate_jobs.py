@@ -12,6 +12,7 @@ and writes a unified JSON array to stdout.
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # LinkedIn serves the same posting from country subdomains (hu., de., nl.linkedin.com)
@@ -56,6 +57,49 @@ def normalize_job(raw: dict, portal: str) -> dict:
         "portal": portal,
         "description_snippet": snippet,
     }
+
+
+def posted_timestamp(value) -> float:
+    """Sortable epoch seconds for a portal's `date` field. Never raises.
+
+    Freshness sorting is the whole point: an early applicant beats a late one, so
+    the corpus is ordered newest-first. That ordering is only as good as this
+    parser, and the four portals do not agree on a format:
+
+        LinkedIn        "2026-08-16"                  (guest card `datetime` attr,
+                                                       sometimes full ISO)
+        Freehire        "2026-08-16T08:31:58Z"
+        WeWorkRemotely  "2026-08-16T07:30:41.000Z"    (milliseconds)
+        Arbeitnow       "2026-08-16T08:31:58+00:00"   (converted from epoch)
+
+    All four are ISO-8601, which is why this is a parser and not a natural-language
+    date reader — no portal in this pipeline emits "2 days ago". A relative string
+    would land here as unparseable and sort last, which is the safe direction.
+
+    Returns `-inf` for anything missing or unparseable so undated jobs sort to the
+    END of a newest-first list rather than the front. Sorting an undated job first
+    would be the failure that matters: it would claim a freshness the data never
+    stated, and push a genuinely new posting below it.
+    """
+    if not value:
+        return float("-inf")
+    text = str(value).strip()
+    if not text:
+        return float("-inf")
+    # `fromisoformat` on 3.10 rejects a "Z" suffix and accepts everything else these
+    # portals emit, milliseconds and explicit offsets included.
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return float("-inf")
+    # A date-only value parses to midnight naive. Treat naive as UTC rather than
+    # local: the portals publish in UTC, and mixing aware and naive datetimes in one
+    # sort raises TypeError on comparison.
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.timestamp()
 
 
 def detect_portal(file_path: Path, data: dict) -> str:
@@ -169,6 +213,22 @@ def main():
         # last file's count and silently understate every portal's contribution.
         stats["portals"][portal] = stats["portals"].get(portal, 0) + portal_count
 
+    # Newest first, so the early-applicant advantage survives every downstream cut.
+    # This ordering is load-bearing rather than cosmetic: `prerank_jobs.py` records
+    # each job's arrival index as its tie-break (`row[POSITION]`), so when two jobs
+    # score identically the fresher one now takes the slot. Before this sort that
+    # tie went to whichever portal file happened to be listed first on the command
+    # line, which is not a reason.
+    #
+    # `-inf` for undated entries puts them last (see `posted_timestamp`). The
+    # secondary key keeps the sort deterministic: several postings routinely share a
+    # timestamp — WeWorkRemotely stamps a whole scrape within the same second — and
+    # without a tie-break their relative order would depend on input file order
+    # again. `dedup_key` is stable across runs, which the list index is not.
+    undated = sum(1 for job in all_jobs if posted_timestamp(job.get("date_posted")) == float("-inf"))
+    all_jobs.sort(key=lambda job: (-posted_timestamp(job.get("date_posted")),
+                                   job.get("dedup_key") or ""))
+
     # Output
     output = {
         "meta": {
@@ -176,6 +236,8 @@ def main():
             "unique": stats["unique"],
             "dupes_skipped": stats["dupes"],
             "portals": stats["portals"],
+            "sorted_by": "date_posted desc",
+            "undated": undated,
         },
         "results": all_jobs,
     }
@@ -185,6 +247,10 @@ def main():
 
     # Summary to stderr
     print(f"Aggregated: {stats['total_input']} input -> {stats['unique']} unique ({stats['dupes']} dupes)", file=sys.stderr)
+    # Named on stderr because an undated job silently sorting last is exactly the
+    # kind of thing that should be visible in the run log, not just in `meta`.
+    print(f"  sorted newest-first by date_posted"
+          + (f"; {undated} undated sort last" if undated else ""), file=sys.stderr)
     for portal, count in stats["portals"].items():
         print(f"  {portal}: {count}", file=sys.stderr)
 

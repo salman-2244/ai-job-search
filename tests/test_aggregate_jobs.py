@@ -212,6 +212,141 @@ class EndToEndAggregation(unittest.TestCase):
         self.assertEqual(out["meta"]["unique"], 1)
 
 
+class PostedTimestampParsing(unittest.TestCase):
+    """The four portals do not agree on a date format, and none may raise.
+
+    Freshness ordering is only as good as this parser: a format it cannot read sorts
+    to the end, so a silent parse failure demotes a genuinely new posting. Every
+    format below is copied from a real portal response.
+    """
+
+    def test_every_real_portal_format_parses(self):
+        for label, value in (
+            ("LinkedIn date-only", "2026-08-16"),
+            ("LinkedIn full ISO", "2026-08-16T08:31:58Z"),
+            ("Freehire", "2026-08-16T08:31:58Z"),
+            ("WeWorkRemotely milliseconds", "2026-08-16T07:30:41.000Z"),
+            ("Arbeitnow explicit offset", "2026-08-16T08:31:58+00:00"),
+        ):
+            with self.subTest(label):
+                self.assertNotEqual(agg.posted_timestamp(value), float("-inf"),
+                                    f"{label} ({value!r}) must parse")
+
+    def test_missing_and_unparseable_dates_sort_last_rather_than_raising(self):
+        for value in (None, "", "   ", "2 days ago", "Posted yesterday",
+                      "not a date", 12345.0, [], {}):
+            with self.subTest(value=value):
+                self.assertEqual(agg.posted_timestamp(value), float("-inf"))
+
+    def test_a_naive_date_is_read_as_utc_not_local(self):
+        """Mixing aware and naive datetimes in one sort raises TypeError."""
+        naive = agg.posted_timestamp("2026-08-16")
+        aware = agg.posted_timestamp("2026-08-16T00:00:00+00:00")
+        self.assertEqual(naive, aware)
+
+    def test_a_lowercase_z_suffix_parses(self):
+        self.assertEqual(agg.posted_timestamp("2026-08-16T08:31:58z"),
+                         agg.posted_timestamp("2026-08-16T08:31:58Z"))
+
+    def test_later_dates_compare_greater(self):
+        self.assertGreater(agg.posted_timestamp("2026-08-16"),
+                           agg.posted_timestamp("2026-08-15"))
+
+
+class NewestFirstOrdering(unittest.TestCase):
+    """Requirement 10: "Prioritize newly posted jobs."
+
+    Load-bearing beyond presentation. `prerank_jobs.py` records each job's arrival
+    index as its score tie-break, so this ordering decides which of two equally-scored
+    jobs takes the last slot. Before the sort that went to whichever portal file was
+    listed first on the command line.
+    """
+
+    def _run(self, files):
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), *[str(f) for f in files]],
+            capture_output=True, text=True, check=True,
+        )
+        return json.loads(proc.stdout), proc.stderr
+
+    def _job(self, n, date):
+        return {"title": f"Analyst {n}", "company": f"Co {n}",
+                "url": f"https://example.com/jobs/{n}", "location": "Remote",
+                "date": date}
+
+    def test_results_come_back_newest_first(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = [portal_file(d, "freehire_a.json", [
+                self._job(1, "2026-08-10T09:00:00Z"),
+                self._job(2, "2026-08-16T09:00:00Z"),
+                self._job(3, "2026-08-13T09:00:00Z"),
+            ])]
+            out, stderr = self._run(files)
+
+        stamps = [agg.posted_timestamp(j["date_posted"]) for j in out["results"]]
+        self.assertEqual(stamps, sorted(stamps, reverse=True),
+                         "the corpus must be ordered newest-first")
+        self.assertEqual([j["title"] for j in out["results"]],
+                         ["Analyst 2", "Analyst 3", "Analyst 1"])
+        self.assertEqual(out["meta"]["sorted_by"], "date_posted desc")
+        self.assertIn("newest-first", stderr)
+
+    def test_the_order_ignores_which_file_was_listed_first(self):
+        """The old ordering was command-line order. It must no longer show through."""
+        with tempfile.TemporaryDirectory() as d:
+            old = portal_file(d, "freehire_old.json",
+                              [self._job(1, "2026-08-10T09:00:00Z")])
+            new = portal_file(d, "arbeitnow_new.json",
+                              [self._job(2, "2026-08-16T09:00:00Z")])
+            first, _ = self._run([old, new])
+            second, _ = self._run([new, old])
+
+        self.assertEqual([j["title"] for j in first["results"]],
+                         ["Analyst 2", "Analyst 1"])
+        self.assertEqual([j["title"] for j in first["results"]],
+                         [j["title"] for j in second["results"]],
+                         "input file order must not change the corpus order")
+
+    def test_undated_jobs_sort_last_and_are_counted(self):
+        """Sorting an undated job first would claim freshness the data never stated."""
+        with tempfile.TemporaryDirectory() as d:
+            files = [portal_file(d, "weworkremotely_x.json", [
+                self._job(1, None),
+                self._job(2, "2026-08-16T09:00:00Z"),
+                self._job(3, "2026-08-11T09:00:00Z"),
+            ])]
+            out, stderr = self._run(files)
+
+        self.assertEqual([j["title"] for j in out["results"]],
+                         ["Analyst 2", "Analyst 3", "Analyst 1"])
+        self.assertEqual(out["meta"]["undated"], 1)
+        self.assertIn("undated", stderr,
+                      "an undated job sorting last must be visible in the run log")
+
+    def test_equal_timestamps_are_ordered_deterministically(self):
+        """WeWorkRemotely stamps a whole scrape within one second."""
+        same = "2026-08-16T07:30:41.000Z"
+        with tempfile.TemporaryDirectory() as d:
+            files = [portal_file(d, "weworkremotely_x.json",
+                                 [self._job(n, same) for n in (3, 1, 2)])]
+            first, _ = self._run(files)
+            second, _ = self._run(files)
+
+        self.assertEqual([j["dedup_key"] for j in first["results"]],
+                         [j["dedup_key"] for j in second["results"]])
+        keys = [j["dedup_key"] for j in first["results"]]
+        self.assertEqual(keys, sorted(keys),
+                         "the tie-break is the dedup key, which is stable across runs")
+
+    def test_no_dates_at_all_still_produces_a_corpus(self):
+        with tempfile.TemporaryDirectory() as d:
+            files = [portal_file(d, "freehire_x.json",
+                                 [self._job(n, None) for n in (1, 2)])]
+            out, _ = self._run(files)
+        self.assertEqual(len(out["results"]), 2)
+        self.assertEqual(out["meta"]["undated"], 2)
+
+
 class NormalizeShape(unittest.TestCase):
     def test_description_is_truncated_to_a_snippet(self):
         job = agg.normalize_job({"title": "AI Engineer", "url": linkedin_url(),
