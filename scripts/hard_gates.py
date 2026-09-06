@@ -1114,6 +1114,105 @@ def seniority_verdict(title, description="") -> dict:
             "reason": "no seniority marker in the title"}
 
 
+# ------------------------------------------------------------ closed-posting gate
+
+# Wording that says the posting is no longer open. LinkedIn's own banner is the
+# first entry; the rest are what other portals and ATS mirrors print for the same
+# state. All are matched against `_norm` output, so punctuation and case are already
+# folded and "No longer accepting applications." arrives as
+# " no longer accepting applications ".
+#
+# Every phrase here has to be unambiguous about the POSTING's state, which rules out
+# some obvious-looking candidates. "closed" alone is out: "we work closely with",
+# "closed-loop analytics" and "month-end close" are all ordinary body text. "filled"
+# alone is out for the same reason — "filled a gap", "customer-filled forms".
+CLOSED_MARKERS = (
+    "no longer accepting applications",
+    "no longer accepting application",
+    "not accepting applications",
+    "no longer available",
+    "applications are closed",
+    "applications closed",
+    "application closed",
+    "this job is closed",
+    "this position is closed",
+    "position has been filled",
+    "position is filled",
+    "role has been filled",
+    "vacancy is closed",
+    "vacancy has closed",
+    "posting has expired",
+    "posting expired",
+    "job has expired",
+    "expired job",
+    "closed for applications",
+    "applications have closed",
+    "we are no longer accepting",
+    "recruitment for this role has closed",
+    "this advert has closed",
+    "advert has expired",
+)
+
+# Wording that puts a closed-sounding phrase in the future, or in a deadline rather
+# than a state. A posting saying "apply early - this role closes on 30 September" is
+# OPEN and says so; "applications close when the position is filled" is the same.
+# Checked before CLOSED_MARKERS and it wins, on the same optional-beats-required
+# principle the language gate uses.
+#
+# This is the whole reason the gate reads sentences rather than the raw body: a
+# future-tense deadline three paragraphs away must not excuse a real banner, and a
+# real banner must not be excused by one.
+NOT_CLOSED_QUALIFIERS = (
+    "closes on", "close on", "closing date", "closes at", "closing on",
+    "will close", "will be closed", "closes when", "close when",
+    "closes once", "until the position is filled", "until filled",
+    "before applications close", "apply before",
+)
+
+
+def closed_verdict(title, description="", *, full_text=True,
+                   caveat=SNIPPET_CAVEAT) -> dict:
+    """Is this posting still accepting applications?
+
+    Asymmetric on purpose, and in the opposite direction to the other gates. A
+    closed banner is a *statement in the text*, so finding one convicts on any
+    evidence — a card snippet carrying "No longer accepting applications" is telling
+    the truth about the posting. But NOT finding one proves nothing: the banner sits
+    near the apply button, which is exactly the region a 500-char snippet or a
+    truncated body cuts off. So a clean read is PASS on a full body and UNKNOWN on
+    partial text, where the other gates pass on silence.
+
+    That asymmetry means the caveat plumbing runs the other way from
+    `language_verdict` and friends: `full_text=False` cannot downgrade a FAIL here,
+    because the FAIL is positive evidence rather than an absence.
+    """
+    block = _closed_verdict(title, description)
+    if block["verdict"] == FAIL:
+        return block
+    if not full_text:
+        return _unverified(block, caveat)
+    return block
+
+
+def _closed_verdict(title, description="") -> dict:
+    """Scan title and body for a closed-posting banner."""
+    text = f"{title}\n{description}"
+    for sentence in _sentences(text):
+        n = _norm(sentence)
+        if any(q in n for q in NOT_CLOSED_QUALIFIERS):
+            continue            # a stated closing DATE, not a closed posting
+        for marker in CLOSED_MARKERS:
+            if marker in n:
+                return {"verdict": FAIL, "marker": marker,
+                        "quote": " ".join(sentence.split())[:200],
+                        "reason": f"the posting states it is closed ('{marker}')"}
+    if description:
+        return {"verdict": PASS, "marker": None, "quote": None,
+                "reason": "no closed-posting notice in the text"}
+    return {"verdict": UNKNOWN, "marker": None, "quote": None,
+            "reason": "no description text to read a closed-posting notice from"}
+
+
 # -------------------------------------------------------- pure-technical gate
 
 def pure_technical_verdict(axes: dict, min_body_domains: int = 2) -> dict:
@@ -1212,9 +1311,13 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
     sponsorship = sponsorship_verdict(title, body, full_text=full_text, caveat=caveat)
     seniority = seniority_verdict(title, body)
     technical = pure_technical_verdict(axes, min_body_domains)
+    # Reads the same `body` as the others but grades silence the opposite way — see
+    # `closed_verdict`. A closed banner convicts on a snippet; a clean snippet does
+    # not acquit, because the banner sits in the region a snippet truncates.
+    closed = closed_verdict(title, body, full_text=full_text, caveat=caveat)
 
     verdicts = (language["verdict"], experience["verdict"], sponsorship["verdict"],
-                seniority["verdict"], technical["verdict"])
+                seniority["verdict"], technical["verdict"], closed["verdict"])
     if FAIL in verdicts:
         overall = FAIL
     elif UNKNOWN in verdicts:
@@ -1225,7 +1328,8 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
     failed = [name for name, block in
               (("language", language), ("experience", experience),
                ("sponsorship", sponsorship),
-               ("seniority", seniority), ("pure_technical", technical))
+               ("seniority", seniority), ("pure_technical", technical),
+               ("closed", closed))
               if block["verdict"] == FAIL]
     return {
         "overall": overall,
@@ -1235,6 +1339,7 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
         "sponsorship": sponsorship,
         "seniority": seniority,
         "pure_technical": technical,
+        "closed": closed,
         "evidence_chars": len(body),
         "evidence_source": ("description_truncated" if cut_body
                             else "description" if description

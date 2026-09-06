@@ -1806,24 +1806,188 @@ class TheLawsEdgeCases(unittest.TestCase):
                 "and Nordic sites.")["verdict"], hg.PASS)
 
 
+class TheThreeYearCeilingIsTheStatedThreshold(unittest.TestCase):
+    """Salman's decision, twice stated: "Include 3 years (exclude only >3)".
+
+    The individual wordings are covered in `ExperienceGate`. This class pins the
+    *threshold* rather than the parsing — the number a future tweak would move without
+    noticing it is a stated preference and not an implementation detail. 3 passes, 4
+    fails, and the boundary is where it is by instruction.
+    """
+
+    def test_the_constant_is_three(self):
+        self.assertEqual(hg.MAX_YEARS_ELIGIBLE, 3,
+                         "the threshold is a user decision, not a tunable")
+
+    def test_zero_through_three_years_pass(self):
+        for years in (0, 1, 2, 3):
+            with self.subTest(years=years):
+                self.assertEqual(
+                    hg.experience_verdict(
+                        "Analyst", f"{years}+ years of experience required.")["verdict"],
+                    hg.PASS, f"{years} years must be eligible")
+
+    def test_four_years_and_up_fail(self):
+        for years in (4, 5, 6, 8, 10):
+            with self.subTest(years=years):
+                self.assertEqual(
+                    hg.experience_verdict(
+                        "Analyst",
+                        f"Minimum {years} years of experience required.")["verdict"],
+                    hg.FAIL, f"{years} years must be excluded")
+
+    def test_a_range_is_graded_at_its_upper_bound(self):
+        """"2-4 years" asks for up to 4, which is over the line."""
+        self.assertEqual(
+            hg.experience_verdict("Analyst",
+                                  "2-4 years of experience required.")["verdict"],
+            hg.FAIL)
+        self.assertEqual(
+            hg.experience_verdict("Analyst",
+                                  "1-3 years of experience required.")["verdict"],
+            hg.PASS)
+
+
+class ClosedPostingGate(unittest.TestCase):
+    """A posting that says it is closed costs a slot, a request, and a CV.
+
+    This gate's evidence asymmetry runs **opposite** to every other gate here, which
+    is the property most worth pinning. Elsewhere, absent text means UNKNOWN because
+    the requirement might sit in the part not fetched. Here the banner *is* the
+    evidence: seeing it convicts on any amount of text, and it can never be excused
+    by a snippet. Not seeing it proves nothing on a partial read, because the banner
+    renders near the apply button — exactly the region a 500-char snippet cuts.
+
+    The hard part is not the banners, it is the near-misses. A posting stating a
+    future closing date ("applications close on 30 September") is OPEN and must pass,
+    and the corpus is full of "work closely with", "month-end close" and "closed-loop
+    analytics" in ordinary body text.
+    """
+
+    def verdict(self, text, title="Business Analyst", **kw):
+        return hg.closed_verdict(title, text, **kw)["verdict"]
+
+    def test_the_linkedin_banner_fails(self):
+        """The exact string requirement 9 names: "No longer accepting applications"."""
+        self.assertEqual(
+            self.verdict("No longer accepting applications. This job is no longer "
+                         "available."),
+            hg.FAIL)
+
+    def test_the_common_phrasings_all_fail(self):
+        for text in ("We are no longer accepting applications for this role.",
+                     "Applications are closed.",
+                     "This position is closed.",
+                     "The position has been filled.",
+                     "This vacancy is closed.",
+                     "This posting has expired.",
+                     "Closed for applications.",
+                     "Recruitment for this role has closed.",
+                     "This advert has closed."):
+            with self.subTest(text=text):
+                self.assertEqual(self.verdict(text), hg.FAIL, text)
+
+    def test_a_banner_in_the_title_fails(self):
+        """Some portals fold the state into the title rather than the body."""
+        self.assertEqual(
+            hg.closed_verdict("Data Analyst — No longer accepting applications",
+                              "We are hiring a data analyst.")["verdict"],
+            hg.FAIL)
+
+    def test_a_future_closing_date_passes(self):
+        """An open posting that states its deadline. The commonest false positive."""
+        for text in ("Applications close on 30 September 2026.",
+                     "The closing date for applications is 15 October.",
+                     "This vacancy will close once we find the right candidate.",
+                     "Apply before applications close.",
+                     "The role is open until the position is filled.",
+                     "We will close the advert when we have enough applicants."):
+            with self.subTest(text=text):
+                self.assertEqual(self.verdict(text), hg.PASS, text)
+
+    def test_ordinary_body_text_containing_close_or_filled_passes(self):
+        """Why bare "closed" and bare "filled" are not markers."""
+        for text in ("You will work closely with the supply chain team.",
+                     "Experience with closed-loop analytics is a plus.",
+                     "You will support the month-end close process.",
+                     "This role has filled a gap in our analytics team.",
+                     "Close collaboration with stakeholders is essential.",
+                     "You will own the financial close calendar."):
+            with self.subTest(text=text):
+                self.assertEqual(self.verdict(text), hg.PASS, text)
+
+    def test_a_closed_banner_convicts_even_on_a_snippet(self):
+        """Positive evidence is positive at any length. `full_text` cannot excuse it."""
+        block = hg.closed_verdict("Data Analyst",
+                                  "No longer accepting applications",
+                                  full_text=False)
+        self.assertEqual(block["verdict"], hg.FAIL)
+
+    def test_a_clean_snippet_is_unknown_not_pass(self):
+        """The banner sits by the apply button — the part a snippet truncates."""
+        self.assertEqual(
+            self.verdict("We are looking for a data analyst to join our team.",
+                         full_text=False),
+            hg.UNKNOWN)
+
+    def test_a_clean_full_body_passes(self):
+        self.assertEqual(
+            self.verdict("We are looking for a data analyst to join our team.",
+                         full_text=True),
+            hg.PASS)
+
+    def test_no_description_is_unknown(self):
+        """Nothing to read a banner from is not evidence the posting is open."""
+        self.assertEqual(hg.closed_verdict("Data Analyst", "")["verdict"], hg.UNKNOWN)
+
+    def test_a_closing_date_in_one_sentence_does_not_excuse_a_banner_in_another(self):
+        """Qualifiers are scoped to their own sentence, not to the whole posting."""
+        block = hg.closed_verdict(
+            "Data Analyst",
+            "The closing date was 1 August 2026. This position is closed.")
+        self.assertEqual(block["verdict"], hg.FAIL)
+
+    def test_a_failure_quotes_the_sentence_it_read(self):
+        """A gate that discards a job without evidence is unreviewable."""
+        block = hg.closed_verdict(
+            "Data Analyst",
+            "Great team. We are no longer accepting applications for this role.")
+        self.assertEqual(block["verdict"], hg.FAIL)
+        self.assertIn("no longer accepting", block["quote"].lower())
+        self.assertTrue(block["reason"])
+
+    def test_evaluate_fails_a_closed_posting_and_names_the_gate(self):
+        got = hg.evaluate(
+            {"title": "Business Analyst",
+             "description": "You will build Power BI dashboards for our supply "
+                            "chain teams. No longer accepting applications."},
+            {"domain_in_title": ["supply_chain"], "domain_from_description": [],
+             "enabler_in_title": [], "enabler_from_description": []})
+        self.assertEqual(got["overall"], hg.FAIL)
+        self.assertIn("closed", got["failed"])
+        self.assertTrue(got["closed"]["reason"])
+
+
 class TheCombinedBlockRunsFiveGates(unittest.TestCase):
     """`evaluate()` gained a fifth gate, and the consumers read it by name.
 
     `prerank_jobs.gate_reason` iterates ``verdict["failed"]`` and looks each name up
     in the block, so a gate that fails without appearing in both places renders no
     reason in the daily report.
+
+    Six gates as of 2026-09-06 — the class name is kept so the history stays greppable.
     """
 
     AXES = {"domain_in_title": ["supply_chain"], "domain_from_description": [],
             "enabler_in_title": [], "enabler_from_description": []}
 
-    def test_the_block_carries_all_five_gates(self):
+    def test_the_block_carries_all_six_gates(self):
         got = hg.evaluate({"title": "Business Analyst",
                            "description": "You will build Power BI dashboards "
                                           "for our supply chain teams."},
                           self.AXES)
         for gate in ("language", "experience", "sponsorship", "seniority",
-                     "pure_technical"):
+                     "pure_technical", "closed"):
             with self.subTest(gate):
                 self.assertIn(gate, got)
                 self.assertIn("verdict", got[gate])
