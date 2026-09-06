@@ -59,9 +59,15 @@ CB_SUBMIT = "submit"
 CB_ALL = "all"
 CB_NONE = "none"
 
-# Concurrency for generation. Each job is an independent `claude -p` process;
-# 3 at once keeps wall-clock down without thrashing the machine.
-MAX_PARALLEL_JOBS = 3
+# Concurrency for generation. Each job is an independent `claude -p` process.
+# Sequential (1) on purpose: the API relay in front of this account reserves a
+# per-request hold (~$0.65 for a drafting prompt) BEFORE streaming any tokens,
+# and refuses the request outright if the balance cannot cover it. Running 3 at
+# once meant three holds competing for one balance, so a thin account lost all
+# three instead of completing one — the 2026-08-25 run failed 14/14 that way.
+# One at a time also means every job that finishes is money already converted
+# into a document. Raise this only against an endpoint with no pre-consume hold.
+MAX_PARALLEL_JOBS = 1
 
 # Telegram tolerates ~30 messages/sec globally but throttles bursts to one chat.
 SEND_DELAY_SECONDS = 0.12
@@ -473,10 +479,24 @@ async def generate_one(
                 fh.write("\n--- stderr ---\n" + stderr[-2000:])
 
         if proc.returncode != 0:
+            # Surface the child's own error text, not just the exit code.
+            # "claude exited 1" sent the reader to the log for what was really a
+            # quota refusal. stderr first, then the tail of stdout: the API relay
+            # prints its 403 to STDOUT, so a stderr-only read reported nothing and
+            # the quota guard never fired (6 jobs lost that way on 2026-08-25).
+            detail = next(
+                (ln.strip() for ln in stderr.splitlines() if ln.strip()), ""
+            ) or next(
+                (ln.strip() for ln in reversed(stdout.splitlines()) if ln.strip()), ""
+            )
             return {
                 "row": row,
                 "ok": False,
-                "error": f"claude exited {proc.returncode}",
+                "error": (
+                    f"claude exited {proc.returncode}: {detail[:300]}"
+                    if detail
+                    else f"claude exited {proc.returncode}"
+                ),
             }
 
         parsed = extract_json_object(stdout) or {}
