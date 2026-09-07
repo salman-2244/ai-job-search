@@ -106,6 +106,26 @@ cover_letters/Cover_*.*
 **/cover_letters/cover_*.*
 **/cover_letters/Cover_*.*
 !cover_letters/cover_example.tex
+# Every rule above is keyed on the STOCK filenames, main.* and cover.*. The custom
+# templates registered via /add-template and currently active (`onepage-ats`,
+# `minimal-onepage`) emit Salman-Resume.* and Salman-Cover-Letter.* instead, which
+# none of those globs match. Found 2026-09-08 with 19 tailored pairs naming real
+# employers sitting untracked-but-unignored in this PUBLIC repo, one `git add .`
+# from publication — and one pair (cv/Intel_Materials_Program_Manager/) already
+# committed in 7c82874.
+# Two shapes, deliberately overlapping. The name globs catch the current templates
+# wherever they write; the depth-2 directory globs catch the NEXT template's
+# filenames, whatever they turn out to be, because an application always lands in
+# its own per-role subdirectory. Depth 2 is what keeps the tracked sources safe:
+# cover_letters/cover.cls, cover_letters/cover_example.tex and cv/main_example.tex
+# all sit one level up from what these match.
+*-Resume.*
+*-Cover-Letter.*
+**/cv/*/*
+**/cover_letters/*/*
+# ...except the letter class's own bundled fonts, which are tracked on purpose and
+# sit at exactly the depth the rule above claims.
+!cover_letters/OpenFonts/**
 
 # documents/ subfolder contents are personal — only README and folder structure are tracked
 documents/cv/**
