@@ -77,6 +77,14 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 ~45 LinkedIn searches on top of the ones already made today, which
 #                 breaks the approved per-day volume. Requires the Phase 1 output from
 #                 a KEEP_TEMP=1 run to still exist; refuses to invent one.
+#   GEO_FILTER    restrict the LinkedIn half of the search plan to one or more geos,
+#                 comma-separated ("Germany", "Germany,Austria"). Names are matched
+#                 case-insensitively against config/search_matrix.json's `geos`, and an
+#                 unmatched name plans zero LinkedIn searches rather than silently
+#                 falling back to a full sweep. Exists for the on-demand Telegram
+#                 `/run <geo>` path; unset means the normal rotating sweep. The other
+#                 portals are unaffected — their geography lives inside each query's
+#                 own args, so there is nothing to narrow. The request cap still binds.
 #   SKIP_ALERTS=1 don't read the LinkedIn job-alert mailbox in Phase 0b. The corpus
 #                 then contains only what the portal queries found, and no job can
 #                 reach the gate's alert-matched 60 tier. Costs no LinkedIn requests
@@ -99,6 +107,10 @@ RANK_TIMEOUT="${RANK_TIMEOUT:-1800}"
 RANK_ATTEMPTS="${RANK_ATTEMPTS:-3}"
 RANK_BACKOFF="${RANK_BACKOFF:-20}"
 RESUME="${RESUME:-0}"
+# Defaulted rather than left unset because the script runs under `set -u`, where the
+# bare reference at the plan-builder call site would abort the run instead of meaning
+# "no filter".
+GEO_FILTER="${GEO_FILTER:-}"
 SKIP_ALERTS="${SKIP_ALERTS:-0}"
 SKIP_NOTIFY="${SKIP_NOTIFY:-0}"
 # Phase 0b's total wall-clock ceiling: 8 minutes. Raised from 300s on 2026-08-24 after
@@ -419,7 +431,16 @@ run_portal() {
 }
 
 # Build the day's plan: which query x geo pairs run, within the request cap
-if ! python3 scripts/build_search_plan.py --date "$TODAY" > "$PLAN_FILE" 2>>"$LOG_FILE"; then
+# An array, not `${GEO_FILTER:+--geo "$GEO_FILTER"}`: that form word-splits after
+# expansion, so "United Kingdom" and "Czech Republic" would arrive as two arguments and
+# argparse would take only the first word. Every configured multi-word geo would break.
+GEO_ARGS=()
+if [[ -n "$GEO_FILTER" ]]; then
+    GEO_ARGS=(--geo "$GEO_FILTER")
+    log "Search plan: geo-scoped to $GEO_FILTER (LinkedIn only; other portals keep their regions)"
+fi
+if ! python3 scripts/build_search_plan.py --date "$TODAY" \
+        "${GEO_ARGS[@]+"${GEO_ARGS[@]}"}" > "$PLAN_FILE" 2>>"$LOG_FILE"; then
     log "FATAL: could not build a search plan from config/search_matrix.json — see log"
     exit 1
 fi

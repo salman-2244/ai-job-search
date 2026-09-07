@@ -3,6 +3,7 @@
 
 Usage:
     python3 build_search_plan.py [--matrix PATH] [--date YYYY-MM-DD] [--portal NAME]
+                                 [--geo NAME[,NAME...]]
 
 Writes one tab-separated invocation per line to stdout:
 
@@ -28,6 +29,20 @@ Rotation contract:
     and only one number is worth trusting as the exposure limit.
   - If the always-include set alone exceeds the search cap, the set is truncated and
     the drop is reported on stderr rather than silently ignored.
+
+`--geo` narrows the run to one or more countries, for the on-demand `/run <geo>` path
+rather than the scheduled sweep. It filters the *candidate* geo list before rotation,
+not the emitted plan: a rotating geo is absent from most days' windows, so
+post-filtering the output would return an empty plan on all but the few days the
+window happened to cover it. Narrowing first instead makes the requested geo the whole
+rotating set, so every enabled query runs against it on any date. The cap still binds
+and the rotation stays keyed on the date, so a `--geo` run is as reproducible as a
+full one.
+
+`--geo` does not filter the other portals. Their geography is baked into each query's
+own args (`--region eu`, `--location Berlin`) rather than being a separate dimension,
+so there is nothing to filter on; they are left in the plan and a warning says so,
+which keeps a geo-scoped run from quietly shrinking the corpus to LinkedIn alone.
 """
 
 import argparse
@@ -58,7 +73,30 @@ def load_matrix(path: Path) -> dict:
         return json.load(f)
 
 
-def _linkedin_plan(cfg: dict, index: int, warn) -> list:
+def known_geos(matrix: dict) -> list:
+    """The LinkedIn geos this matrix can search, in declared order.
+
+    Exposed for the callers that have to validate a user-supplied geo before spending
+    a run on it — the Telegram `/run <geo>` path offers these as buttons.
+    """
+    return list(matrix.get("linkedin", {}).get("geos", []))
+
+
+def resolve_geos(available: list, requested) -> tuple:
+    """Match requested geo names against `available`. Returns (matched, unknown).
+
+    Matching is on the slug, so `--geo germany`, `Germany` and `United_Kingdom` all
+    land on the configured `"United Kingdom"`-style spelling. `matched` keeps the
+    matrix's declared order rather than the request's, so two spellings of one geo
+    cannot plan it twice.
+    """
+    wanted = {slug(r) for r in requested if str(r).strip()}
+    matched = [g for g in available if slug(g) in wanted]
+    unknown = sorted(wanted - {slug(g) for g in matched})
+    return matched, unknown
+
+
+def _linkedin_plan(cfg: dict, index: int, warn, only_geos=None) -> list:
     """Build the rotating LinkedIn plan. Returns a list of (name, portal, args)."""
     if not cfg.get("enabled", False):
         return []
@@ -67,6 +105,26 @@ def _linkedin_plan(cfg: dict, index: int, warn) -> list:
     limit = str(cfg.get("limit_per_query", 10))
     always_geos = cfg.get("always_include_geos", [])
     geos = cfg.get("geos", [])
+
+    if only_geos:
+        matched, unknown = resolve_geos(geos, only_geos)
+        if unknown:
+            warn(f"linkedin: unknown geo(s) {unknown} — not in the matrix's `geos`. "
+                 f"Known: {geos}")
+        if not matched:
+            # Returning the unfiltered plan would run a full sweep under a flag that
+            # asked for one country, which is the opposite of the request and spends
+            # the whole cap doing it. An empty LinkedIn plan is the honest answer; the
+            # caller sees zero planned requests and can fix the name.
+            warn("linkedin: --geo matched no configured geo; planning no LinkedIn "
+                 "searches this run.")
+            return []
+        geos = matched
+        # A narrowed run has no rotation to do: the point of `--geo` is that this
+        # country runs now, not that it runs on the days its window comes up. Treating
+        # the matched set as always-include also means the cap truncation warning
+        # below is the single place that reports an over-subscribed request.
+        always_geos = matched
 
     # `max_requests_per_run` bounds the whole run's LinkedIn traffic, not just its
     # searches: Phase 1c spends up to `detail_enrich_budget` more requests on the
@@ -144,16 +202,27 @@ def _simple_plan(portal: str, cfg: dict, warn) -> list:
     return plan
 
 
-def build_plan(matrix: dict, index: int, only_portal=None, warn=None) -> list:
+def build_plan(matrix: dict, index: int, only_portal=None, warn=None,
+               only_geos=None) -> list:
     """Return the full ordered plan as a list of (name, portal, args) tuples."""
     if warn is None:
         def warn(msg):
             print(f"Warning: {msg}", file=sys.stderr)
 
     plan = []
-    plan.extend(_linkedin_plan(matrix.get("linkedin", {}), index, warn))
+    plan.extend(_linkedin_plan(matrix.get("linkedin", {}), index, warn, only_geos))
     for portal in ("freehire", "arbeitnow", "weworkremotely"):
         plan.extend(_simple_plan(portal, matrix.get(portal, {}), warn))
+
+    if only_geos:
+        others = sorted({p[1] for p in plan if p[1] != "linkedin"})
+        if others:
+            # Said out loud rather than silently dropped: these portals encode their
+            # geography inside each query's own args, so there is no geo dimension to
+            # filter. Keeping them means a geo-scoped run still returns remote-EU and
+            # regional hits, which is usually what was wanted.
+            warn(f"--geo narrows LinkedIn only; {', '.join(others)} keep their "
+                 "configured regions.")
 
     if only_portal:
         plan = [p for p in plan if p[1] == only_portal]
@@ -173,6 +242,10 @@ def main():
     parser.add_argument("--matrix", type=Path, default=DEFAULT_MATRIX)
     parser.add_argument("--date", help="YYYY-MM-DD; defaults to today. Drives rotation.")
     parser.add_argument("--portal", help="Emit only this portal's invocations.")
+    parser.add_argument("--geo", help="Restrict LinkedIn to these geos "
+                                      "(comma-separated; matched case-insensitively).")
+    parser.add_argument("--list-geos", action="store_true",
+                        help="Print the matrix's LinkedIn geos, one per line, and exit.")
     parser.add_argument("--count", action="store_true",
                         help="Print the number of planned requests and exit.")
     args = parser.parse_args()
@@ -181,8 +254,16 @@ def main():
         print(f"Error: matrix not found at {args.matrix}", file=sys.stderr)
         return 1
 
+    matrix = load_matrix(args.matrix)
+
+    if args.list_geos:
+        for geo in known_geos(matrix):
+            print(geo)
+        return 0
+
+    only_geos = [g.strip() for g in args.geo.split(",")] if args.geo else None
     day = datetime.strptime(args.date, "%Y-%m-%d").date() if args.date else date.today()
-    plan = build_plan(load_matrix(args.matrix), day_index(day), args.portal)
+    plan = build_plan(matrix, day_index(day), args.portal, only_geos=only_geos)
 
     if args.count:
         print(len(plan))
@@ -192,7 +273,8 @@ def main():
         print("\t".join([name, portal, *cli_args]))
 
     linkedin_count = sum(1 for p in plan if p[1] == "linkedin")
-    print(f"Planned {len(plan)} requests ({linkedin_count} LinkedIn) for {day}",
+    scope = f" geo-scoped to {', '.join(only_geos)}" if only_geos else ""
+    print(f"Planned {len(plan)} requests ({linkedin_count} LinkedIn) for {day}{scope}",
           file=sys.stderr)
     return 0
 

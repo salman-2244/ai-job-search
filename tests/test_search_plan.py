@@ -7,6 +7,7 @@ tests pin the cap, the rotation's coverage guarantee, and the temp-filename uniq
 that stops two queries from overwriting each other's results.
 """
 import importlib.util
+import subprocess
 import sys
 import unittest
 from datetime import date
@@ -193,6 +194,249 @@ class PlanShapeTests(unittest.TestCase):
         plan = bsp.build_plan(m, 0, only_portal="linkedin", warn=quiet)
         self.assertTrue(plan)
         self.assertTrue(all(p[1] == "linkedin" for p in plan))
+
+
+class GeoFilterTests(unittest.TestCase):
+    """`--geo` / GEO_FILTER: the on-demand `/run <geo>` path's narrowing.
+
+    The property that matters is that a narrowed run actually searches the requested
+    country *on any date*. Rotation means a given geo is absent from most days'
+    windows, so a filter applied to the emitted plan would return nothing on all but a
+    few days — a bug that would look like "the bot found no German jobs" rather than
+    like a filter that never ran.
+    """
+
+    def linkedin(self, plan):
+        return [p for p in plan if p[1] == "linkedin"]
+
+    def geos_in(self, plan):
+        """Which -l values the plan actually queries."""
+        out = set()
+        for _name, _portal, args in self.linkedin(plan):
+            out.add(args[args.index("-l") + 1])
+        return out
+
+    def test_a_rotating_geo_is_searched_on_every_date_when_requested(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        # Netherlands is not in always_include_geos, so unfiltered runs reach it only
+        # when the window comes round. Under --geo it must be there every time.
+        for index in range(0, 40, 7):
+            with self.subTest(index=index):
+                plan = bsp.build_plan(m, index, only_geos=["Netherlands"], warn=quiet)
+                self.assertEqual(self.geos_in(plan), {"Netherlands"},
+                                 "a geo-scoped run must query exactly that geo")
+
+    def test_the_filter_does_not_smuggle_in_the_always_include_geo(self):
+        """Hungary is always-include, but "run Germany" means Germany.
+
+        Left unhandled this is the likely bug: `always_include_geos` is unioned into
+        every plan, so a Germany run would spend part of its cap on Budapest and the
+        user would see Hungarian jobs from a request that named another country.
+        """
+        m = bsp.load_matrix(MATRIX_PATH)
+        plan = bsp.build_plan(m, 0, only_geos=["Germany"], warn=quiet)
+        self.assertEqual(self.geos_in(plan), {"Germany"})
+
+    def test_several_geos_are_all_searched(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        plan = bsp.build_plan(m, 3, only_geos=["Germany", "Austria"], warn=quiet)
+        self.assertEqual(self.geos_in(plan), {"Germany", "Austria"})
+
+    def test_geo_names_match_case_insensitively(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        for spelling in ("germany", "GERMANY", "Germany"):
+            with self.subTest(spelling=spelling):
+                plan = bsp.build_plan(m, 0, only_geos=[spelling], warn=quiet)
+                self.assertEqual(self.geos_in(plan), {"Germany"},
+                                 "typed input should not have to match the config's case")
+
+    def test_a_multi_word_geo_survives_matching(self):
+        """"United Kingdom" and "Czech Republic" are the shapes most likely to break."""
+        m = bsp.load_matrix(MATRIX_PATH)
+        for geo in ("United Kingdom", "Czech Republic", "united_kingdom"):
+            with self.subTest(geo=geo):
+                plan = bsp.build_plan(m, 0, only_geos=[geo], warn=quiet)
+                self.assertEqual(len(self.geos_in(plan)), 1,
+                                 f"{geo!r} matched {self.geos_in(plan)}")
+
+    def test_two_spellings_of_one_geo_do_not_plan_it_twice(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        once = bsp.build_plan(m, 0, only_geos=["Germany"], warn=quiet)
+        twice = bsp.build_plan(m, 0, only_geos=["Germany", "germany"], warn=quiet)
+        self.assertEqual(len(self.linkedin(once)), len(self.linkedin(twice)),
+                         "duplicate spellings would double the requests")
+
+    def test_an_unknown_geo_plans_no_linkedin_searches_and_warns(self):
+        """Failing loudly beats falling back to a full sweep.
+
+        A typo that silently ran all 18 countries would spend the whole day's cap on
+        the opposite of what was asked, and the mistake would be invisible in the
+        report.
+        """
+        m = bsp.load_matrix(MATRIX_PATH)
+        warnings = []
+        plan = bsp.build_plan(m, 0, only_geos=["Narnia"], warn=warnings.append)
+        self.assertEqual(self.linkedin(plan), [])
+        self.assertTrue(any("narnia" in w.lower() for w in warnings),
+                        f"the unknown name must be named back: {warnings}")
+
+    def test_a_partly_unknown_request_still_runs_the_known_half(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        warnings = []
+        plan = bsp.build_plan(m, 0, only_geos=["Germany", "Narnia"],
+                              warn=warnings.append)
+        self.assertEqual(self.geos_in(plan), {"Germany"})
+        self.assertTrue(any("narnia" in w.lower() for w in warnings))
+
+    def test_the_request_cap_still_binds_under_a_geo_filter(self):
+        """--geo narrows the corpus, it does not buy extra requests."""
+        m = bsp.load_matrix(MATRIX_PATH)
+        cap = m["linkedin"]["max_requests_per_run"]
+        reserve = m["linkedin"]["detail_enrich_budget"]
+        for only in (["Germany"], ["Germany", "Austria", "Ireland", "Finland",
+                                   "Sweden", "Switzerland", "United Kingdom"]):
+            with self.subTest(geos=len(only)):
+                plan = bsp.build_plan(m, 0, only_geos=only, warn=quiet)
+                self.assertLessEqual(len(self.linkedin(plan)), cap - reserve)
+
+    def test_an_oversubscribed_geo_request_is_truncated_not_expanded(self):
+        # 4 queries against one geo is 4 requests under a cap of 3, so the plan must
+        # lose one rather than the geo filter buying itself extra headroom.
+        m = matrix(cap=3, geos=("Hungary", "Germany"), always=("Hungary",),
+                   queries=("AI Engineer", "Data Scientist", "ML Engineer",
+                            "Data Analyst"))
+        m["linkedin"]["detail_enrich_budget"] = 0
+        warnings = []
+        plan = bsp.build_plan(m, 0, only_geos=["Germany"], warn=warnings.append)
+        self.assertEqual(len(self.linkedin(plan)), 3)
+        self.assertTrue(any("dropping" in w for w in warnings), warnings)
+
+    def test_a_geo_scoped_plan_is_deterministic(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        first = bsp.build_plan(m, 11, only_geos=["Sweden"], warn=quiet)
+        second = bsp.build_plan(m, 11, only_geos=["Sweden"], warn=quiet)
+        self.assertEqual(first, second)
+
+    def test_the_other_portals_survive_a_geo_scoped_run(self):
+        """Their geography is inside their own query args; nothing to filter.
+
+        Dropping them would shrink a `/run Germany` corpus to LinkedIn alone and lose
+        the remote-EU listings, which are geographically relevant to any request.
+        """
+        m = bsp.load_matrix(MATRIX_PATH)
+        warnings = []
+        plan = bsp.build_plan(m, 0, only_geos=["Germany"], warn=warnings.append)
+        others = {p[1] for p in plan if p[1] != "linkedin"}
+        self.assertTrue(others, "non-LinkedIn portals should still be planned")
+        self.assertTrue(any("--geo narrows LinkedIn only" in w for w in warnings),
+                        f"the narrowing's limit should be stated: {warnings}")
+
+    def test_no_filter_is_the_unchanged_full_sweep(self):
+        """The default path must be identical to before the flag existed."""
+        m = bsp.load_matrix(MATRIX_PATH)
+        self.assertEqual(bsp.build_plan(m, 5, warn=quiet),
+                         bsp.build_plan(m, 5, only_geos=None, warn=quiet))
+        self.assertEqual(bsp.build_plan(m, 5, warn=quiet),
+                         bsp.build_plan(m, 5, only_geos=[], warn=quiet))
+
+    def test_names_stay_unique_so_temp_files_cannot_collide(self):
+        m = bsp.load_matrix(MATRIX_PATH)
+        names = [p[0] for p in bsp.build_plan(m, 0, only_geos=["Germany", "Austria"],
+                                              warn=quiet)]
+        self.assertEqual(len(names), len(set(names)))
+
+
+class ResolveGeosTests(unittest.TestCase):
+    def test_matched_order_follows_the_matrix_not_the_request(self):
+        available = ["Hungary", "Germany", "Netherlands"]
+        matched, unknown = bsp.resolve_geos(available, ["Netherlands", "Hungary"])
+        self.assertEqual(matched, ["Hungary", "Netherlands"])
+        self.assertEqual(unknown, [])
+
+    def test_blank_entries_are_ignored(self):
+        """"Germany," and "Germany, " are what a phone keyboard actually sends."""
+        matched, unknown = bsp.resolve_geos(["Germany"], ["Germany", "", "  "])
+        self.assertEqual(matched, ["Germany"])
+        self.assertEqual(unknown, [])
+
+    def test_unknown_names_are_reported(self):
+        matched, unknown = bsp.resolve_geos(["Germany"], ["Narnia", "Germany"])
+        self.assertEqual(matched, ["Germany"])
+        self.assertEqual(unknown, ["narnia"])
+
+    def test_known_geos_reads_the_matrix(self):
+        self.assertEqual(bsp.known_geos(matrix(geos=("Hungary", "Germany"))),
+                         ["Hungary", "Germany"])
+        self.assertEqual(bsp.known_geos({}), [])
+
+    def test_the_real_matrix_exposes_its_geos(self):
+        geos = bsp.known_geos(bsp.load_matrix(MATRIX_PATH))
+        self.assertIn("Germany", geos)
+        self.assertGreaterEqual(len(geos), 10)
+
+
+class GeoCliTests(unittest.TestCase):
+    """The CLI surface `run_daily.sh` and the Stage 3 orchestrator actually call."""
+
+    SCRIPT = REPO / "scripts" / "build_search_plan.py"
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(self.SCRIPT), "--date", "2026-09-07", *args],
+            capture_output=True, text=True, cwd=str(REPO))
+
+    def linkedin_rows(self, stdout):
+        rows = [r.split("\t") for r in stdout.splitlines() if r]
+        return [r for r in rows if len(r) > 1 and r[1] == "linkedin"]
+
+    def test_geo_flag_narrows_the_emitted_plan(self):
+        proc = self.run_cli("--geo", "Germany")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.linkedin_rows(proc.stdout)
+        self.assertTrue(rows, proc.stderr)
+        for row in rows:
+            self.assertEqual(row[row.index("-l") + 1], "Germany")
+
+    def test_a_multi_word_geo_survives_the_shell_boundary(self):
+        """The `run_daily.sh` array-vs-word-splitting bug, pinned end to end."""
+        proc = self.run_cli("--geo", "United Kingdom")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = self.linkedin_rows(proc.stdout)
+        self.assertTrue(rows, f"no LinkedIn rows: {proc.stderr}")
+        for row in rows:
+            self.assertEqual(row[row.index("-l") + 1], "United Kingdom")
+
+    def test_comma_separated_geos_are_split(self):
+        proc = self.run_cli("--geo", "Germany,Austria")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        seen = {r[r.index("-l") + 1] for r in self.linkedin_rows(proc.stdout)}
+        self.assertEqual(seen, {"Germany", "Austria"})
+
+    def test_list_geos_prints_the_offerable_choices(self):
+        proc = self.run_cli("--list-geos")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        listed = [line for line in proc.stdout.splitlines() if line]
+        self.assertEqual(listed, bsp.known_geos(bsp.load_matrix(MATRIX_PATH)))
+
+    def test_an_unknown_geo_exits_zero_with_a_warning_not_a_full_sweep(self):
+        """Exit 0 matters: run_daily.sh treats a non-zero plan build as FATAL.
+
+        The run should proceed with the other portals and an empty LinkedIn half, and
+        the operator should be able to see why from stderr.
+        """
+        proc = self.run_cli("--geo", "Narnia")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self.linkedin_rows(proc.stdout), [])
+        self.assertIn("Narnia", proc.stderr + proc.stdout)
+
+    def test_the_scope_is_reported_on_stderr(self):
+        proc = self.run_cli("--geo", "Germany")
+        self.assertIn("geo-scoped", proc.stderr)
+
+    def test_count_still_works_under_a_geo_filter(self):
+        proc = self.run_cli("--geo", "Germany", "--count")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(proc.stdout.strip().isdigit(), proc.stdout)
 
 
 class RealMatrixTests(unittest.TestCase):
