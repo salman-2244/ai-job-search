@@ -119,6 +119,18 @@ REQUIRED_IGNORE_RULES = [
 # ALLOWED_PERMISSIONS, so the widening is explicit and reviewable.
 ALLOWED_IGNORE_NEGATIONS = {
     "!cover_letters/OpenFonts/fonts/**",
+    # Broader than the entry above it, and it has to be. The application-output
+    # rules now exclude `**/cover_letters/*/*` so a new template's filenames are
+    # caught without knowing them in advance, and that pattern matches the
+    # directory `cover_letters/OpenFonts/fonts`. git will not descend into an
+    # excluded directory, so a negation naming only what is *inside* it never
+    # gets consulted - verified in a scratch repo on 2026-09-08, where
+    # `!cover_letters/OpenFonts/fonts/**` alone left the .ttf files ignored.
+    # The negation must match the directory itself, hence `OpenFonts/**`.
+    # Safe to widen: OpenFonts holds only the letter class's bundled OFL font
+    # files, no generated document and no personal data, so re-including all of
+    # it cannot re-expose anything the excluding rules exist to hide.
+    "!cover_letters/OpenFonts/**",
     "!cv/main_example.tex",
     "!cover_letters/cover_example.tex",
     "!documents/**/.gitkeep",
