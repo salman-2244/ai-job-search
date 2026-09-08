@@ -69,6 +69,122 @@ CB_NONE = "none"
 # into a document. Raise this only against an endpoint with no pre-consume hold.
 MAX_PARALLEL_JOBS = 1
 
+
+# --------------------------------------------------------------------------
+# Run-scoped output paths (Stage 3)
+#
+# The legacy layout — cv/<slug>/, cover_letters/<slug>/ — collides across runs:
+# two runs that both draft "Acme_Role" overwrite each other's documents, and a
+# re-draft silently replaces a finished application. The run-scoped layout
+# threads a day and run id into the directory so every run owns its own tree:
+#
+#     cv/<YYYY-MM-DD>/<run_id>/<slug>/Salman-Resume.tex
+#     cover_letters/<YYYY-MM-DD>/<run_id>/<slug>/Salman-Cover-Letter.tex
+#
+# Legacy directories are read-only to this helper: recognized and skipped, never
+# moved, deleted, or overwritten (the .gitignore name globs like `*-Resume.*`
+# keep either layout out of the repo). This module is the single source of the
+# layout; generate_batch.py and the Stage 3 orchestrator consume it through here.
+# --------------------------------------------------------------------------
+
+_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def doc_dir_for(day: str, run_id: Optional[str], slug: str) -> str:
+    """The directory (relative to the output root) one application's files go in.
+
+    With a run id this is `<day>/<run_id>/<slug>` — run-scoped, so two runs on
+    the same day never share a directory. Without one it is just `<slug>`, the
+    legacy layout, so a hand-run without Stage 3 keeps behaving exactly as
+    before. Raising on a malformed component is the point: a `/` or `..` inside
+    any of them would escape the output root, and the values travel into a
+    drafter prompt that runs with write access to the repo.
+    """
+    if not _DAY_RE.fullmatch(day or ""):
+        raise ValueError(f"day must be YYYY-MM-DD, got {day!r}")
+    if not slug or "/" in slug or "\\" in slug or ".." in slug or slug.startswith("."):
+        raise ValueError(f"slug is not path-safe: {slug!r}")
+    if run_id is None:
+        return slug
+    if not _RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+        raise ValueError(f"run_id is not path-safe: {run_id!r}")
+    return f"{day}/{run_id}/{slug}"
+
+
+def output_paths(repo: Path, day: str, run_id: str, slug: str) -> dict[str, Path]:
+    """The four artifact paths for one application inside one run.
+
+    Keys are `cv_tex`, `cv_pdf`, `cl_tex`, `cl_pdf`. Used by the batch runner's
+    completeness check and by generate_one's result fixups, so the reported
+    tracker paths are the paths that actually exist.
+    """
+    doc_dir = doc_dir_for(day, run_id, slug)
+    cv_dir = Path(repo) / "cv" / doc_dir
+    cl_dir = Path(repo) / "cover_letters" / doc_dir
+    return {
+        "cv_tex": cv_dir / "Salman-Resume.tex",
+        "cv_pdf": cv_dir / "Salman-Resume.pdf",
+        "cl_tex": cl_dir / "Salman-Cover-Letter.tex",
+        "cl_pdf": cl_dir / "Salman-Cover-Letter.pdf",
+    }
+
+
+def legacy_artifacts(slug: str, repo: Path = REPO) -> list[Path]:
+    """The four artifact paths in the legacy `cv/<slug>/` layout."""
+    return [
+        Path(repo) / "cv" / slug / "Salman-Resume.tex",
+        Path(repo) / "cv" / slug / "Salman-Resume.pdf",
+        Path(repo) / "cover_letters" / slug / "Salman-Cover-Letter.tex",
+        Path(repo) / "cover_letters" / slug / "Salman-Cover-Letter.pdf",
+    ]
+
+
+def _all_present(paths: Iterable[Path]) -> bool:
+    try:
+        return all(p.is_file() and p.stat().st_size > 0 for p in paths)
+    except OSError:
+        return False
+
+
+def is_complete(
+    slug: str,
+    output_root: Optional[Path] = None,
+    day: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> bool:
+    """True when all four artifacts exist as non-empty files.
+
+    With `run_id`, checks the run-scoped layout under `output_root` (default the
+    repo). Without one, checks the legacy layout — which is what makes resume
+    and `--all-missing` recognize yesterday's work instead of regenerating it.
+    A .tex without its .pdf is a draft that never compiled, so all four are
+    required.
+    """
+    if run_id:
+        paths = output_paths(
+            output_root if output_root is not None else REPO, day or "", run_id, slug
+        )
+        return _all_present(paths.values())
+    return _all_present(legacy_artifacts(slug, output_root if output_root is not None else REPO))
+
+
+def legacy_is_complete(slug: str, repo: Path = REPO) -> bool:
+    """Recognize a finished legacy application without touching it.
+
+    Read-only by contract: callers skip complete legacy slugs rather than
+    migrating them, and a partial one (a .tex missing its .pdf) is left exactly
+    as it is for a human to look at — never moved, deleted, or overwritten.
+    """
+    return _all_present(legacy_artifacts(slug, repo))
+
+
+def job_file_path(today: str, idx: int, run_id: Optional[str] = None) -> Path:
+    """Where this job's JSON payload goes, named so concurrent runs cannot collide."""
+    if run_id:
+        return Path(f"/tmp/jobsearch_selected_{today}_{run_id}_{idx}.json")
+    return Path(f"/tmp/jobsearch_selected_{today}_{idx}.json")
+
 # Telegram tolerates ~30 messages/sec globally but throttles bursts to one chat.
 SEND_DELAY_SECONDS = 0.12
 
@@ -442,17 +558,32 @@ def load_env(path: Optional[Path] = None) -> dict[str, str]:
 
 
 async def generate_one(
-    row: JobRow, today: str, sem: asyncio.Semaphore, log: Path
+    row: JobRow,
+    today: str,
+    sem: asyncio.Semaphore,
+    log: Path,
+    run_id: Optional[str] = None,
+    output_root: Optional[Path] = None,
 ) -> dict:
-    """Draft + compile one job's documents in its own Claude Code process."""
+    """Draft + compile one job's documents in its own Claude Code process.
+
+    With `run_id` the documents land in the run-scoped layout
+    (`cv/<day>/<run_id>/<slug>/…`) under `output_root` (default the repo), the
+    reported paths are the ones that actually exist on disk, and `ok` additionally
+    requires all four artifacts to be present — the child's own `cv_compiled`
+    flag is trusted less than the filesystem. Without `run_id` the legacy layout
+    and behavior are preserved byte-for-byte for the listener and hand-runs.
+    """
     async with sem:
-        job_file = Path(f"/tmp/jobsearch_selected_{today}_{row.idx}.json")
+        job_file = job_file_path(today, row.idx, run_id)
         job_file.write_text(
             json.dumps(build_job_payload(row), indent=2), encoding="utf-8"
         )
 
+        doc_dir = doc_dir_for(today, run_id, row.slug)
         prompt = DRAFT_PROMPT.read_text(encoding="utf-8")
         prompt = prompt.replace("<JOB_FILE_PATH>", str(job_file))
+        prompt = prompt.replace("<OUTPUT_DIR>", doc_dir)
         prompt = prompt.replace("<OUTPUT_SLUG>", row.slug)
 
         proc = await asyncio.create_subprocess_exec(
@@ -502,13 +633,54 @@ async def generate_one(
         parsed = extract_json_object(stdout) or {}
         jobs = parsed.get("jobs") or []
         result = jobs[0] if jobs else parsed
-        ok = bool(result.get("cv_compiled")) and bool(result.get("cl_compiled"))
+        if run_id:
+            fixup_run_scoped_result(result, today, run_id, row.slug, output_root)
+            ok = bool(result.get("cv_compiled")) and bool(result.get("cl_compiled"))
+            artifacts = output_paths(output_root or REPO, today, run_id, row.slug)
+            missing = [k for k, p in artifacts.items() if not (p.is_file() and p.stat().st_size > 0)]
+            if missing:
+                ok = False
+                result["missing_artifacts"] = missing
+                result["errors"] = list(result.get("errors") or []) + [
+                    f"run-scoped artifacts missing: {', '.join(missing)}"
+                ]
+        else:
+            ok = bool(result.get("cv_compiled")) and bool(result.get("cl_compiled"))
         return {
             "row": row,
             "ok": ok,
             "result": result,
             "error": None if ok else (parsed.get("errors") or ["incomplete output"])[0],
         }
+
+
+def fixup_run_scoped_result(
+    result: dict,
+    today: str,
+    run_id: str,
+    slug: str,
+    output_root: Optional[Path] = None,
+) -> None:
+    """Rewrite a drafter's reported paths onto the run-scoped layout, in place.
+
+    The drafter (prompts/selected_job_draft.md) still reports legacy-shaped paths
+    because its contract predates run scoping. The filesystem is the truth: the
+    files exist at `cv/<day>/<run_id>/<slug>/…`, so the tracker and the summary
+    are pointed at what is actually there — a tracker row naming a path nobody
+    can open is worse than one naming the real location.
+
+    `slug` comes from the caller's JobRow, not the drafter's JSON: the prompt's
+    output contract predates run scoping and names no slug field, so a fallback
+    to the parsed result would silently skip every fixup.
+    """
+    if not slug:
+        return
+    root = output_root or REPO
+    paths = output_paths(root, today, run_id, slug)
+    result["cv_file"] = str(paths["cv_tex"].relative_to(root))
+    result["cv_pdf"] = str(paths["cv_pdf"].relative_to(root))
+    result["cover_letter_file"] = str(paths["cl_tex"].relative_to(root))
+    result["cl_pdf"] = str(paths["cl_pdf"].relative_to(root))
 
 
 def append_tracker(
@@ -736,7 +908,14 @@ async def run_interactive(rows: list[JobRow], cfg: dict, args: argparse.Namespac
 
         sem = asyncio.Semaphore(MAX_PARALLEL_JOBS)
         outcomes = await asyncio.gather(
-            *(generate_one(r, today, sem, log) for r in chosen)
+            *(
+                generate_one(
+                    r, today, sem, log,
+                    run_id=getattr(args, "run_id", None),
+                    output_root=getattr(args, "output_root", None),
+                )
+                for r in chosen
+            )
         )
         append_tracker(
             [(o["row"], o.get("result") or {}) for o in outcomes if o["ok"]],
@@ -846,6 +1025,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=None,
         help="write tracker rows here instead of job_search_tracker.csv "
         "(use for sandbox runs so fake companies never reach the real log)",
+    )
+    ap.add_argument(
+        "--run-id",
+        default=None,
+        help="Stage 3 run id: documents land in cv/<day>/<run_id>/<slug>/ instead "
+        "of cv/<slug>/, so concurrent runs cannot overwrite each other",
+    )
+    ap.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="root the document tree here instead of the repo (paired with --run-id "
+        "for Stage 3 run-scoped output)",
     )
     ap.add_argument(
         "--timeout", type=float, default=3600.0, help="seconds to wait for Submit"

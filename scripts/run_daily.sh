@@ -85,6 +85,19 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 `/run <geo>` path; unset means the normal rotating sweep. The other
 #                 portals are unaffected — their geography lives inside each query's
 #                 own args, so there is nothing to narrow. The request cap still binds.
+#   JOB_COUNT     cap on how many jobs reach the rankset (Stage 3 /run [n]). The
+#                 Phase 1b-final cut takes the first N of the deep-rank budget; the
+#                 rest of that budget is passed over, not re-scored by the ranker.
+#                 Range 1-50, integers only, set in the environment not argv — a
+#                 validated run_id and a non-numeric count in the same env block
+#                 must fail the same way. Unset means the full budget, byte-for-byte
+#                 unchanged behavior.
+#   RUN_ID        Stage 3 run id stamped into new logs, reports and the selection
+#                 handoff so a day's artifacts can be traced to the run that made
+#                 them. Path-component safe by the same rule the orchestrator
+#                 enforces; a malformed value exits 1 rather than being sanitized.
+#   OUTPUT_ROOT   root for Stage 3 run-scoped document trees (cv/<day>/<run_id>/…).
+#                 Default empty = the repo, exactly as before.
 #   SKIP_ALERTS=1 don't read the LinkedIn job-alert mailbox in Phase 0b. The corpus
 #                 then contains only what the portal queries found, and no job can
 #                 reach the gate's alert-matched 60 tier. Costs no LinkedIn requests
@@ -111,6 +124,30 @@ RESUME="${RESUME:-0}"
 # bare reference at the plan-builder call site would abort the run instead of meaning
 # "no filter".
 GEO_FILTER="${GEO_FILTER:-}"
+# Stage 3 on-demand controls. Defaults keep the launchd path byte-for-byte
+# identical; the orchestrator sets all three for a supervised run.
+RUN_ID="${RUN_ID:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
+JOB_COUNT="${JOB_COUNT:-}"
+if [[ -n "$RUN_ID" ]]; then
+    case "$RUN_ID" in
+        *[!A-Za-z0-9._-]*|.*|..*)
+            echo "FATAL: RUN_ID is not path-safe: '$RUN_ID'. Use 1-64 characters of " \
+                 "A-Za-z0-9._- without a leading dot. The orchestrator generates ids " \
+                 "that always pass; a hand-set value must too, because it names " \
+                 "directories documents and reports are written under." >&2
+            exit 1
+            ;;
+    esac
+fi
+if [[ -n "$JOB_COUNT" ]]; then
+    if ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || (( JOB_COUNT < 1 || JOB_COUNT > 50 )); then
+        echo "FATAL: JOB_COUNT must be a whole number between 1 and 50, got '$JOB_COUNT'. " \
+             "The Telegram bot bounds its own input; this is the script's independent bound, " \
+             "so a hand-set value cannot request absurdity." >&2
+        exit 1
+    fi
+fi
 SKIP_ALERTS="${SKIP_ALERTS:-0}"
 SKIP_NOTIFY="${SKIP_NOTIFY:-0}"
 # Phase 0b's total wall-clock ceiling: 8 minutes. Raised from 300s on 2026-08-24 after
@@ -167,7 +204,8 @@ notify_result() {
         "jobs fetched: ${TOTAL_JOBS:-?}
 ranked: ${RANKED_COUNT:-?}
 report: ${REPORT_FILE}
-log: ${LOG_FILE}" \
+log: ${LOG_FILE}
+run: ${RUN_ID:-manual}" \
         || echo "[notify] tg-notify failed" >&2
 }
 
@@ -221,6 +259,9 @@ trap 'exit 130' INT
 mkdir -p "$LOG_DIR" "$REPORT_DIR" "$APP_PACKAGES_DIR"
 
 log "=== Pipeline Run: $TODAY $(date +"%H:%M:%S") ==="
+if [[ -n "$RUN_ID" ]]; then
+    log "Stage 3 run id: $RUN_ID"
+fi
 log "Config: enabled=true, max_jobs=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pipeline']['max_jobs_to_apply'])")"
 
 # === Read pipeline config ===
@@ -684,6 +725,15 @@ fi
 if [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
     log "Phase 1b-final: SKIPPED (RESUME=1) — reusing the rankset at $RANKSET_FILE"
 else
+    # JOB_COUNT (Stage 3 /run [n]): take the first N of the deep-rank budget into
+    # the rankset. Nothing else changes — scoring, gates and deferral all ran
+    # already, so this is a pure cut of an already-ranked file, and the deferred
+    # file is not rewritten (its entries describe why jobs missed the full budget).
+    JOB_COUNT_ARGS=()
+    if [[ -n "$JOB_COUNT" ]]; then
+        log "Phase 1b-final: capping the rankset at $JOB_COUNT job(s) (JOB_COUNT)"
+        JOB_COUNT_ARGS=("--budget" "$JOB_COUNT")
+    fi
     log "Phase 1b-final: re-scoring the $SHORTLIST_JOBS enriched shortlisted jobs and cutting to the deep-rank budget..."
     if ! python3 scripts/prerank_jobs.py --jobs "$SHORTLIST_FILE" \
             --corpus "$JOBS_FILE" \
@@ -691,6 +741,7 @@ else
             --matrix "$MATRIX" --today "$TODAY" \
             --alerts "$ALERT_STORE" \
             --stage final \
+            "${JOB_COUNT_ARGS[@]+"${JOB_COUNT_ARGS[@]}"}" \
             > "$PRERANK_FILE" 2>>"$LOG_FILE"; then
         log "FATAL: Phase 1b-final failed — refusing to fall back to ranking all $SHORTLIST_JOBS shortlisted jobs (see log)"
         exit 1
@@ -950,7 +1001,14 @@ if (( SELECTED_JOBS > 0 )); then
     # reboot, a crash restart), and every one of those starts must be a no-op
     # unless a selection is genuinely pending.
     PENDING_FILE="/tmp/jobsearch_pending_selection.json"
-    printf '{"today": "%s", "rankset": "%s"}\n' "$TODAY" "$RANKSET_FILE" > "$PENDING_FILE"
+    printf '{"today": "%s", "rankset": "%s"' "$TODAY" "$RANKSET_FILE" > "$PENDING_FILE"
+    if [[ -n "$RUN_ID" ]]; then
+        printf ', "run_id": "%s"' "$RUN_ID" >> "$PENDING_FILE"
+    fi
+    if [[ -n "$OUTPUT_ROOT" ]]; then
+        printf ', "output_root": "%s"' "$OUTPUT_ROOT" >> "$PENDING_FILE"
+    fi
+    printf '}\n' >> "$PENDING_FILE"
 
     # kickstart -k, not `launchctl start`: -k kills an already-running instance
     # first. Without it, yesterday's listener still holding the token inside its
