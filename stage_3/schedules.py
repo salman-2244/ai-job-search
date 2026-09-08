@@ -292,16 +292,24 @@ class ScheduleStore:
 def due(records: list[Schedule], now: datetime) -> list[Schedule]:
     """Records that should launch at `now`, in the order they were given.
 
-    A recurring record matches its cron in its own timezone; a one-shot record
-    is due once its local time has arrived and it has never been started.
+    A recurring record matches its cron in its own timezone, but not within the
+    same fire-minute as its last start — a scheduler tick that marks-then-launches
+    would otherwise relaunch on the very next tick of the same minute. A one-shot
+    record is due once its local time has arrived and it has never been started.
     """
     out = []
     for record in records:
         if not record.enabled:
             continue
         if record.kind == "recurring":
-            if cron_matches(record.expression, now, record.timezone):
-                out.append(record)
+            if not cron_matches(record.expression, now, record.timezone):
+                continue
+            if record.last_started_at is not None:
+                started = datetime.fromisoformat(record.last_started_at)
+                if now.replace(second=0, microsecond=0) <= started.replace(
+                        second=0, microsecond=0):
+                    continue
+            out.append(record)
         elif record.last_started_at is None:
             if now >= _parse_once(record.expression, record.timezone):
                 out.append(record)
