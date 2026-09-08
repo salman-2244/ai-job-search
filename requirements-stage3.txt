@@ -1,0 +1,13 @@
+# Optional tier-3 dependencies for Stage 3's Playwright-based LinkedIn
+# enrichment. Everything else in this repo runs on the standard library plus
+# python-telegram-bot; these packages are needed only when you explicitly opt
+# in to the authenticated browser tier (see docs/STAGE_3.md).
+#
+# The version is pinned so a Playwright upgrade cannot silently change browser
+# behavior under an unattended run. After installing, provision the browser
+# itself (not covered by pip):
+#
+#   pip install -r requirements-stage3.txt
+#   playwright install chromium
+#
+playwright==1.62.0

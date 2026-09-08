@@ -107,6 +107,7 @@ instructions." Nothing here interprets it.
 import argparse
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -984,6 +985,132 @@ def browser_fetcher(module, ledger, warn, log, state, guest=fetch_detail):
     return fetch
 
 
+# === The tier-3 path ========================================================
+# The third authenticated client, enabled only when the operator turns it on:
+# the matrix sets `linkedin.use_playwright` AND the environment carries a
+# session (`LINKEDIN_PLAYWRIGHT_STORAGE_STATE` pointing at an existing file, or
+# LINKEDIN_EMAIL/LINKEDIN_PASSWORD). Both conditions, never one: a provider
+# with no session can only land on a login wall, and a session nobody asked
+# this path to spend must not be spent by it.
+#
+# It engages only where tier 1 could not (WebBridge unavailable at pre-flight,
+# or `use_browser_extractor` off). The WebBridge browser and a Playwright
+# context are two authenticated clients for one host, and running both per job
+# doubles the session risk for the same body — so there is deliberately no
+# mid-run handoff from browser to Playwright: a browser path that degrades
+# mid-list still lands on the guest CLI exactly as before.
+
+
+def _load_playwright_provider(warn, log, environ=None):
+    """The tier-3 provider from scripts/linkedin_playwright.py, or (None, None, reason).
+
+    Returns (provider, errors, reason): `errors` is the loaded module, so the
+    fetcher can catch its exact typed exceptions — the provider module is loaded
+    by file path (same importlib pattern as `_load_extractor`), and the classes
+    must come from the same module object the provider raises, not from a
+    re-imported look-alike. Reuses an already-registered module so the loader is
+    idempotent and tests can pre-register their own copy.
+
+    Playwright itself is imported lazily by the provider's first fetch, so this
+    loader runs — and the phase degrades to the guest CLI cleanly — on a machine
+    with no browser installed at all.
+    """
+    env = os.environ if environ is None else environ
+    path = REPO / "scripts" / "linkedin_playwright.py"
+    name = "linkedin_playwright"
+    module = sys.modules.get(name)
+    if module is None or not hasattr(module, "PlaywrightDetailProvider"):
+        try:
+            spec = importlib.util.spec_from_file_location(name, path)
+            module = importlib.util.module_from_spec(spec)
+            # Registered *before* exec — the same dataclass lookup trap
+            # `_load_extractor` documents; this module's dataclasses are only
+            # built at fetch time, but the rule is the same and free to honor.
+            sys.modules[name] = module
+            spec.loader.exec_module(module)
+        except Exception as exc:                                # noqa: BLE001
+            sys.modules.pop(name, None)  # never leave a half-executed module behind
+            warn(f"tier-3 provider at {path} would not import "
+                 f"({type(exc).__name__}: {exc}) — using the guest CLI")
+            return None, None, "tier-3 provider would not import"
+
+    state_raw = (env.get("LINKEDIN_PLAYWRIGHT_STORAGE_STATE") or "").strip()
+    storage_state = Path(state_raw).expanduser() if state_raw else None
+    if storage_state is not None and not storage_state.is_file():
+        warn("LINKEDIN_PLAYWRIGHT_STORAGE_STATE names a missing file — ignoring it")
+        storage_state = None
+    has_credentials = bool(env.get("LINKEDIN_EMAIL") and env.get("LINKEDIN_PASSWORD"))
+    if storage_state is None and not has_credentials:
+        return None, None, ("no LINKEDIN_PLAYWRIGHT_STORAGE_STATE file and no "
+                            "LINKEDIN_EMAIL/LINKEDIN_PASSWORD — tier 3 has no session")
+
+    headless_raw = (env.get("LINKEDIN_PLAYWRIGHT_HEADLESS") or "true").strip().lower()
+    headless = headless_raw not in {"false", "0", "no"}
+    try:
+        timeout = float((env.get("LINKEDIN_PLAYWRIGHT_TIMEOUT") or "30").strip())
+    except ValueError:
+        warn("LINKEDIN_PLAYWRIGHT_TIMEOUT is not a number — using 30s")
+        timeout = 30.0
+    timeout = min(300.0, max(1.0, timeout))
+
+    provider = module.PlaywrightDetailProvider(
+        storage_state=storage_state, headless=headless, timeout=timeout)
+    log("tier 3 armed — authenticated Playwright fallback enabled")
+    return provider, module, None
+
+
+def playwright_fetcher(provider, errors, ledger, warn, log, state,
+                       guest=fetch_detail):
+    """A `fetch(job_id)` for `enrich` backed by the tier-3 Playwright provider.
+
+    Same shape as `browser_fetcher` on purpose: `enrich` and `merge_detail` stay
+    fetch-agnostic, a description is a description whichever client read it, and
+    every failure lands on the guest path without raising. The provider charges
+    the shared ledger before each navigation itself, so this wrapper never
+    touches the budget — it only reacts to what the provider reports.
+
+    The switch policy mirrors the browser path's: a posting-level failure
+    (timeout, missing content) is tolerated for `BROWSER_FAILURE_STREAK`
+    consecutive postings and then condemns the tier, while a failure no retry
+    can fix — a login wall, a CAPTCHA/checkpoint, a consent screen, Playwright
+    itself not installed — condemns it immediately. The provider's messages
+    name the operator action and never carry credentials.
+    """
+    def fetch(job_id):
+        if state.get("switched"):
+            return guest(job_id)
+        if ledger.left() < 1:
+            raise DetailError(
+                f"LinkedIn request budget spent ({ledger.spent}/{ledger.limit}) — "
+                "refusing to exceed linkedin.max_requests_per_run")
+        try:
+            got = provider.fetch(job_id, ledger)
+        except errors.PlaywrightBudgetExhaustedError as exc:
+            # The cap is spent. The guest CLI shares this ledger, so there is
+            # nothing to switch to either — the job keeps its snippet.
+            raise DetailError(str(exc))
+        except (errors.PlaywrightLoginWallError, errors.PlaywrightChallengeError,
+                errors.PlaywrightConsentError, errors.PlaywrightNotAvailableError) as exc:
+            state["switched"] = True
+            state["reason"] = f"tier 3 paused ({type(exc).__name__}: {exc})"
+            warn(f"fallback guest — {state['reason']}")
+            log("tier 3 paused for the rest of the phase — an operator action is "
+                "required before it can run again")
+            raise DetailError(str(exc))
+        except errors.PlaywrightProviderError as exc:
+            state["streak"] = state.get("streak", 0) + 1
+            if state["streak"] >= BROWSER_FAILURE_STREAK:
+                state["switched"] = True
+                state["reason"] = (f"tier 3 failed on {state['streak']} consecutive "
+                                   f"postings (last: {exc})")
+                warn(f"fallback guest — {state['reason']}")
+            raise DetailError(str(exc))
+        state["streak"] = 0
+        state["playwright_jobs"] = state.get("playwright_jobs", 0) + 1
+        return got
+    return fetch
+
+
 def alert_fallback(reason: str, log, run=subprocess.run) -> bool:
     """Ping Telegram once that this run is on the guest path. True if sent.
 
@@ -1128,8 +1255,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Report the selection without fetching or writing.")
     parser.add_argument("--no-browser", action="store_true",
-                        help="Force the guest CLI even if linkedin.use_browser_extractor "
-                             "is true. For benchmarking one path against the other.")
+                        help="Force the guest CLI even if the browser extractor or "
+                             "tier-3 Playwright path is enabled. For benchmarking one "
+                             "path against the other.")
     parser.add_argument("--alert-on-fallback", action="store_true",
                         help="Send one Telegram alert if the browser path is "
                              "unavailable. run_daily.sh passes this; manual runs stay "
@@ -1225,16 +1353,40 @@ def main():
     # before the browser existed.
     ledger = RequestLedger(budget)
     use_browser = bool(linkedin.get("use_browser_extractor", False))
+    use_playwright = bool(linkedin.get("use_playwright", False))
     module, fallback_reason = None, None
+    provider, errors, playwright_reason = None, None, None
     if args.dry_run or budget <= 0:
         log("path decision skipped (dry run or zero budget) — no requests spent")
     elif args.no_browser:
         log("fallback guest — --no-browser was passed")
         fallback_reason = None      # an explicit choice is not an incident to alert on
     elif not use_browser:
-        log("fallback guest — linkedin.use_browser_extractor is false")
+        # Logged only when tier 3 cannot catch the handoff below; an armed
+        # tier 3 makes this a playwright-or-guest run, not a guest run.
+        if not use_playwright:
+            log("fallback guest — linkedin.use_browser_extractor is false")
     else:
         module, fallback_reason = browser_fetch_path(budget, warn, log, ledger)
+
+    # Tier 3 arms only where tier 1 could not: a WebBridge run is never joined
+    # by a Playwright one (see the tier-3 block above), a dry run spends
+    # nothing, and an explicit --no-browser means the guest CLI, full stop.
+    if (module is None and use_playwright
+            and not args.no_browser and not args.dry_run and budget > 0):
+        provider, errors, playwright_reason = _load_playwright_provider(warn, log)
+        if provider is not None:
+            # Tier 3 caught the handoff, so the run is NOT on the guest path:
+            # clear the browser fallback reason so the alert below does not
+            # fire for a run that kept full authenticated descriptions.
+            fallback_reason = None
+    if provider is None and playwright_reason:
+        log(f"tier 3 not engaged ({playwright_reason})")
+    if (module is None and provider is None and not args.no_browser
+            and not args.dry_run and budget > 0 and use_playwright
+            and not use_browser):
+        log("fallback guest — linkedin.use_browser_extractor is false and "
+            "tier 3 did not engage")
 
     if fallback_reason and args.alert_on_fallback:
         alert_fallback(fallback_reason, log)
@@ -1249,15 +1401,20 @@ def main():
     targets, stats = select_targets(jobs, queries, job_budget, seen_keys, warn, cut,
                                     alert_budget, floor)
 
-    state = {"streak": 0, "switched": False, "browser_jobs": 0, "reason": None}
+    state = {"streak": 0, "switched": False, "browser_jobs": 0,
+             "playwright_jobs": 0, "reason": None}
     if module is not None:
         fetch = browser_fetcher(module, ledger, warn, log, state,
                                 guest=timeout_wrapper(args.timeout))
+    elif provider is not None:
+        fetch = playwright_fetcher(provider, errors, ledger, warn, log, state,
+                                   guest=timeout_wrapper(args.timeout))
     else:
         fetch = timeout_wrapper(args.timeout)
 
     summary = {"targeted": len(targets), "enriched": 0, "empty": 0, "failed": 0,
-               "fetch_path": "browser" if module is not None else "guest",
+               "fetch_path": ("browser" if module is not None
+                              else "playwright" if provider is not None else "guest"),
                "fallback_reason": fallback_reason,
                "budget": budget, "job_budget": job_budget,
                "preflight_requests": ledger.spent,
@@ -1280,10 +1437,13 @@ def main():
     # "guest", and a report that called it either would be wrong about the run whose
     # explanation matters most.
     summary["browser_jobs"] = state["browser_jobs"]
-    summary["guest_jobs"] = max(0, summary["enriched"] - state["browser_jobs"])
+    summary["playwright_jobs"] = state["playwright_jobs"]
+    summary["guest_jobs"] = max(0, summary["enriched"] - state["browser_jobs"]
+                                - state["playwright_jobs"])
     summary["requests_spent"] = ledger.spent
     if state["switched"]:
-        summary["fetch_path"] = "browser->guest"
+        summary["fetch_path"] = ("browser->guest" if module is not None
+                                 else "playwright->guest")
         summary["fallback_reason"] = state["reason"]
         # The mid-run switch alerts too, and only here — `alert_fallback` is called
         # from exactly two places in this function and neither can run twice, which is
@@ -1291,6 +1451,7 @@ def main():
         if args.alert_on_fallback and not fallback_reason:
             alert_fallback(state["reason"], log)
     log(f"path={summary['fetch_path']} browser_jobs={summary['browser_jobs']} "
+        f"playwright_jobs={summary['playwright_jobs']} "
         f"guest_jobs={summary['guest_jobs']} "
         f"linkedin_requests={ledger.spent}/{ledger.limit}")
 
