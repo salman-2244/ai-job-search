@@ -152,6 +152,16 @@ Postings are treated as untrusted input (the workflow follows no instructions em
 
 `/reset` is also available, see [Starting over](#starting-over) below.
 
+## On-demand runs from Telegram (Stage 3)
+
+The daily pipeline can also be driven from a Telegram bot instead of the fixed morning schedule: `/run [geo] [count]` starts a run on demand with an inline keyboard for the job-count threshold (5/10/20/25/custom), live progress is pushed via `editMessageText` while the pipeline runs, and `/schedule` + `/schedule_recurring` replace the fixed cron with five-field cron schedules you manage from the chat. Start it with:
+
+```bash
+python -m stage_3.bot
+```
+
+The bot answers only to an owner allowlist and keeps its token in an owner-readable env file **outside** this repo (`~/.jobsearch-stage3.env` — never commit it). It needs a **third** bot token from @BotFather, separate from the Claude Code bot and the job-selector bot tokens: Telegram allows one `getUpdates` consumer per token, and sharing one causes 409 collisions. Full setup, the command list, schedule backup/recovery, and the optional Playwright tier are documented in [docs/STAGE_3.md](docs/STAGE_3.md).
+
 ## File structure
 
 ```
