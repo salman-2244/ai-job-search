@@ -1,45 +1,12 @@
-# Stage 3 — Resume checkpoint (updated 2026-09-08)
+# Stage 3 — Resume checkpoint (final, 2026-09-08)
 
-This file is the single place to look to pick the build back up. It is a **checkpoint**,
-not a replacement for the plan: the approved implementation plan is
-`docs/superpowers/plans/2026-09-08-stage-3-completion.md` and is the source of truth for
-what each task must contain. Read it before touching anything.
+This file was the single place to look to pick the build back up. **All eleven
+tasks of `docs/superpowers/plans/2026-09-08-stage-3-completion.md` are now
+implemented, tested, and committed.** This file is kept as the build record;
+`docs/STAGE_3.md` is now the operations guide a user follows.
 
-**Status in one line:** Tasks 1–4 are done, tested, and pushed. Task 5 (cron schedule
-store) is the next thing to build. Tasks 5–11 remain.
-
-## Where the work lives
-
-- **Worktree:** `/Users/salman/Projects/ai-job-search/.claude/worktrees/stage-3-completion`
-- **Branch:** `worktree-stage-3-completion` (tracks `origin/worktree-stage-3-completion`)
-- **Remote:** `origin` = `https://github.com/salman-2244/ai-job-search.git`
-- **SDD ledger:** `.superpowers/sdd/2026-09-08-stage-3-completion/progress.md`
-  (first line names the plan; a `Task N: complete` line means that task is done —
-  do not re-do it. Per-task reports sit beside it as `task-N-report.md`.)
-- The plan file and the brief files in that `.superpowers/sdd/.../` directory are **read-only
-  for this build** — do not edit them. The task briefs (`task-N-brief.md`) carry the exact
-  interfaces, weights, and test values; the report files (`task-N-report.md`) record what
-  each finished task changed and how it was verified.
-
-## What is committed (newest first)
-
-```
-f2a15aa  feat(stage3): supervise pipeline runs with manifests and lifecycle   (Task 4)
-5588f89  feat(stage3): render progress and selection keyboards                (Task 3)
-d67a58e  feat(stage3): model pipeline progress from logs                      (Task 2)
-bf4cdd5  test(stage3): lock down secure configuration                         (Task 1)
-964d079  docs: add Stage 3 resume checkpoint                                  (pre-existing)
-13b46d2  docs: add Stage 3 completion implementation plan                     (pre-existing)
-```
-
-All green. Verification commands that pass right now:
-
-```
-python3 -m pytest tests/test_stage3_config.py tests/test_stage3_progress.py \
-                  tests/test_stage3_render.py tests/test_stage3_orchestrator.py -q   # 49 passed
-python3 -m py_compile stage_3/config.py stage_3/progress.py stage_3/render.py \
-                  stage_3/orchestrator.py                                             # clean
-```
+**Status in one line:** Tasks 1–11 complete. Branch
+`worktree-stage-3-completion` pushed; the PR carries the validation summary.
 
 ## Task status
 
@@ -49,65 +16,100 @@ python3 -m py_compile stage_3/config.py stage_3/progress.py stage_3/render.py \
 | 2 | Implement pure progress tracking | **done** — `d67a58e` |
 | 3 | Implement deterministic Telegram rendering | **done** — `5588f89` |
 | 4 | Implement the run orchestrator | **done** — `f2a15aa` |
-| 5 | Persist validated cron schedules | **next** |
-| 6 | Implement the Telegram bot | not started |
-| 7 | Isolate generated applications by run (outputs) | not started |
-| 8 | Add optional Playwright provider + session helper | not started |
-| 9 | Document Stage 3 setup and operations (`docs/STAGE_3.md`) | not started |
-| 10 | Verification + security review + full test suite | not started |
-| 11 | Prepare the pull request | not started |
+| 5 | Persist validated cron schedules | **done** — `c58658b` |
+| 6 | Implement the Telegram bot + scheduler loop | **done** — `eda3c03` |
+| 7 | Isolate generated applications by run (outputs) | **done** — `38b4d9d` |
+| 8 | Optional Playwright provider + session helper | **done** — `f24e604` |
+| 9 | Document setup and operations (`docs/STAGE_3.md`) | **done** — `0905a88` |
+| 10 | Verification + security review + full suite | **done** — `3e9fdd6` |
+| 11 | Prepare the pull request | **done** — this push + the PR |
 
-## The next task (Task 5) — exactly what to do
+## What is committed (newest first)
 
-Read `task-5-brief.md` and do red → green from scratch: `stage_3/schedules.py` plus
-`tests/test_stage3_schedules.py`. Required interface: `Schedule` dataclass,
-`validate_cron(expression) -> tuple[int, int, int, int, int]`,
-`cron_matches(expression, moment, timezone)`, `ScheduleStore(path)` with
-`load() -> list[Schedule]` / `save(records)`, and `due(records, now) -> list[Schedule]`.
-Five-field cron with `*`, lists, ranges and steps, validated with `zoneinfo.ZoneInfo`.
-The store is atomic (temp + fsync + `os.replace`), mode `0600`, with a `.bak` of the last
-known-good state; a corrupt primary recovers from the backup, and if both are corrupt it
-raises a typed error — never guess.
+```
+3e9fdd6  fix(stage3): contain unexpected tier-3 page exceptions in the DetailError path  (Task 10)
+0905a88  docs(stage3): document bot setup and operations                                (Task 9)
+f24e604  feat(enrich): add optional session-aware Playwright fallback                   (Task 8)
+38b4d9d  feat(pipeline): isolate generated applications by run                          (Task 7)
+eda3c03  feat(stage3): Telegram bot with live progress, scheduling, and scheduler loop  (Task 6)
+c58658b  feat(stage3): persist validated cron schedules safely                          (Task 5)
+f61ec90  docs(stage3): record Tasks 3-4 completion and the full test baseline
+f2a15aa  feat(stage3): supervise pipeline runs with manifests and lifecycle             (Task 4)
+5588f89  feat(stage3): render progress and selection keyboards                          (Task 3)
+964d079  docs: add Stage 3 resume checkpoint
+d67a58e  feat(stage3): model pipeline progress from logs                                (Task 2)
+bf4cdd5  test(stage3): lock down secure configuration                                   (Task 1)
+```
 
-### Task 4 notes (for the reviewer who picks up later)
+## Verification (Task 10, recorded 2026-09-08)
 
-- The orchestrator deliberately does **not** touch `scripts/run_daily.sh` yet: it launches
-  `bash <repo>/scripts/run_daily.sh` with `RUN_ID`, `JOB_COUNT`, `GEO_FILTER`,
-  `OUTPUT_ROOT`, plus any passthrough `env` (e.g. `RESUME=1`) **in the environment, never
-  argv**, and with `Stage3Config.child_env` (which pops `STAGE3_BOT_TOKEN`). Task 7 is
-  where the shell side learns those variables — do not split the seam between the tasks.
-- `RESUME=1` with no explicit `run_id` resumes the single unfinished run of the day via
-  manifest lookup; ambiguous candidates raise with their ids.
-- The monitor thread owns the lifecycle: log-tail via a drain thread, `ProgressTracker`
-  projection, SIGTERM-then-SIGKILL (to the process group) on cancel or the
-  `STAGE3_MAX_RUNTIME` ceiling, waiting warnings at 120 s then every 120 s, and the
-  seven-newest-day log retention (older date dirs are tarred to `<root>/archive/` first).
-- Test mode uses `poll_interval=0` plus an injected clock; the monitor advances the clock
-  only on idle iterations, and `start()` gives the drain thread a 50 ms head start in that
-  mode. Keep that when editing the monitor loop.
+```
+.venv/bin/python -m pytest tests/test_stage3_config.py tests/test_stage3_progress.py \
+    tests/test_stage3_render.py tests/test_stage3_orchestrator.py \
+    tests/test_stage3_schedules.py tests/test_stage3_bot.py \
+    tests/test_stage3_outputs.py tests/test_linkedin_playwright.py \
+    tests/test_stage3_docs.py -q
+# 157 passed, 8 subtests passed in 1.16s
 
-## Environment notes (cost real time the first sessions)
+.venv/bin/python -m pytest tests/ -q --ignore=tests/test_ranker_calibration.py \
+    --ignore=tests/test_prerank_jobs.py
+# 1153 passed, 13 skipped, 757 subtests passed; 7 failed — all environment-caused, see below
 
-- **There is no `.venv` in this worktree.** The plan's briefs say
-  `.venv/bin/python -m pytest ...` — substitute the system interpreter:
-  `python3` (3.10) and `python3 -m pytest` (9.1.x are present). Every report records this
-  deviation.
-- **Pre-existing test baseline — NOT yours to fix.** Verified to predate this branch's
-  Stage 3 work. Keep reporting these separately and do not "fix" them by editing global
-  settings or Stage 1/2 pipeline code:
-  - `tests/test_security_guards.py::RealRepoTests::test_guards_pass_on_this_repo` — a global
-    `.claude/settings.json` guard (29 findings from other tooling's hooks).
-  - `tests/test_selector_resilience.py::TestAckIsBestEffort::test_ack_swallows_the_too_old_error`
-    — an `IndexError` in Stage 1/2 selector code (`scripts/telegram_select.py`).
-  - `tests/test_ranker_calibration.py::SandboxGateGuards::*` (18 collection errors) and
-    `tests/test_prerank_jobs.py` (1 collection error) — read the untracked
-    `manual_run_2026-08-19/` data directory, which exists in the main checkout but not in
-    this worktree, so those files are absent here.
-  - The `test_lint_skills_passes` / `test_lint_passes_on_real_repo` failures run
-    `lint_skills.py` against skill docs and are unrelated to Stage 3.
-  Excluding those, the suite is green and **all four new Stage 3 test files pass
-  (49 tests)**.
-- `bash -n scripts/run_daily.sh` must stay clean (needed explicitly by Task 7).
+bash -n scripts/run_daily.sh     # clean
+python3 -m py_compile scripts/linkedin_playwright.py scripts/linkedin_session.py \
+    scripts/enrich_linkedin.py stage_3/*.py    # clean
+git diff --check                 # clean
+```
+
+### The 7 full-suite failures are environment-caused, not regressions
+
+Verified by stashing the Stage 3 work and re-running (they fail identically at
+the pre-Stage-3 baseline commit):
+
+- `tests/test_security_guards.py::RealRepoTests::test_guards_pass_on_this_repo` —
+  the documented global baseline (29 findings from other tooling's hooks in a
+  gitignored `.claude/settings.json`).
+- 6 × `test_lint_*` (apply/html-report/notion-sync/outcome/rank/upskill) —
+  `lint_skills.py` reads the gitignored `.claude/settings.json`, which does not
+  exist in this sandbox.
+- Excluded from the run entirely, per the earlier baseline:
+  `tests/test_ranker_calibration.py` (18 collection errors) and
+  `tests/test_prerank_jobs.py` (1 collection error) — they read the untracked
+  `manual_run_2026-08-19/` data directory, which exists in the main checkout
+  but not here.
+
+### Environment deviations (recorded per the earlier reports)
+
+- No `.venv` existed here originally; one was created in-project
+  (`.venv/bin/pip install "pytest>=9.1,<10" "python-telegram-bot==22.8"`) to run
+  the plan's exact verification commands. `.venv/` is gitignored.
+- `kimi-webbridge` is not installed in this sandbox, so the two daemon-start
+  tests that require the real binary now `skipTest` explicitly (they passed on
+  the maintainer's machine where the binary exists).
+
+## Task 8 security review finding (fixed in `3e9fdd6`)
+
+A real Playwright page can raise a raw exception from `read_page` (mid-navigation
+race). `playwright_fetcher` let it escape, and because `enrich` catches
+`DetailError` only, one odd page would have aborted Phase 1c mid-list. The
+catch-all now mirrors `browser_fetcher`: unexpected exceptions become
+`DetailError`, count toward the two-posting streak, and never abort the phase.
+Pinned by `test_an_unexpected_page_exception_becomes_detailerror_not_a_crash`.
+
+Also fixed while landing Task 8: `checkpoint` URLs now classify as a *challenge*
+(the provider checks challenge markers first, and reads the URL as well as the
+text) — LinkedIn's `checkpoint/challengesV2` router was being mislabeled as a
+lapsed login, sending the operator to re-provision a live session.
+
+## What the operator does next (user decisions, not agent actions)
+
+- Provision the **third** @BotFather token and `~/.jobsearch-stage3.env` (see
+  `docs/STAGE_3.md` §1–2) — secrets never enter the repo or this workflow.
+- Optional tier 3: `pip install -r requirements-stage3.txt && playwright install
+  chromium`, then `python3 scripts/linkedin_session.py` from a terminal.
+- The already-public `cv/Intel_Materials_Program_Manager/` pair on `origin/master`
+  (see `docs/STAGE_3_HANDOFF.md` §9A) still needs the user's call: plain deletion
+  leaves it in history; history rewrite rewrites public history.
 
 ## Non-negotiable constraints (bind every task — copy into any review)
 
@@ -124,15 +126,3 @@ raises a typed error — never guess.
 - Schedules: atomic write + fsync + `.bak` + mode 0600; a corrupt primary recovers from
   backup; both corrupt → typed error, scheduling disabled, never guess.
 - Playwright never bypasses a login wall / 2FA / CAPTCHA / checkpoint / consent screen.
-
-## How to resume (short version)
-
-```
-git -C /Users/salman/Projects/ai-job-search/.claude/worktrees/stage-3-completion status
-# read .superpowers/sdd/2026-09-08-stage-3-completion/progress.md  (what's done)
-# read the current task's task-N-brief.md                          (what to build)
-# implement red→green with python3, commit with the brief's message,
-# write task-N-report.md, append a "Task N: complete (commit <sha>; ...)" line to progress.md
-```
-
-Then push after each task: `git push origin worktree-stage-3-completion`.
