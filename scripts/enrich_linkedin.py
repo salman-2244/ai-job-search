@@ -1105,6 +1105,20 @@ def playwright_fetcher(provider, errors, ledger, warn, log, state,
                                    f"postings (last: {exc})")
                 warn(f"fallback guest — {state['reason']}")
             raise DetailError(str(exc))
+        except Exception as exc:                                # noqa: BLE001
+            # An unexpected shape from a real page (a mid-navigation race, a
+            # playwright internal) must not escape as anything other than
+            # DetailError: `enrich` catches DetailError and only DetailError,
+            # so anything else here would abort the whole phase mid-list.
+            # The provider charged the ledger exactly once on entry, so no
+            # extra spend here — the streak handles it like any other
+            # posting-level failure.
+            state["streak"] = state.get("streak", 0) + 1
+            if state["streak"] >= BROWSER_FAILURE_STREAK:
+                state["switched"] = True
+                state["reason"] = f"tier 3 raised {type(exc).__name__}: {exc}"
+                warn(f"fallback guest — {state['reason']}")
+            raise DetailError(f"{type(exc).__name__}: {exc}")
         state["streak"] = 0
         state["playwright_jobs"] = state.get("playwright_jobs", 0) + 1
         return got

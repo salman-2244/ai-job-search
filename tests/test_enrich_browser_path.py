@@ -777,6 +777,29 @@ class TheTier3PlaywrightPathIsOptInAndSaysWhy(unittest.TestCase):
         self.assertIn("budget spent", str(caught.exception))
         self.assertEqual(opened, [], "a spent cap must not reach the provider")
 
+    def test_an_unexpected_page_exception_becomes_detailerror_not_a_crash(self):
+        """A real page can raise anything (mid-navigation race). `enrich`
+        catches DetailError and only DetailError, so anything escaping here
+        would abort the whole phase mid-list — the failure mode
+        browser_fetcher already guards against, mirrored for tier 3."""
+        _, errors, _, _, _ = self.loader(dict(self.CRED_ENV))
+        served = []
+
+        class ExplodingProvider:
+            def fetch(self, job_id, ledger):
+                served.append(job_id)
+                ledger.spend(1)
+                raise RuntimeError("playwright internal: execution context destroyed")
+
+        state = {"streak": 0, "switched": False}
+        fetch = self._fetcher(ExplodingProvider(), enr.RequestLedger(5), state,
+                              guest=lambda job_id: {"description": "guest body"})
+        with self.assertRaises(enr.DetailError):
+            fetch("4000000001")
+        self.assertEqual(served, ["4000000001"])
+        self.assertFalse(state["switched"], "one odd page must not condemn the tier")
+        self.assertEqual(state["streak"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
