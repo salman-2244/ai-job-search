@@ -53,6 +53,10 @@ SECRET_KEYS = frozenset({
 #: ceiling exists to end, and the script's own per-phase watchdogs bound everything
 #: shorter. 0 disables it.
 DEFAULT_MAX_RUNTIME = 10800
+DEFAULT_RUN_STATE_ROOT = Path.home() / ".jobsearch-stage3-runs"
+DEFAULT_SCHEDULE_PATH = Path.home() / ".jobsearch-stage3-schedules.json"
+DEFAULT_SCHEDULE_BACKUP_PATH = Path.home() / ".jobsearch-stage3-schedules.json.bak"
+DEFAULT_PLAYWRIGHT_TIMEOUT = 30.0
 
 
 class ConfigError(RuntimeError):
@@ -152,6 +156,12 @@ class Stage3Config:
     max_runtime: int = DEFAULT_MAX_RUNTIME
     linkedin_email: str = ""
     linkedin_password: str = ""
+    run_state_root: Path = DEFAULT_RUN_STATE_ROOT
+    schedule_path: Path = DEFAULT_SCHEDULE_PATH
+    schedule_backup_path: Path = DEFAULT_SCHEDULE_BACKUP_PATH
+    linkedin_storage_state: Path | None = None
+    playwright_headless: bool = True
+    playwright_timeout: float = DEFAULT_PLAYWRIGHT_TIMEOUT
     source: Path = field(default=DEFAULT_ENV_PATH)
 
     def __repr__(self) -> str:
@@ -284,7 +294,8 @@ def load_config(path: Path | None = None, environ: dict | None = None,
         raise ConfigError(f"STAGE3_CHAT_ID must be numeric, got {chat_raw!r}. A "
                           "@username will not work; @userinfobot gives the id.")
 
-    allowed = parse_user_ids(get("STAGE3_ALLOWED_USER_IDS", chat_raw))
+    allowed_raw = get("STAGE3_ALLOWED_USER_IDS", "")
+    allowed = parse_user_ids(allowed_raw) if allowed_raw.strip(" ,;") else [int(chat_raw)]
 
     repo = Path(get("STAGE3_REPO", str(REPO_ROOT))).expanduser()
     if not (repo / "scripts" / "run_daily.sh").is_file():
@@ -301,6 +312,23 @@ def load_config(path: Path | None = None, environ: dict | None = None,
 
     email = get("LINKEDIN_EMAIL")
     password = get("LINKEDIN_PASSWORD")
+    run_state_root = Path(get("STAGE3_RUN_STATE_ROOT", str(DEFAULT_RUN_STATE_ROOT))).expanduser()
+    schedule_path = Path(get("STAGE3_SCHEDULE_PATH", str(DEFAULT_SCHEDULE_PATH))).expanduser()
+    schedule_backup_path = Path(
+        get("STAGE3_SCHEDULE_BACKUP_PATH", str(DEFAULT_SCHEDULE_BACKUP_PATH))
+    ).expanduser()
+    storage_raw = get("LINKEDIN_PLAYWRIGHT_STORAGE_STATE")
+    linkedin_storage_state = Path(storage_raw).expanduser() if storage_raw else None
+    headless_raw = get("LINKEDIN_PLAYWRIGHT_HEADLESS", "true").lower()
+    if headless_raw not in {"true", "false", "1", "0", "yes", "no"}:
+        raise ConfigError("LINKEDIN_PLAYWRIGHT_HEADLESS must be true or false")
+    playwright_timeout_raw = get("LINKEDIN_PLAYWRIGHT_TIMEOUT", str(DEFAULT_PLAYWRIGHT_TIMEOUT))
+    try:
+        playwright_timeout = float(playwright_timeout_raw)
+    except ValueError as exc:
+        raise ConfigError("LINKEDIN_PLAYWRIGHT_TIMEOUT must be a positive number") from exc
+    if playwright_timeout <= 0 or playwright_timeout > 300:
+        raise ConfigError("LINKEDIN_PLAYWRIGHT_TIMEOUT must be between 0 and 300 seconds")
     if warn is not None and bool(email) != bool(password):
         # Half-configured credentials read as "tier 3 is available" and then fail at the
         # login form, after the two cheaper tiers have already been skipped.
@@ -317,5 +345,11 @@ def load_config(path: Path | None = None, environ: dict | None = None,
         max_runtime=int(runtime_raw),
         linkedin_email=email,
         linkedin_password=password,
+        run_state_root=run_state_root,
+        schedule_path=schedule_path,
+        schedule_backup_path=schedule_backup_path,
+        linkedin_storage_state=linkedin_storage_state,
+        playwright_headless=headless_raw in {"true", "1", "yes"},
+        playwright_timeout=playwright_timeout,
         source=env_path,
     )
