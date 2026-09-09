@@ -15,6 +15,14 @@ REPORT_DIR="$PROJECT_DIR/reports/daily"
 LOCK_DIR="/tmp/jobsearch_daily_pipeline.lock"
 TODAY=$(date +%Y-%m-%d)
 LOG_FILE="${STAGE3_PIPELINE_LOG:-$LOG_DIR/${TODAY}.log}"
+# Stage 3 logs can contain job-posting text and diagnostic details. Create a new
+# run-scoped log under an owner-only umask, and narrow an existing one before any
+# guard or stale-lock path can write to it.
+if [[ -n "${STAGE3_PIPELINE_LOG:-}" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    (umask 077; : >> "$LOG_FILE")
+    chmod 600 "$LOG_FILE"
+fi
 REPORT_FILE="$REPORT_DIR/${TODAY}.md"
 PLAN_FILE="/tmp/jobsearch_plan_${TODAY}.tsv"
 JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"

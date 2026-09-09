@@ -326,6 +326,31 @@ class RunDailyThreading(TempDirCase):
         validation_at = text.index('JOB_COUNT="${JOB_COUNT:-}"')
         self.assertLess(validation_at, text.index('SKIP_ALERTS="${SKIP_ALERTS:-0}"'))
 
+    def test_run_scoped_log_is_created_with_owner_only_permissions(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        setup = text.index('if [[ -n "${STAGE3_PIPELINE_LOG:-}" ]]')
+        first_log = text.index("# === Logging ===")
+        self.assertLess(setup, first_log)
+        self.assertIn('mkdir -p "$(dirname "$LOG_FILE")"', text[setup:first_log])
+        self.assertIn('(umask 077; : >> "$LOG_FILE")', text[setup:first_log])
+        self.assertIn('chmod 600 "$LOG_FILE"', text[setup:first_log])
+
+        log_path = self.tmp / "new" / "run" / "pipeline.log"
+        prefix = text[: text.index('REPORT_FILE="$REPORT_DIR/${TODAY}.md"')]
+        env = {
+            "HOME": str(Path.home()),
+            "PATH": "/usr/bin:/bin",
+            "STAGE3_PIPELINE_LOG": str(log_path),
+        }
+        for initial_mode in (None, 0o644):
+            if initial_mode is not None:
+                log_path.chmod(initial_mode)
+            proc = subprocess.run(
+                ["bash", "-c", prefix], capture_output=True, text=True, env=env
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
+
     def test_job_count_cut_and_handoff_threading_present(self):
         text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
         # The Phase 1b-final cut (guarded, array-safe expansion — the plain
