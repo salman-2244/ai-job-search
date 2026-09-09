@@ -17,6 +17,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 GUIDE = REPO / "docs" / "STAGE_3.md"
+HISTORICAL_CHECKPOINT = REPO / "docs" / "STAGE_3_RESUME.md"
 
 
 def guide_text() -> str:
@@ -60,6 +61,35 @@ class TheGuideCarriesTheOperationalTruths(unittest.TestCase):
     def test_schedule_recovery_is_described_not_guessed(self):
         text = guide_text().lower()
         self.assertIn(".bak", text)
+
+    def test_schedule_save_failure_is_fail_closed_and_retryable(self):
+        text = guide_text().lower()
+        self.assertIn("no job launches", text)
+        self.assertIn("remain unchanged", text)
+        self.assertIn("still due on the next tick or restart", text)
+
+    def test_restart_identity_and_run_scoped_log_are_documented(self):
+        text = guide_text()
+        self.assertIn("YYYYMMDDThhmmssZ-<6 hex>", text)
+        self.assertIn("pipeline.log", text)
+        self.assertIn("process-start marker", text)
+        self.assertIn("terminal `interrupted`", text)
+        self.assertIn("more than one process identity", text)
+        self.assertIn("does not reset that budget", text)
+
+    def test_storage_state_is_the_only_auth_mechanism_and_exactly_0600(self):
+        text = guide_text().lower()
+        self.assertIn("only authenticated\n  playwright input", text)
+        self.assertIn("exact mode `0600`", text)
+        self.assertIn("reject any broader unix permissions", text)
+        self.assertNotIn("linkedin_email=", text)
+        self.assertNotIn("linkedin_password=", text)
+
+    def test_resume_file_is_explicitly_historical_not_a_live_checkpoint(self):
+        text = HISTORICAL_CHECKPOINT.read_text(encoding="utf-8").lower()
+        self.assertIn("historical build checkpoint", text)
+        self.assertIn("not the current", text)
+        self.assertNotIn("resume checkpoint (final", text)
 
 
 if __name__ == "__main__":

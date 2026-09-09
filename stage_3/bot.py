@@ -22,11 +22,13 @@ import asyncio
 import dataclasses
 import html
 import json
+import logging
 import re
 import secrets
 import subprocess
 import sys
 import time
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,7 +43,14 @@ from telegram.ext import (
 )
 
 from .config import Stage3Config, load_config
+from .diagnostics import (
+    callable_reference,
+    configure_diagnostics,
+    prepare_telegram_text,
+    safe_preview,
+)
 from .orchestrator import Orchestrator, RunRefusedError, RunRequest
+from .progress import RunState
 from .render import count_keyboard, geo_keyboard, render_run
 from .schedules import (
     MAX_JOB_COUNT,
@@ -58,6 +67,8 @@ from .schedules import (
 #: dedicated token bucket.
 EDITOR_POLL_SECONDS = 3.0
 SCHEDULER_INTERVAL_SECONDS = 60.0
+
+LOGGER = logging.getLogger("stage_3.bot")
 
 _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
@@ -122,6 +133,7 @@ async def start(update, context) -> None:
         "👋 <b>Job search control</b>\n\n"
         "/run [geo] [count] — start a run now (e.g. <code>/run Germany 10</code>)\n"
         "/status — live progress or the last run's outcome\n"
+        "/health — bot uptime, active run, and schedule count\n"
         "/cancel — stop the active run\n\n"
         "<b>Scheduling</b>\n"
         "/schedule &lt;YYYY-MM-DDTHH:MM&gt; [geo] [count] [tz=Zone] — one-shot\n"
@@ -221,13 +233,26 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
     last_text: str | None = None
 
     async def _edit(text: str) -> None:
+        LOGGER.info(
+            "telegram api call method=edit_message_text chat_id=%s message_id=%s preview=%s",
+            chat_id, message_id, safe_preview(text),
+        )
         try:
-            await bot.edit_message_text(
+            result = await bot.edit_message_text(
                 text, chat_id=chat_id, message_id=message_id,
                 parse_mode=ParseMode.HTML,
             )
-        except Exception:
-            pass  # "message is not modified" races and network blips; retry next tick
+            LOGGER.info(
+                "telegram api success method=edit_message_text chat_id=%s message_id=%s result=%s",
+                chat_id, message_id, type(result).__name__,
+            )
+        except Exception as exc:
+            LOGGER.warning(
+                "telegram api failure method=edit_message_text chat_id=%s message_id=%s "
+                "exception_type=%s preview=%s",
+                chat_id, message_id, type(exc).__name__, safe_preview(text),
+                exc_info=True,
+            )
 
     try:
         while True:
@@ -254,6 +279,31 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
     finally:
         if context.bot_data.get("active_handle") is handle:
             context.bot_data.pop("active_handle", None)
+
+
+async def health(update, context) -> None:
+    """Confirm command reception and report only non-sensitive process health."""
+    if not await _authorised(update, context):
+        return
+    started = context.bot_data.get("started_monotonic", time.monotonic())
+    uptime = max(0, int(time.monotonic() - started))
+    handle = context.bot_data.get("active_handle")
+    if handle is not None and handle.is_running:
+        active = f"active ({html.escape(handle.run_id)})"
+    else:
+        active = "idle"
+    try:
+        schedule_count = len(context.bot_data["schedules"].load())
+        schedules = str(schedule_count)
+    except ScheduleStoreError:
+        schedules = "unavailable"
+    await update.effective_message.reply_text(
+        "✅ <b>Bot is running.</b>\n"
+        f"Uptime: {uptime}s\n"
+        f"Run: {active}\n"
+        f"Schedules: {schedules}",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def status(update, context) -> None:
@@ -572,6 +622,7 @@ async def scheduler_tick(context, now: datetime | None = None) -> None:
     except ScheduleStoreError as exc:
         await bot.send_message(config.chat_id,
                                f"⚠️ Could not persist schedule state: {html.escape(str(exc))}")
+        return
     for record in ready:
         orchestrator: Orchestrator = context.bot_data["orchestrator"]
         try:
@@ -618,6 +669,45 @@ async def _scheduler_loop(application: Application) -> None:
         await asyncio.sleep(SCHEDULER_INTERVAL_SECONDS)
 
 
+async def _start_background_tasks(application: Application) -> None:
+    """Start lifecycle-owned tasks once the polling loop is ready."""
+    tasks = [asyncio.create_task(_scheduler_loop(application))]
+    handle = application.bot_data.get("restored_handle")
+    if handle is not None:
+        tasks.append(asyncio.create_task(
+            _watch_restored_handle(handle, application.bot_data)
+        ))
+    application.bot_data["background_tasks"] = tasks
+
+
+async def _stop_background_tasks(application: Application) -> None:
+    """Cancel and await lifecycle-owned tasks during PTB shutdown."""
+    tasks = application.bot_data.pop("background_tasks", [])
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _watch_restored_handle(handle, bot_data: dict) -> None:
+    """Remove a restored handle once its monitor reaches a terminal state."""
+    await asyncio.to_thread(handle.wait)
+    if bot_data.get("active_handle") is handle:
+        bot_data.pop("active_handle", None)
+
+
+def restore_active_run(bot_data: dict):
+    """Restore a validated live handle before polling accepts commands."""
+    orchestrator: Orchestrator = bot_data["orchestrator"]
+    config: Stage3Config = bot_data["config"]
+    handle = orchestrator.restore_active(config.run_state_root)
+    if handle is not None:
+        bot_data["active_handle"] = handle
+    else:
+        bot_data.pop("active_handle", None)
+    return handle
+
+
 # -- application assembly -----------------------------------------------------
 
 
@@ -639,8 +729,11 @@ def build_application(config: Stage3Config, orchestrator, schedules: ScheduleSto
         "orchestrator": orchestrator,
         "schedules": schedules,
         "geos": geos,
+        "started_monotonic": time.monotonic(),
     })
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("health", health))
+    application.add_handler(CommandHandler("ping", health))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("run", run))
     application.add_handler(CommandHandler("cancel", cancel))
@@ -656,23 +749,103 @@ def build_application(config: Stage3Config, orchestrator, schedules: ScheduleSto
     return application
 
 
+def _active_pipeline_log(application: Application) -> Path | None:
+    handle = application.bot_data.get("active_handle")
+    manifest = getattr(handle, "manifest_path", None)
+    return Path(manifest).parent / "pipeline.log" if manifest is not None else None
+
+
+def _delivery_completed(future: Future, *, chat_id: int, preview: str) -> None:
+    """Observe a cross-thread Telegram future so delivery failures are visible."""
+    try:
+        message = future.result()
+    except Exception as exc:
+        LOGGER.error(
+            "telegram api failure method=send_message chat_id=%s exception_type=%s preview=%s",
+            chat_id, type(exc).__name__, preview, exc_info=True,
+        )
+        return
+    LOGGER.info(
+        "telegram api success method=send_message chat_id=%s message_id=%s",
+        chat_id, getattr(message, "message_id", "unknown"),
+    )
+
+
+def _wire_notifications(application: Application, orchestrator: Orchestrator,
+                        config: Stage3Config, loop) -> object:
+    """Install the production monitor-thread to Telegram-loop callback."""
+    def notify(text: str) -> None:
+        prepared = prepare_telegram_text(text)
+        preview = safe_preview(prepared)
+        LOGGER.info(
+            "notification callback invoked callback=%s chat_id=%s preview=%s",
+            callable_reference(notify), config.chat_id, preview,
+        )
+        LOGGER.info(
+            "telegram api call method=send_message chat_id=%s preview=%s",
+            config.chat_id, preview,
+        )
+        future = asyncio.run_coroutine_threadsafe(
+            application.bot.send_message(config.chat_id, prepared), loop,
+        )
+        future.add_done_callback(
+            lambda done: _delivery_completed(
+                done, chat_id=config.chat_id, preview=preview,
+            )
+        )
+
+    LOGGER.info(
+        "installing notification callback callback=%s",
+        callable_reference(notify),
+    )
+    orchestrator.set_notify(notify)
+    return notify
+
+
 def main() -> None:
     """Entry point: `python -m stage_3.bot`."""
     config = load_config()  # validates token isolation before anything polls
     schedules = ScheduleStore(config.schedule_path)
     orchestrator = Orchestrator(config)
+    application_ref = {}
+    configure_diagnostics(
+        config.run_state_root,
+        lambda: _active_pipeline_log(application_ref["application"])
+        if "application" in application_ref else None,
+    )
 
     async def _post_init(application: Application) -> None:
+        LOGGER.info("PTB post_init started")
+        try:
+            identity = await application.bot.get_me()
+        except Exception as exc:
+            LOGGER.critical(
+                "telegram startup validation failed method=get_me exception_type=%s",
+                type(exc).__name__, exc_info=True,
+            )
+            raise RuntimeError(
+                "Telegram startup validation failed; check STAGE3_BOT_TOKEN and network access"
+            ) from exc
+        LOGGER.info(
+            "telegram startup validation succeeded method=get_me bot_id=%s username=%s",
+            getattr(identity, "id", "unknown"),
+            safe_preview(getattr(identity, "username", "unknown")),
+        )
         loop = asyncio.get_running_loop()
-
-        def notify(text: str) -> None:
-            """Best-effort operator push from the orchestrator's monitor thread."""
-            asyncio.run_coroutine_threadsafe(
-                application.bot.send_message(config.chat_id, text), loop)
-
-        orchestrator.set_notify(notify)
-        application.create_task(_scheduler_loop(application))
+        _wire_notifications(application, orchestrator, config, loop)
+        application.bot_data["restored_handle"] = restore_active_run(
+            application.bot_data
+        )
+        await _start_background_tasks(application)
+        LOGGER.info("PTB post_init completed")
 
     application = build_application(config, orchestrator, schedules,
                                     post_init=_post_init)
-    application.run_polling(allowed_updates=Update.all_types())
+    application.post_stop = _stop_background_tasks
+    application_ref["application"] = application
+    LOGGER.info("starting Telegram polling")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

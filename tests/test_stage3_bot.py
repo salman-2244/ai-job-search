@@ -33,13 +33,17 @@ from stage_3.bot import (
     geo_callback,
     count_callback,
     custom_count_text,
+    health,
     list_schedules,
+    _start_background_tasks,
+    _stop_background_tasks,
     run,
     schedule,
     schedule_recurring,
     scheduler_tick,
     start,
     status,
+    restore_active_run,
 )
 from stage_3.config import Stage3Config
 from stage_3.orchestrator import RunRefusedError, RunRequest, RunResult
@@ -161,10 +165,12 @@ class FakeHandle:
 
 
 class FakeOrchestrator:
-    def __init__(self, refuse=False):
+    def __init__(self, refuse=False, restored=None):
         self.requests = []
         self.refuse = refuse
         self.handles = []
+        self.restored = restored
+        self.restore_roots = []
 
     def start(self, request, **kwargs):
         self.requests.append(request)
@@ -176,6 +182,10 @@ class FakeOrchestrator:
         handle = FakeHandle(running=False)
         self.handles.append(handle)
         return handle
+
+    def restore_active(self, state_root=None):
+        self.restore_roots.append(state_root)
+        return self.restored
 
 
 class FakeContext:
@@ -235,6 +245,27 @@ def test_run_with_geo_and_count_starts_orchestrator(tmp_path):
     assert orchestrator.requests[0] == RunRequest(geo="Germany", job_count=10)
     # One initial progress message went out.
     assert update.effective_chat.sent
+
+
+def test_run_renders_when_handle_state_is_initially_none(tmp_path):
+    class NoneStateOrchestrator(FakeOrchestrator):
+        def start(self, request, **kwargs):
+            handle = super().start(request, **kwargs)
+            handle.state = None
+            return handle
+
+    update = FakeUpdate(message=FakeMessage("/run Germany 10"))
+    update.effective_chat = FakeChat(FakeBot())
+    context = FakeContext(
+        tmp_path,
+        orchestrator=NoneStateOrchestrator(),
+        args=["Germany", "10"],
+    )
+
+    run_coro(run(update, context))
+
+    assert update.effective_chat.sent
+    assert "Run" in update.effective_chat.sent[0][0]
 
 
 def test_run_unknown_geo_never_reaches_the_orchestrator(tmp_path):
@@ -342,6 +373,36 @@ def test_cancel_without_active_run_says_so(tmp_path):
     assert "no active run" in update.message.replies[0][0].lower()
 
 
+def test_startup_restores_active_handle_for_status_and_cancel(tmp_path):
+    handle = FakeHandle(running=True)
+    handle.state.message = "Phase 2: Ranking jobs via Claude Code..."
+    handle.state.current_phase = "2"
+    orchestrator = FakeOrchestrator(restored=handle)
+    context = FakeContext(tmp_path, orchestrator=orchestrator)
+
+    restored = restore_active_run(context.bot_data)
+
+    assert restored is handle
+    assert context.bot_data["active_handle"] is handle
+    assert orchestrator.restore_roots == [
+        context.bot_data["config"].run_state_root
+    ]
+    status_update = FakeUpdate(message=FakeMessage("/status"))
+    run_coro(status(status_update, context))
+    assert "Ranking" in status_update.message.replies[0][0]
+    cancel_update = FakeUpdate(message=FakeMessage("/cancel"))
+    run_coro(cancel(cancel_update, context))
+    assert handle.cancelled
+
+
+def test_startup_leaves_no_active_handle_for_stale_manifest(tmp_path):
+    orchestrator = FakeOrchestrator(restored=None)
+    context = FakeContext(tmp_path, orchestrator=orchestrator)
+
+    assert restore_active_run(context.bot_data) is None
+    assert "active_handle" not in context.bot_data
+
+
 # -- scheduling commands ----------------------------------------------------
 
 
@@ -440,6 +501,72 @@ def test_scheduler_tick_skips_untimed_records(tmp_path):
     assert context.bot_data["orchestrator"].requests == []
 
 
+def test_scheduler_tick_aborts_launch_when_mark_started_save_fails(tmp_path):
+    due_record = Schedule(
+        id="s-save-fail", kind="recurring", expression="0 8 * * 1-5",
+        geo="Germany", job_count=10, timezone="UTC",
+    )
+
+    class SaveFailingStore:
+        def load(self):
+            return [due_record]
+
+        def save(self, records):
+            from stage_3.schedules import ScheduleStoreError
+
+            raise ScheduleStoreError("synthetic persistence failure")
+
+    context = FakeContext(tmp_path, store=SaveFailingStore())
+    now = datetime(2026, 9, 8, 8, 0, tzinfo=timezone.utc)
+
+    run_coro(scheduler_tick(context, now=now))
+
+    assert context.bot_data["orchestrator"].requests == []
+    assert any(
+        "persist schedule state" in text.lower()
+        for _, text, _ in context.bot.sent
+    )
+
+
+def test_scheduler_save_failure_remains_due_after_restart(tmp_path):
+    from stage_3.schedules import ScheduleStoreError, due
+
+    persistent = ScheduleStore(tmp_path / "restart-schedules.json")
+    persistent.save([
+        Schedule(
+            id="s-restart", kind="recurring", expression="0 8 * * 1-5",
+            geo="Germany", job_count=10, timezone="UTC",
+        )
+    ])
+
+    class SaveFailingStore:
+        def load(self):
+            return persistent.load()
+
+        def save(self, records):
+            raise ScheduleStoreError("synthetic persistence failure")
+
+    now = datetime(2026, 9, 8, 8, 0, tzinfo=timezone.utc)
+    failed_context = FakeContext(tmp_path, store=SaveFailingStore())
+
+    run_coro(scheduler_tick(failed_context, now=now))
+
+    assert failed_context.bot_data["orchestrator"].requests == []
+    unchanged = persistent.load()[0]
+    assert unchanged.last_started_at is None
+    assert due([unchanged], now) == [unchanged]
+
+    # A fresh context/store simulates a process restart reading durable state.
+    restarted_store = ScheduleStore(persistent.path)
+    restarted_context = FakeContext(tmp_path, store=restarted_store)
+    run_coro(scheduler_tick(restarted_context, now=now))
+
+    assert restarted_context.bot_data["orchestrator"].requests == [
+        RunRequest(geo="Germany", job_count=10)
+    ]
+    assert restarted_store.load()[0].last_started_at == now.isoformat()
+
+
 def test_scheduler_tick_surfaces_refusal_to_the_chat(tmp_path):
     context = FakeContext(tmp_path, orchestrator=FakeOrchestrator(refuse=True))
     store = context.bot_data["schedules"]
@@ -463,6 +590,67 @@ def test_scheduler_tick_reports_corrupt_store_and_disables(tmp_path):
     assert any("schedule" in text.lower() for _, text, _ in context.bot.sent)
 
 
+def test_health_reports_uptime_idle_state_and_stats(tmp_path):
+    context = FakeContext(tmp_path)
+    message = FakeMessage()
+    update = FakeUpdate(message=message)
+
+    run_coro(health(update, context))
+
+    text = message.replies[0][0]
+    assert "Bot is running" in text
+    assert "Uptime:" in text
+    assert "Run: idle" in text
+    assert "Schedules: 0" in text
+
+
+def test_health_reports_active_run(tmp_path):
+    context = FakeContext(tmp_path)
+    context.bot_data["active_handle"] = FakeHandle(run_id="run-active", running=True)
+    message = FakeMessage()
+
+    run_coro(health(FakeUpdate(message=message), context))
+
+    assert "run-active" in message.replies[0][0]
+
+
+def test_background_tasks_start_only_after_application_is_running():
+    class FakeApplication:
+        def __init__(self):
+            self.bot_data = {}
+
+    application = FakeApplication()
+
+    run_coro(_start_background_tasks(application))
+
+    assert len(application.bot_data["background_tasks"]) == 1
+    application.bot_data["background_tasks"][0].cancel()
+
+
+def test_background_tasks_are_cancelled_during_shutdown():
+    class FakeTask:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+        def __await__(self):
+            async def done():
+                return None
+            return done().__await__()
+
+    task = FakeTask()
+    application = type("Application", (), {
+        "bot_data": {"background_tasks": [task]},
+    })()
+
+    run_coro(_stop_background_tasks(application))
+
+    assert task.cancelled is True
+    assert "background_tasks" not in application.bot_data
+
+
 # -- application wiring ------------------------------------------------------
 
 
@@ -480,7 +668,7 @@ def test_build_application_registers_every_command():
             if commands:
                 registered.update(commands)
     assert registered == {
-        "start", "status", "run", "cancel", "schedule",
+        "start", "health", "ping", "status", "run", "cancel", "schedule",
         "schedule_recurring", "list_schedules", "cancel_schedule",
     }
     assert app.bot_data["geos"] == GEOS

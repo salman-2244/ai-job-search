@@ -19,7 +19,9 @@ is asserted rather than assumed.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,6 +33,11 @@ _spec = importlib.util.spec_from_file_location(
 lp = importlib.util.module_from_spec(_spec)
 sys.modules["linkedin_playwright"] = lp
 _spec.loader.exec_module(lp)
+
+_STATE_DIRECTORY = tempfile.TemporaryDirectory(prefix="linkedin-test-state-")
+_TEST_STORAGE_STATE = Path(_STATE_DIRECTORY.name) / "state.json"
+_TEST_STORAGE_STATE.write_text("{}", encoding="utf-8")
+_TEST_STORAGE_STATE.chmod(0o600)
 
 
 class FakeLedger:
@@ -94,6 +101,7 @@ def make_provider(
     """Provider + shared clock; the clock advances on every provider sleep."""
     clock = clock or FakeClock()
     provider = lp.PlaywrightDetailProvider(
+        storage_state=_TEST_STORAGE_STATE,
         browser_factory=lambda state, headless: browser,
         clock=clock,
         sleep=clock.advance,  # each poll advances the fake clock
@@ -135,25 +143,35 @@ class ProviderSuccessTests(unittest.TestCase):
         self.assertEqual(browser.navigated_to, [])
         self.assertFalse(browser.closed)  # never opened
 
-    def test_storage_state_is_passed_to_the_factory_when_present(self):
-        seen = {}
-
-        def factory(state, headless):
-            seen["state"] = state
-            seen["headless"] = headless
-            return FakeBrowser(description_text="d")
-
+    def test_missing_configured_storage_state_is_rejected_before_factory(self):
+        opened = []
         provider, _ = make_provider(FakeBrowser(description_text="d"))
-        # A missing storage-state file falls through to the env-credential
-        # path; with neither present the production factory refuses. The
-        # injected factory here owns its own auth semantics and proceeds.
         provider.storage_state = Path("/nonexistent/state.json")
-        provider._browser_factory = factory
-        got = provider.fetch("123", FakeLedger(5))
-        self.assertIsNone(seen["state"])
-        self.assertIn("description", got)
+        provider._browser_factory = lambda state, headless: opened.append(state)
 
-    def test_storage_state_file_wins_over_credentials(self):
+        with self.assertRaises(lp.PlaywrightStorageStateError):
+            provider.fetch("123", FakeLedger(5))
+
+        self.assertEqual(opened, [])
+
+    def test_storage_state_must_have_exact_0600_mode(self):
+        import os
+        import tempfile
+
+        opened = []
+        with tempfile.NamedTemporaryFile(suffix=".json") as handle:
+            os.chmod(handle.name, 0o640)
+            provider, _ = make_provider(FakeBrowser(description_text="d"))
+            provider.storage_state = Path(handle.name)
+            provider._browser_factory = lambda state, headless: opened.append(state)
+
+            with self.assertRaises(lp.PlaywrightStorageStateError) as caught:
+                provider.fetch("123", FakeLedger(5))
+
+        self.assertIn("0600", str(caught.exception))
+        self.assertEqual(opened, [])
+
+    def test_exact_0600_storage_state_is_passed_to_the_factory(self):
         import os
         import tempfile
 
@@ -164,10 +182,9 @@ class ProviderSuccessTests(unittest.TestCase):
             return FakeBrowser(description_text="d")
 
         with tempfile.NamedTemporaryFile(suffix=".json") as handle:
-            os.environ.pop("LINKEDIN_EMAIL", None)
-            os.environ.pop("LINKEDIN_PASSWORD", None)
+            os.chmod(handle.name, 0o600)
             provider, _ = make_provider(FakeBrowser(description_text="d"))
-            provider.storage_state = Path(handle.name)  # a file that exists
+            provider.storage_state = Path(handle.name)
             provider._browser_factory = factory
             provider.fetch("123", FakeLedger(5))
         self.assertEqual(seen["state"], handle.name)
@@ -252,36 +269,24 @@ class BrowserStartFailureTests(unittest.TestCase):
         with self.assertRaises(lp.PlaywrightNotAvailableError):
             provider.fetch("123", FakeLedger(5))
 
-    def test_env_credentials_alone_are_enough_to_open(self):
-        seen = {}
-
-        def factory(state, headless):
-            seen["opened"] = True
-            return FakeBrowser(description_text="d")
-
+    def test_env_credentials_do_not_open_without_storage_state(self):
         import os
 
         os.environ["LINKEDIN_EMAIL"] = "synthetic@example.com"
         os.environ["LINKEDIN_PASSWORD"] = "synthetic-not-a-secret"
         try:
-            provider, _ = make_provider(FakeBrowser(description_text="d"))
-            provider._browser_factory = factory
-            provider.fetch("123", FakeLedger(5))
+            with self.assertRaises(lp.PlaywrightLoginWallError) as caught:
+                lp._real_browser_factory(None, headless=True)
         finally:
             os.environ.pop("LINKEDIN_EMAIL", None)
             os.environ.pop("LINKEDIN_PASSWORD", None)
-        self.assertTrue(seen.get("opened"))
+        self.assertIn("linkedin_session.py", str(caught.exception))
+        self.assertNotIn("LINKEDIN_EMAIL", str(caught.exception))
 
-    def test_the_production_factory_refuses_to_start_without_a_session(self):
-        # _real_browser_factory's own gate, exercised directly: a real browser
-        # with no storage state and no credentials can only land on a login
-        # wall, so it is refused before anything launches.
-        import os
-
-        os.environ.pop("LINKEDIN_EMAIL", None)
-        os.environ.pop("LINKEDIN_PASSWORD", None)
-        with self.assertRaises(lp.PlaywrightLoginWallError):
+    def test_the_production_factory_refuses_to_start_without_storage_state(self):
+        with self.assertRaises(lp.PlaywrightLoginWallError) as caught:
             lp._real_browser_factory(None, headless=True)
+        self.assertIn("storage state", str(caught.exception).lower())
 
 
 class ErrorHygieneTests(unittest.TestCase):

@@ -21,13 +21,13 @@ constraints that make tier 3 hard are policy, not engineering:
 `playwright` is imported lazily inside the provider's first use, never at module
 scope: this file must import cleanly (and its tests must run) on a machine with
 no browser installed at all — the same reason `telegram_select.py` defers its
-`telegram` import. Credentials are read from `os.environ` only, never argv,
-never logged, and never returned in an error message.
+`telegram` import. The only supported authenticated mechanism is a storage-state
+file created manually by `scripts/linkedin_session.py`; credentials are never
+typed into LinkedIn by this provider.
 """
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -72,6 +72,10 @@ class PlaywrightNotAvailableError(PlaywrightProviderError):
 
 class PlaywrightBudgetExhaustedError(PlaywrightProviderError):
     """The shared RequestLedger has nothing left. Not retryable this run."""
+
+
+class PlaywrightStorageStateError(PlaywrightProviderError):
+    """The configured storage state is missing or not owner-only mode 0600."""
 
 
 class PlaywrightLoginWallError(PlaywrightProviderError):
@@ -135,12 +139,9 @@ def _looks_like_consent(text: str) -> bool:
 class PlaywrightDetailProvider:
     """Fetch one job's full description through an authenticated page.
 
-    Authentication order (deliberate): a configured storage state wins over
-    email/password, because a storage state is a session a human already
-    established in a terminal and re-using it never types credentials into a
-    page. Email/password from the environment is the fallback, and it is used
-    only by submitting the login form LinkedIn itself serves — never by
-    bypassing a wall in front of it.
+    The only supported authentication input is a Playwright storage-state file
+    that a human created with `scripts/linkedin_session.py`. Its exact mode must
+    be 0600 before this provider passes it to a browser.
 
     `browser_factory` is the test seam: given `(storage_state, headless)` it
     returns an object with the `_FakeBrowser` surface. Production passes
@@ -151,8 +152,6 @@ class PlaywrightDetailProvider:
     def __init__(
         self,
         storage_state: Optional[Path] = None,
-        email_env: str = "LINKEDIN_EMAIL",
-        password_env: str = "LINKEDIN_PASSWORD",
         headless: bool = True,
         timeout: float = 30.0,
         browser_factory=None,
@@ -160,8 +159,6 @@ class PlaywrightDetailProvider:
         sleep=time.sleep,
     ):
         self.storage_state = Path(storage_state) if storage_state else None
-        self.email_env = email_env
-        self.password_env = password_env
         self.headless = headless
         self.timeout = max(1.0, float(timeout))
         self._browser_factory = browser_factory or _real_browser_factory
@@ -200,18 +197,30 @@ class PlaywrightDetailProvider:
     # -- lifecycle ------------------------------------------------------------
 
     def _open(self):
-        """A browser context via the factory; auth shape decided by the factory.
-
-        The storage-state/credentials check lives in `_real_browser_factory`,
-        not here: with a real browser, opening without a session can only land
-        on a login wall, so it is refused there. An injected factory (tests,
-        exotic embedding) owns its own auth semantics.
-        """
-        state = None
-        if self.storage_state is not None and self.storage_state.is_file():
-            state = str(self.storage_state)
+        """Open only with a manually generated, owner-only storage state."""
+        if self.storage_state is None:
+            raise PlaywrightStorageStateError(
+                "tier 3 requires a manually generated Playwright storage state; "
+                "run scripts/linkedin_session.py in a terminal."
+            )
         try:
-            return self._browser_factory(state, self.headless)
+            mode = self.storage_state.stat().st_mode & 0o777
+        except OSError as exc:
+            raise PlaywrightStorageStateError(
+                "the configured Playwright storage state is missing or unreadable; "
+                "run scripts/linkedin_session.py in a terminal."
+            ) from exc
+        if not self.storage_state.is_file():
+            raise PlaywrightStorageStateError(
+                "the configured Playwright storage state is not a regular file."
+            )
+        if mode != 0o600:
+            raise PlaywrightStorageStateError(
+                f"Playwright storage state must have exact mode 0600, got {mode:04o}; "
+                f"fix with: chmod 600 {self.storage_state}"
+            )
+        try:
+            return self._browser_factory(str(self.storage_state), self.headless)
         except PlaywrightProviderError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -279,21 +288,15 @@ class PlaywrightDetailProvider:
 def _real_browser_factory(storage_state: Optional[str], headless: bool):
     """The production factory. Imports playwright lazily; returns a `_RealBrowser`.
 
-    Also the place the auth-presence rule is enforced: a real browser with no
-    storage state and no credentials in the environment can only land on a
-    login wall, so it is refused here, with the fix named, before anything is
-    launched. The email/password path still comes from `os.environ` — never
-    argv, never a file inside the repo.
+    The authentication-presence rule is enforced here as a second boundary:
+    production never launches a browser without manually generated storage
+    state. Automated email/password login is intentionally unsupported.
     """
-    has_storage = storage_state is not None
-    has_credentials = bool(
-        os.environ.get("LINKEDIN_EMAIL") and os.environ.get("LINKEDIN_PASSWORD")
-    )
-    if not has_storage and not has_credentials:
+    if storage_state is None:
         raise PlaywrightLoginWallError(
-            "tier 3 has no session: no storage state file and no "
-            "LINKEDIN_EMAIL/LINKEDIN_PASSWORD in the environment. Provision "
-            "with scripts/linkedin_session.py (terminal-only)."
+            "tier 3 has no Playwright storage state. Provision it manually with "
+            "scripts/linkedin_session.py in a terminal; automated credential login "
+            "is not supported."
         )
     try:
         from playwright.sync_api import sync_playwright

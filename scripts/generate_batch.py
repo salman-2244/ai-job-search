@@ -278,6 +278,7 @@ def release_lock(path: Optional[Path]) -> None:
 # signature the sandbox runner and the dashboard already read.
 _RUN_ID: Optional[str] = None
 _ts_is_complete = None  # bound to telegram_select.is_complete by run() when run-scoped
+_ts_legacy_is_complete = None  # bound to the read-only legacy gate by run()
 
 
 def artifacts(slug: str) -> list[Path]:
@@ -295,12 +296,14 @@ def is_complete(slug: str) -> bool:
     All four are required: a .tex with no .pdf is a draft that never compiled,
     and sending a recruiter a missing PDF is worse than regenerating one.
 
-    With `--run-id` this delegates to the shared layout in telegram_select.py so
-    a batch and the Telegram path agree on where run-scoped documents live; the
-    legacy check stays local so a batch keeps working without that module loaded.
+    With `--run-id` this delegates to the shared run-scoped layout, while also
+    honoring the shared read-only legacy gate. A complete legacy application is
+    never regenerated or migrated; a partial one does not block generation.
+    The legacy check stays local when no run id is active so a batch keeps
+    working without telegram_select.py loaded.
     """
     if _RUN_ID is not None:
-        return _ts_is_complete(slug)
+        return _ts_legacy_is_complete(slug) or _ts_is_complete(slug)
     try:
         return all(p.exists() and p.stat().st_size > 0 for p in artifacts(slug))
     except OSError:
@@ -360,12 +363,12 @@ def install_signals(loop: asyncio.AbstractEventLoop) -> None:
 
 
 async def run(args: argparse.Namespace) -> int:
-    global _ts_is_complete
+    global _ts_is_complete, _ts_legacy_is_complete
     ts = load_ts()
     if _RUN_ID is not None:
-        # Bind day/run_id/output_root so is_complete(slug) resolves through the
-        # shared RUN-SCOPED layout — a bare call would silently check the legacy
-        # one and --all-missing would regenerate everything every time.
+        # A complete legacy application remains authoritative and read-only; if
+        # none exists, resume checks the current run's own output tree.
+        _ts_legacy_is_complete = partial(ts.legacy_is_complete, repo=REPO)
         _ts_is_complete = partial(
             ts.is_complete, day=args.date, run_id=_RUN_ID, output_root=args.output_root
         )

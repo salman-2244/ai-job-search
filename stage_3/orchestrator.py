@@ -25,6 +25,7 @@ Security posture:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -41,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import DEFAULT_RUN_STATE_ROOT, Stage3Config
+from .diagnostics import callable_reference, safe_preview
 from .progress import ProgressTracker, RunState
 
 #: `run_daily.sh:15` creates this with an atomic `mkdir`; its existence is the
@@ -54,6 +56,10 @@ MAX_JOB_COUNT = 50
 _DATE_DIR_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _ATTEMPT_RE = re.compile(r"attempt\s+(\d+)", re.IGNORECASE)
+_PROCESS_STAT_RE = re.compile(r"^(\d+) \((.*)\) ([A-Z]) (.*)$")
+_TERMINAL_STATUSES = frozenset({
+    "complete", "failed", "cancelled", "timeout", "interrupted",
+})
 
 _EOF = object()  # sentinel: the child's stdout closed
 
@@ -170,7 +176,7 @@ def retain_run_logs(root: Path, keep_days: int = 7, today: str | None = None) ->
 def select_resumable(root: Path, date: str, explicit: str | None = None) -> str | None:
     """Pick the run a `RESUME=1` request should continue, deterministically.
 
-    An explicit id must exist and must not already be complete. Without one, exactly
+    An explicit id must exist and must not already be terminal. Without one, exactly
     one unfinished run for the date may be resumed; several candidates is an error
     that names them, and none at all returns None (start fresh — the legacy path).
     A corrupt manifest is skipped: resume is best-effort and a fresh run is safe.
@@ -185,8 +191,11 @@ def select_resumable(root: Path, date: str, explicit: str | None = None) -> str 
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RunRefusedError(f"manifest for run {explicit} is unreadable") from exc
-        if data.get("status") == "complete":
-            raise RunRefusedError(f"run {explicit} is already complete; nothing to resume")
+        if data.get("status") in _TERMINAL_STATUSES:
+            raise RunRefusedError(
+                f"run {explicit} is already terminal ({data.get('status')}); "
+                "nothing to resume"
+            )
         return explicit
     unfinished: list[str] = []
     try:
@@ -199,7 +208,7 @@ def select_resumable(root: Path, date: str, explicit: str | None = None) -> str 
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if data.get("status") != "complete":
+        if data.get("status") not in _TERMINAL_STATUSES:
             unfinished.append(name)
     if len(unfinished) > 1:
         raise RunRefusedError(
@@ -244,6 +253,130 @@ class RunResult:
     state: RunState
     manifest: Path
     error_class: str | None = None
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Stable identity for one Unix process and its dedicated process group."""
+
+    pid: int
+    pgid: int
+    started_at: int
+
+    @classmethod
+    def from_manifest(cls, value) -> "ProcessIdentity | None":
+        if not isinstance(value, dict):
+            return None
+        try:
+            identity = cls(
+                pid=int(value["pid"]),
+                pgid=int(value["pgid"]),
+                started_at=int(value["started_at"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if identity.pid <= 1 or identity.pgid != identity.pid \
+                or identity.started_at < 0:
+            return None
+        return identity
+
+    def as_manifest(self) -> dict[str, int]:
+        return {
+            "pid": self.pid,
+            "pgid": self.pgid,
+            "started_at": self.started_at,
+        }
+
+
+class ProcessInspector:
+    """Read and signal process groups while defending against PID reuse."""
+
+    def identity(self, pid: int) -> ProcessIdentity | None:
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return self._ps_identity(pid)
+        match = _PROCESS_STAT_RE.match(raw.strip())
+        if match is None:
+            return None
+        fields = match.group(4).split()
+        try:
+            pgid = int(fields[1])
+            started_at = int(fields[18])
+        except (IndexError, ValueError):
+            return None
+        return ProcessIdentity(pid=pid, pgid=pgid, started_at=started_at)
+
+    def _ps_identity(self, pid: int) -> ProcessIdentity | None:
+        """macOS fallback: absolute launch time plus pid/pgid identifies reuse."""
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "pid=,pgid=,lstart=", "-p", str(pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        line = proc.stdout.strip()
+        match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
+        if proc.returncode != 0 or match is None:
+            return None
+        try:
+            started = datetime.strptime(
+                match.group(3), "%a %b %d %H:%M:%S %Y"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        return ProcessIdentity(
+            pid=int(match.group(1)),
+            pgid=int(match.group(2)),
+            started_at=int(started.timestamp()),
+        )
+
+    def signal_group(self, pgid: int, sig: int) -> None:
+        os.killpg(pgid, sig)
+
+
+class ReattachedProcess:
+    """A process-group view reconstructed from a validated durable identity."""
+
+    stdout = ()
+
+    def __init__(self, identity: ProcessIdentity, inspector: ProcessInspector):
+        self.identity = identity
+        self.pid = identity.pid
+        self._inspector = inspector
+
+    def _current(self) -> ProcessIdentity | None:
+        current = self._inspector.identity(self.pid)
+        return current if current == self.identity else None
+
+    def poll(self):
+        return None if self._current() is not None else 0
+
+    def wait(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+        return 0
+
+    def _signal(self, sig: int) -> None:
+        if self._current() is None:
+            return
+        try:
+            self._inspector.signal_group(self.identity.pgid, sig)
+        except ProcessLookupError:
+            pass
+
+    def terminate(self):
+        self._signal(signal.SIGTERM)
+
+    def kill(self):
+        self._signal(signal.SIGKILL)
 
 
 @dataclass
@@ -292,15 +425,11 @@ class PopenProcess:
         # start_new_session: the script spawns children; signals must reach the
         # whole group or a TERM leaves workers running with no supervisor.
         self._proc = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=env, cwd=cwd, start_new_session=True,
         )
         self.pid = self._proc.pid
-
-    @property
-    def stdout(self):
-        return self._proc.stdout
+        self.stdout = ()
 
     def poll(self):
         return self._proc.poll()
@@ -348,9 +477,11 @@ class Orchestrator:
         max_runtime: float | None = None,
         keep_days: int = 7,
         notify=None,
+        process_inspector=None,
     ):
         self._config = config
         self._runner = runner or PipelineRunner()
+        self._process_inspector = process_inspector or ProcessInspector()
         self._clock = clock
         self._sleeper = sleeper
         self._lock_dir = Path(lock_dir) if lock_dir is not None else None
@@ -368,8 +499,77 @@ class Orchestrator:
         self._max_runtime = max_runtime or None  # 0 disables the ceiling
         self._start_lock = threading.Lock()
         self._active: RunHandle | None = None
+        self._logger = logging.getLogger("stage_3.orchestrator")
 
     # -- public API ---------------------------------------------------------
+
+    def set_notify(self, notify) -> None:
+        """Install the operator notification hook once the bot loop exists."""
+        if not callable(notify):
+            raise TypeError("notify must be callable")
+        self._notify = notify
+        self._logger.info(
+            "notification callback installed callback=%s",
+            callable_reference(notify),
+        )
+
+    def restore_active(self, state_root: Path | None = None) -> RunHandle | None:
+        """Reattach to the newest positively identified running process group.
+
+        A PID is never trusted by itself: the persisted process-group id and OS
+        start marker must still match. A stale ``running`` manifest is finalized
+        as interrupted so it cannot block launches or masquerade as live state.
+        """
+        state_root = Path(state_root or self._default_state_root())
+        candidates = self._running_manifests(state_root)
+        live: list[tuple[Path, dict, ProcessIdentity]] = []
+        for manifest_path, data in candidates:
+            identity = ProcessIdentity.from_manifest(data.get("process"))
+            current = (
+                self._process_inspector.identity(identity.pid)
+                if identity is not None else None
+            )
+            if identity is None or current != identity:
+                self._mark_interrupted(manifest_path, data)
+                continue
+            live.append((manifest_path, data, identity))
+        if len(live) > 1:
+            run_ids = ", ".join(str(data["run_id"]) for _, data, _ in live)
+            raise RunRefusedError(
+                "multiple live pipeline processes were recorded "
+                f"({run_ids}); refusing to choose or signal either one"
+            )
+        if not live:
+            return None
+        manifest_path, data, identity = live[0]
+        handle = RunHandle(str(data["run_id"]), manifest_path)
+        handle._manifest = data
+        handle._state = self._state_from_log(manifest_path.parent / "pipeline.log")
+        proc = ReattachedProcess(identity, self._process_inspector)
+        request = RunRequest(
+            geo=data.get("geo"),
+            job_count=int(data.get("job_count") or 10),
+            run_id=handle.run_id,
+        )
+        with self._start_lock:
+            if self._active is not None and self._active.is_running:
+                return self._active
+            self._active = handle
+        threading.Thread(
+            target=self._drain,
+            args=(proc, handle._queue, manifest_path.parent / "pipeline.log"),
+            name=f"stage3-reattach-drain-{handle.run_id}",
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=self._supervise,
+            args=(handle, request, manifest_path.parent, proc,
+                  state_root, str(data.get("date") or manifest_path.parent.parent.name),
+                  self._elapsed_runtime(data.get("started_at"))),
+            name=f"stage3-reattach-{handle.run_id}",
+            daemon=True,
+        ).start()
+        return handle
 
     def start(self, request: RunRequest, *, state_root: Path | None = None,
               today: str | None = None) -> RunHandle:
@@ -403,8 +603,12 @@ class Orchestrator:
             except OSError:
                 pass  # observability only; the run itself must not hinge on it
             try:
-                proc = self._runner(request, self._command(), self._child_env(request, run_id),
-                                    str(self._repo()))
+                proc = self._runner(
+                    request,
+                    self._command(),
+                    self._child_env(request, run_id, run_dir / "pipeline.log"),
+                    str(self._repo()),
+                )
             except OSError as exc:
                 handle._manifest.update(status="failed", error_class="spawn",
                                         finished_at=now_iso(), resumable=False)
@@ -413,6 +617,21 @@ class Orchestrator:
                 except OSError:
                     pass
                 raise RunRefusedError(f"could not launch the pipeline: {exc}") from exc
+            identity = self._process_inspector.identity(proc.pid)
+            if identity is None:
+                identity = ProcessIdentity(
+                    pid=proc.pid, pgid=proc.pid, started_at=int(time.time())
+                )
+            if identity.pgid != proc.pid:
+                proc.terminate()
+                raise RunRefusedError(
+                    "could not verify the pipeline's dedicated process group"
+                )
+            handle._manifest["process"] = identity.as_manifest()
+            try:
+                atomic_json_write(handle.manifest_path, handle._manifest)
+            except OSError:
+                pass
             self._active = handle
         threading.Thread(
             target=self._drain, args=(proc, handle._queue, run_dir / "pipeline.log"),
@@ -463,11 +682,14 @@ class Orchestrator:
                 "/status or wait for it to finish."
             )
 
-    def _child_env(self, request: RunRequest, run_id: str) -> dict:
+    def _child_env(self, request: RunRequest, run_id: str,
+                   pipeline_log: Path | None = None) -> dict:
         extra = dict(request.env or {})
         extra.setdefault("OUTPUT_ROOT", str(self._repo()))
         extra["RUN_ID"] = run_id  # authoritative: never inherited from the caller
         extra["JOB_COUNT"] = str(request.job_count)
+        if pipeline_log is not None:
+            extra["STAGE3_PIPELINE_LOG"] = str(pipeline_log)
         if request.geo:
             extra["GEO_FILTER"] = request.geo
         if self._config is not None:
@@ -496,31 +718,113 @@ class Orchestrator:
             "exit_code": None,
             "last_message": "",
             "terminal_notified": False,
+            "process": None,
         }
+
+    def _running_manifests(self, root: Path) -> list[tuple[Path, dict]]:
+        found: list[tuple[Path, dict]] = []
+        try:
+            paths = sorted(root.glob("????-??-??/*/manifest.json"), reverse=True)
+        except OSError:
+            return found
+        for path in paths:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if data.get("status") == "running" and data.get("run_id"):
+                found.append((path, data))
+        return found
+
+    def _mark_interrupted(self, path: Path, data: dict) -> None:
+        data.update(
+            status="interrupted",
+            error_class="process_missing",
+            finished_at=now_iso(),
+            last_message="The recorded pipeline process is no longer running.",
+            resumable=False,
+        )
+        try:
+            atomic_json_write(path, data)
+        except OSError:
+            pass
+
+    def _state_from_log(self, log_path: Path) -> RunState:
+        tracker = ProgressTracker()
+        try:
+            with log_path.open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    tracker.feed(line, now=self._clock())
+        except OSError:
+            pass
+        return tracker.state
+
+    def _elapsed_runtime(self, started_at) -> float:
+        """Return wall-clock runtime already consumed before reattachment."""
+        if not isinstance(started_at, str):
+            return 0.0
+        try:
+            started = datetime.fromisoformat(started_at)
+        except ValueError:
+            return 0.0
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(
+            0.0,
+            (datetime.now(timezone.utc) - started.astimezone(timezone.utc)).total_seconds(),
+        )
 
     # -- threads ------------------------------------------------------------
 
     def _drain(self, proc, lines: queue.Queue, log_path: Path) -> None:
-        """Copy the child's stdout into the run log and the monitor's queue."""
+        """Project output from a fake stream or the production durable log."""
+        if proc.stdout != ():
+            try:
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    for line in proc.stdout:
+                        if not line.endswith("\n"):
+                            line += "\n"
+                        log_file.write(line)
+                        log_file.flush()
+                        lines.put(line)
+            except Exception:
+                pass
+            finally:
+                lines.put(_EOF)
+            return
+        position = 0
+        if isinstance(proc, ReattachedProcess):
+            try:
+                position = log_path.stat().st_size
+            except OSError:
+                pass
         try:
-            with open(log_path, "a", encoding="utf-8") as log_file:
-                for line in proc.stdout:
-                    if not line.endswith("\n"):
-                        line += "\n"
-                    log_file.write(line)
-                    log_file.flush()
-                    lines.put(line)
+            while proc.poll() is None:
+                position = self._read_log_lines(log_path, position, lines)
+                time.sleep(self._poll_interval or 0.01)
+            self._read_log_lines(log_path, position, lines)
         except Exception:
             pass
         finally:
             lines.put(_EOF)
 
-    def _supervise(self, handle, request, run_dir, proc, state_root, date) -> None:
+    def _read_log_lines(self, path: Path, position: int, lines: queue.Queue) -> int:
+        try:
+            with path.open(encoding="utf-8", errors="replace") as stream:
+                stream.seek(position)
+                for line in stream:
+                    lines.put(line if line.endswith("\n") else line + "\n")
+                return stream.tell()
+        except OSError:
+            return position
+
+    def _supervise(self, handle, request, run_dir, proc, state_root, date,
+                   elapsed_runtime=0.0) -> None:
         """Monitor one run end-to-end. All monitor-thread logic lives here."""
-        tracker = ProgressTracker()
+        tracker = ProgressTracker(handle._state)
         state = tracker.state
         handle._state = state
-        started = self._clock()
+        started = self._clock() - max(0.0, elapsed_runtime)
         next_warning = started + self._stall_after
         sigterm_at: float | None = None
         enforced: str | None = None
@@ -541,28 +845,30 @@ class Orchestrator:
                     # (poll_interval == 0) this is what moves the injected clock,
                     # so a fed line must never advance it.
                     self._sleeper(self._sleep_tick)
-                if (not state.complete and state.stalled(now, self._stall_after)
+                if (enforced is None and not state.complete
+                        and state.stalled(now, self._stall_after)
                         and now >= next_warning):
-                    quiet = int(now - (state.last_activity or now))
+                    quiet = int(now - state.last_activity)
                     self._emit(handle, "waiting", state)
                     self._notify_text(
                         handle,
                         f"💬 Still working — no log update for {quiet}s "
                         f"(phase {state.current_phase}).",
                     )
-                    next_warning = now + self._warn_every
+                    next_warning = self._clock() + self._warn_every
                 if enforced is None:
                     if handle._cancel_event.is_set():
                         enforced = "cancelled"
-                    elif self._max_runtime is not None and now - started >= self._max_runtime:
+                    elif self._max_runtime is not None \
+                            and now - started >= self._max_runtime:
                         enforced = "timeout"
                     if enforced is not None:
                         proc.terminate()
                         sigterm_at = now
                         self._notify_text(
                             handle,
-                            f"⏹ Run {handle.run_id} {enforced} — stopping the pipeline "
-                            f"(SIGTERM sent, escalation in {int(self._kill_after)}s).",
+                            f"⏹ Run {handle.run_id} is stopping — SIGTERM sent, "
+                            f"escalation in {int(self._kill_after)}s.",
                         )
                 elif sigterm_at is not None and now - sigterm_at >= self._kill_after:
                     if proc.poll() is None:
@@ -590,13 +896,22 @@ class Orchestrator:
         self._update_manifest(handle, state, status, exit_code=exit_code,
                               error_class=error_class, finished=True)
         self._emit(handle, "terminal", state)
+        terminal_text = None
         if status == "complete":
-            self._notify_text(handle,
-                              f"✅ Run {handle.run_id} complete — documents saved to disk.")
+            terminal_text = (
+                f"✅ Run {handle.run_id} terminal: complete — documents saved to disk."
+            )
         elif status == "failed":
-            self._notify_text(handle,
-                              f"❌ Run {handle.run_id} failed (exit {exit_code}, "
-                              f"class {error_class}).")
+            terminal_text = (
+                f"❌ Run {handle.run_id} terminal: failed (exit {exit_code}, "
+                f"class {error_class})."
+            )
+        elif status == "cancelled":
+            terminal_text = f"⏹ Run {handle.run_id} terminal: cancelled."
+        elif status == "timeout":
+            terminal_text = f"⏱ Run {handle.run_id} terminal: timeout."
+        if terminal_text is not None:
+            self._notify_text(handle, terminal_text, terminal=True)
         try:
             retain_run_logs(state_root, keep_days=self._keep_days, today=date)
         except Exception:
@@ -631,20 +946,33 @@ class Orchestrator:
         except OSError:
             pass
 
-    def _notify_text(self, handle, text: str) -> None:
-        """Best-effort terminal/waiting notification, deduplicated per run."""
-        if handle._manifest.get("terminal_notified"):
-            return
-        handle._manifest["terminal_notified"] = True
-        try:
-            atomic_json_write(handle.manifest_path, handle._manifest)
-        except OSError:
-            pass
-        if self._notify is not None:
+    def _notify_text(self, handle, text: str, *, terminal: bool = False) -> None:
+        """Send a best-effort notice; deduplicate only terminal outcomes."""
+        if terminal:
+            if handle._manifest.get("terminal_notified"):
+                return
+            handle._manifest["terminal_notified"] = True
             try:
-                self._notify(text)
-            except Exception:
+                atomic_json_write(handle.manifest_path, handle._manifest)
+            except OSError:
                 pass
+        if self._notify is None:
+            self._logger.warning(
+                "notification callback unavailable terminal=%s preview=%s",
+                terminal, safe_preview(text),
+            )
+            return
+        self._logger.info(
+            "invoking notification callback callback=%s terminal=%s preview=%s",
+            callable_reference(self._notify), terminal, safe_preview(text),
+        )
+        try:
+            self._notify(text)
+        except Exception as exc:
+            self._logger.exception(
+                "notification callback raised exception_type=%s preview=%s",
+                type(exc).__name__, safe_preview(text),
+            )
 
     def _emit(self, handle, kind: str, state: RunState) -> None:
         with handle._cb_lock:

@@ -14,7 +14,7 @@ LOG_DIR="$PROJECT_DIR/logs/daily"
 REPORT_DIR="$PROJECT_DIR/reports/daily"
 LOCK_DIR="/tmp/jobsearch_daily_pipeline.lock"
 TODAY=$(date +%Y-%m-%d)
-LOG_FILE="$LOG_DIR/${TODAY}.log"
+LOG_FILE="${STAGE3_PIPELINE_LOG:-$LOG_DIR/${TODAY}.log}"
 REPORT_FILE="$REPORT_DIR/${TODAY}.md"
 PLAN_FILE="/tmp/jobsearch_plan_${TODAY}.tsv"
 JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"
@@ -1001,14 +1001,8 @@ if (( SELECTED_JOBS > 0 )); then
     # reboot, a crash restart), and every one of those starts must be a no-op
     # unless a selection is genuinely pending.
     PENDING_FILE="/tmp/jobsearch_pending_selection.json"
-    printf '{"today": "%s", "rankset": "%s"' "$TODAY" "$RANKSET_FILE" > "$PENDING_FILE"
-    if [[ -n "$RUN_ID" ]]; then
-        printf ', "run_id": "%s"' "$RUN_ID" >> "$PENDING_FILE"
-    fi
-    if [[ -n "$OUTPUT_ROOT" ]]; then
-        printf ', "output_root": "%s"' "$OUTPUT_ROOT" >> "$PENDING_FILE"
-    fi
-    printf '}\n' >> "$PENDING_FILE"
+    python3 "$PROJECT_DIR/scripts/write_selection_handoff.py" \
+        "$PENDING_FILE" "$TODAY" "$RANKSET_FILE" "$RUN_ID" "$OUTPUT_ROOT"
 
     # kickstart -k, not `launchctl start`: -k kills an already-running instance
     # first. Without it, yesterday's listener still holding the token inside its

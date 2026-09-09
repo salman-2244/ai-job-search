@@ -2,9 +2,9 @@
 
 Setup and operations guide for the Telegram bot that turns the daily pipeline
 on-demand: `/run` when you want it, `/schedule` when you want it later, live
-progress while it runs. Read this before starting the bot; `docs/STAGE_3_RESUME.md`
-is the build checkpoint and `docs/STAGE_3_HANDOFF.md` records the design
-decisions this guide summarizes.
+progress while it runs. Read this before starting the bot;
+`docs/STAGE_3_RESUME.md` is the historical build checkpoint and
+`docs/STAGE_3_HANDOFF.md` records the design decisions this guide summarizes.
 
 The guide is deliberately explicit about the security posture: this bot can
 launch a pipeline that drafts job applications, so it answers **only** to the
@@ -40,21 +40,18 @@ STAGE3_REPO=/Users/you/Projects/ai-job-search   optional, defaults to this check
 STAGE3_MAX_RUNTIME=10800               optional seconds; 0 disables the ceiling
 STAGE3_RUN_STATE_ROOT=~/.jobsearch-stage3-runs    optional, run manifests live here
 STAGE3_SCHEDULE_PATH=~/.jobsearch-stage3-schedules.json   optional
-LINKEDIN_EMAIL=you@example.com         optional, tier-3 enrichment only
-LINKEDIN_PASSWORD=...                  optional, tier-3 enrichment only
 LINKEDIN_PLAYWRIGHT_STORAGE_STATE=~/.jobsearch-linkedin-state.json  optional
 ```
 
 Rules the config enforces, so you do not have to trust this file:
 
-- The file is read **first**, then the process environment overrides individual
-  keys (file = durable config, environment = one-off override).
-- A missing **or blank** `STAGE3_ALLOWED_USER_IDS` falls back to
-  `STAGE3_CHAT_ID` alone — owner only, never open. Only a present-but-empty
-  value (`,,,`) raises.
-- The token never appears in `argv`, logs, exception messages, or the child
-  environment: `Stage3Config.child_env()` pops `STAGE3_BOT_TOKEN` before the
-  pipeline runs.
+- Nonblank values in the env file take precedence over the process environment;
+  the process environment fills keys omitted from the durable file.
+- A missing, blank, or separator-only `STAGE3_ALLOWED_USER_IDS` falls back to
+  `STAGE3_CHAT_ID` alone — owner only, never open. Non-numeric entries raise.
+- The token and unsupported legacy LinkedIn email/password variables never enter
+  the child environment. The storage-state path is the only authenticated
+  Playwright input propagated to the pipeline.
 - A group-readable env file warns but does not abort; fix it anyway
   (`chmod 600 ~/.jobsearch-stage3.env`).
 
@@ -65,15 +62,18 @@ python -m stage_3.bot
 ```
 
 The loader validates the token shape, token isolation, and the allowlist before
-anything polls. On a clean start the bot listens for its commands and the
-scheduler loop ticks once a minute.
+anything polls. Startup then performs a real Telegram `getMe` request; an invalid
+token or unreachable API aborts startup instead of leaving a silent poller. On a
+clean start the bot listens for its commands and the scheduler loop ticks once a
+minute.
 
 ## 4. Commands
 
 | Command | What it does |
 |---|---|
 | `/start` | Greet and show the command summary. |
-| `/status` | Replay the active (or latest) run's manifest and log into a progress card. |
+| `/health` or `/ping` | Confirm command reception and report non-sensitive uptime, active-run state, and schedule count. |
+| `/status` | Show live in-memory progress, including safely restored progress after a bot restart; when idle, show selected fields from the latest manifest. |
 | `/run [geo] [count]` | Start a run. Missing pieces come through inline keyboards (geo, then count 5/10/20/25/custom). |
 | `/cancel` | SIGTERM the active run (escalating to SIGKILL), keep the manifest. |
 | `/schedule <YYYY-MM-DDTHH:MM> [geo] [count] [tz=Zone]` | One-shot run at a wall-clock time. |
@@ -116,20 +116,34 @@ gates.
 - Cron expressions are strict five-field (`min hr dom mon dow`) with `*`, lists,
   ranges and steps, evaluated in the record's timezone (`ZoneInfo`; the default
   timezone is UTC, override per-record with `tz=Zone`).
-- The scheduler marks a record due before launching to prevent duplicate
-  launches in the same minute, and launches through the same orchestrator path
-  a manual `/run` uses. Recovery failures and schedule results are pushed to
-  `STAGE3_CHAT_ID`.
+- Before launching due jobs, the scheduler atomically persists every due record's
+  `last_started_at`. If that save fails, **no job launches**, the source records
+  remain unchanged, and the schedule is still due on the next tick or restart.
+  Successful launches use the same orchestrator path as manual `/run`; refusals
+  and storage failures are pushed to `STAGE3_CHAT_ID`.
 
 ## 6. Run state, logs, and retention
 
-- Each run gets an id (`YYYYMMDDThhmmss-<6 hex>`) and a manifest under
+- Each run gets an id (`YYYYMMDDThhmmssZ-<6 hex>`) and a manifest under
   `STAGE3_RUN_STATE_ROOT/<date>/<run_id>/manifest.json` (atomic, non-secret
-  fields only).
-- The orchestrator tails `logs/daily/YYYY-MM-DD.log`, projects it into phase
-  progress, and enforces `STAGE3_MAX_RUNTIME` (default 3h; the ceiling that
-  ends exactly the shape of hang the 2026-08-18 run exhibited).
-- The seven newest log date directories are retained; older ones are tarred to
+  fields only). The worker writes its durable stream beside it as `pipeline.log`;
+  non-Stage-3 launches keep the original `logs/daily/YYYY-MM-DD.log` default.
+- Secret-safe bot diagnostics are written to
+  `STAGE3_RUN_STATE_ROOT/stage3-bot.log` and, while a run is active, duplicated
+  into that run's `pipeline.log`. These diagnostics record callback installation,
+  callback invocation, Telegram API attempts, message ids on success, and
+  exception types on failure; text previews are bounded and Telegram-shaped
+  tokens are redacted. New diagnostic logs use mode `0600`.
+- On startup the bot scans `running` manifests. It reattaches only when the
+  persisted PID, dedicated process-group id, and OS process-start marker all
+  still match, then replays `pipeline.log` for `/status`, `/cancel`, and overlap
+  refusal. A missing or reused process is finalized as terminal `interrupted`
+  and is not resumed. If more than one process identity is still live, startup
+  refuses to choose or signal either one and requires operator investigation.
+- The orchestrator enforces `STAGE3_MAX_RUNTIME` (default 3h; `0` disables it).
+  A restart does not reset that budget: reattachment accounts from the original
+  manifest `started_at`, covering the shape of hang the 2026-08-18 run exhibited.
+- The seven newest run-date directories are retained; older ones are tarred to
   `<root>/archive/` first and the active run's log is never deleted.
 
 ## 7. Optional tier-3 LinkedIn enrichment (Playwright)
@@ -142,9 +156,11 @@ opt-in authenticated browser for when both are unavailable:
 2. Provision the session **from a terminal, once**:
    `python3 scripts/linkedin_session.py` — a headed browser opens, *you* sign
    in, and the helper saves a Playwright storage state to
-   `~/.jobsearch-linkedin-state.json` (mode `0600`, outside the repo). It
+   `~/.jobsearch-linkedin-state.json` with exact mode `0600` (outside the repo).
+   The loader and provider reject any broader Unix permissions. The helper
    prints only a shape summary (cookie counts, soonest expiry), never a value,
-   and never accepts a session over Telegram or any other channel.
+   and never accepts a session, email, or password over Telegram or any other
+   channel.
 3. Point `LINKEDIN_PLAYWRIGHT_STORAGE_STATE` at it and set
    `linkedin.use_playwright: true` in `config/search_matrix.json`.
 
@@ -158,8 +174,11 @@ existing state without opening a browser.
 ## 8. Stopping and deploying
 
 - Stop the bot with Ctrl-C (or `kill -TERM` on the `python -m stage_3.bot`
-  process). An active run keeps going in its own process group and its manifest
-  records the state; `/status` can still replay it after a bot restart.
+  process). The pipeline runs in its own process group and keeps writing its
+  run-scoped `pipeline.log`; on bot restart, the exact process identity must
+  validate before `/status` and `/cancel` are restored. If it no longer
+  validates, the manifest becomes terminal `interrupted` rather than pretending
+  the run is live.
 - Deployment is "run it on a machine that can reach Telegram and LinkedIn":
   a launchd plist or systemd unit wrapping `python -m stage_3.bot` with the
   env file present is the whole story. There is no container image by design —

@@ -1,4 +1,7 @@
 import json
+import os
+import signal
+import subprocess
 import threading
 from datetime import datetime, timezone
 
@@ -8,6 +11,8 @@ from stage_3.config import Stage3Config
 from stage_3.orchestrator import (
     MAX_JOB_COUNT,
     Orchestrator,
+    ProcessIdentity,
+    ProcessInspector,
     RunRefusedError,
     RunRequest,
     atomic_json_write,
@@ -122,6 +127,54 @@ def wait_for(handle):
     return result
 
 
+def write_running_manifest(root, run_id="20260908T120000Z-aaaaaa", **overrides):
+    run_dir = root / "2026-09-08" / run_id
+    run_dir.mkdir(parents=True)
+    manifest = {
+        "run_id": run_id,
+        "date": "2026-09-08",
+        "status": "running",
+        "phase": "2",
+        "geo": "Germany",
+        "job_count": 10,
+        "rank_attempt": 1,
+        "rank_max_attempts": 3,
+        "error_class": None,
+        "resumable": True,
+        "started_at": "2026-09-08T12:00:00+00:00",
+        "finished_at": None,
+        "exit_code": None,
+        "last_message": "Phase 2: Ranking jobs via Claude Code...",
+        "terminal_notified": False,
+        "process": {
+            "pid": 42424,
+            "pgid": 42424,
+            "started_at": 987654321,
+        },
+    }
+    manifest.update(overrides)
+    atomic_json_write(run_dir / "manifest.json", manifest)
+    (run_dir / "pipeline.log").write_text(
+        "[12:00:00] Phase 1 complete: 37 unique jobs fetched\n"
+        "[12:05:00] Phase 2: Ranking jobs via Claude Code...\n",
+        encoding="utf-8",
+    )
+    return run_dir / "manifest.json"
+
+
+class FakeProcessInspector:
+    def __init__(self, identities=()):
+        self.identities = {identity.pid: identity for identity in identities}
+        self.signals = []
+
+    def identity(self, pid):
+        return self.identities.get(pid)
+
+    def signal_group(self, pgid, sig):
+        self.signals.append((pgid, sig))
+        self.identities.pop(pgid, None)
+
+
 def test_same_day_runs_get_distinct_ids_and_manifests():
     first = new_run_id(datetime(2026, 9, 8, tzinfo=timezone.utc), "aaaaaa")
     second = new_run_id(datetime(2026, 9, 8, tzinfo=timezone.utc), "bbbbbb")
@@ -201,6 +254,61 @@ def command_is_clean(command):
     return "synthetic-secret-value" not in text and text.startswith("bash")
 
 
+def test_set_notify_installs_runtime_notification_hook(tmp_path):
+    notifications = []
+    orchestrator, _, _ = make_orchestrator(
+        lines=["[10:00:00] Pipeline complete.\n"],
+    )
+    orchestrator.set_notify(notifications.append)
+
+    handle = orchestrator.start(
+        request(tmp_path), state_root=tmp_path, today="2026-09-08"
+    )
+
+    assert wait_for(handle).status == "complete"
+    assert len(notifications) == 1
+    assert "complete" in notifications[0].lower()
+
+
+def test_set_notify_rejects_non_callable():
+    orchestrator, _, _ = make_orchestrator()
+    with pytest.raises(TypeError, match="callable"):
+        orchestrator.set_notify(None)
+
+
+def test_notification_callback_actually_invoked_for_terminal_outcomes(tmp_path):
+    cases = (
+        ("complete", ["[10:00:00] Pipeline complete.\n"], 0),
+        ("failed", ["[10:00:00] Phase 2 FAILED (exit 1)\n"], 1),
+    )
+    for index, (expected, lines, exit_code) in enumerate(cases):
+        notifications = []
+        orchestrator, _, _ = make_orchestrator(lines=lines, exit_code=exit_code)
+        orchestrator.set_notify(notifications.append)
+        result = wait_for(orchestrator.start(
+            request(tmp_path, run_id=f"run-{index}"),
+            state_root=tmp_path,
+            today="2026-09-08",
+        ))
+        assert result.status == expected
+        assert len(notifications) == 1
+        assert f"terminal: {expected}" in notifications[0].lower()
+
+    notifications = []
+    orchestrator, _, _ = make_orchestrator(hold_open=True)
+    orchestrator.set_notify(notifications.append)
+    handle = orchestrator.start(
+        request(tmp_path, run_id="run-cancel"),
+        state_root=tmp_path,
+        today="2026-09-08",
+    )
+    handle.cancel()
+    assert wait_for(handle).status == "cancelled"
+    assert any("is stopping" in text.lower() for text in notifications)
+    terminal = [text for text in notifications if "terminal: cancelled" in text.lower()]
+    assert len(terminal) == 1
+
+
 def test_failing_run_is_classified_not_completed(tmp_path):
     lines = [
         "[10:00:00] Phase 1 complete: 5 unique jobs fetched\n",
@@ -254,6 +362,189 @@ def test_start_after_finish_is_allowed_again(tmp_path):
     assert wait_for(second).status == "complete"
 
 
+def test_process_identity_is_persisted_before_monitoring(tmp_path):
+    seen = {}
+    proc = FakeProcess(hold_open=True)
+    inspector = FakeProcessInspector([
+        ProcessIdentity(pid=proc.pid, pgid=proc.pid, started_at=987654321)
+    ])
+
+    def runner(req, command, env, cwd):
+        seen["env"] = env
+        return proc
+
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        runner=runner,
+        process_inspector=inspector,
+        clock=FakeClock(),
+        sleeper=lambda _: None,
+        lock_dir=None,
+        poll_interval=0.0,
+        max_runtime=0,
+    )
+    handle = orchestrator.start(
+        request(tmp_path), state_root=tmp_path, today="2026-09-08"
+    )
+    try:
+        process = json.loads(handle.manifest_path.read_text())["process"]
+        assert process == {
+            "pid": proc.pid,
+            "pgid": proc.pid,
+            "started_at": 987654321,
+        }
+        assert seen["env"]["STAGE3_PIPELINE_LOG"] == str(
+            handle.manifest_path.parent / "pipeline.log"
+        )
+    finally:
+        handle.cancel()
+        wait_for(handle)
+
+
+def test_reattach_requires_the_exact_same_process_identity(tmp_path):
+    manifest = write_running_manifest(tmp_path)
+    reused = FakeProcessInspector([
+        ProcessIdentity(pid=42424, pgid=42424, started_at=111111111)
+    ])
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=reused,
+        lock_dir=None,
+    )
+
+    assert orchestrator.restore_active(tmp_path) is None
+    data = json.loads(manifest.read_text())
+    assert data["status"] == "interrupted"
+    assert data["error_class"] == "process_missing"
+    assert data["finished_at"] is not None
+    assert reused.signals == []
+
+
+def test_restore_active_replays_log_and_refuses_overlap(tmp_path):
+    identity = ProcessIdentity(pid=42424, pgid=42424, started_at=987654321)
+    inspector = FakeProcessInspector([identity])
+    write_running_manifest(tmp_path)
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=inspector,
+        lock_dir=None,
+        poll_interval=0.01,
+        max_runtime=0,
+    )
+
+    handle = orchestrator.restore_active(tmp_path)
+
+    assert handle is not None and handle.is_running
+    assert handle.run_id == "20260908T120000Z-aaaaaa"
+    assert handle.state.current_phase == "2"
+    assert "Ranking" in handle.state.message
+    with pytest.raises(RunRefusedError, match="already being supervised"):
+        orchestrator.start(
+            request(tmp_path), state_root=tmp_path, today="2026-09-08"
+        )
+
+
+def test_reattached_cancel_signals_only_the_validated_process_group(tmp_path):
+    identity = ProcessIdentity(pid=42424, pgid=42424, started_at=987654321)
+    inspector = FakeProcessInspector([identity])
+    write_running_manifest(tmp_path)
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=inspector,
+        lock_dir=None,
+        poll_interval=0.01,
+        kill_after=0.01,
+        max_runtime=0,
+    )
+    handle = orchestrator.restore_active(tmp_path)
+
+    handle.cancel()
+    result = handle.wait(timeout=1)
+
+    assert result is not None and result.status == "cancelled"
+    assert inspector.signals[0] == (42424, signal.SIGTERM)
+    assert all(pgid == 42424 for pgid, _ in inspector.signals)
+
+
+def test_reattached_run_keeps_original_max_runtime_budget(tmp_path):
+    identity = ProcessIdentity(pid=42424, pgid=42424, started_at=987654321)
+    inspector = FakeProcessInspector([identity])
+    write_running_manifest(
+        tmp_path,
+        started_at="2000-01-01T00:00:00+00:00",
+    )
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=inspector,
+        lock_dir=None,
+        poll_interval=0.01,
+        kill_after=0.01,
+        max_runtime=60,
+    )
+
+    handle = orchestrator.restore_active(tmp_path)
+    result = handle.wait(timeout=1)
+
+    assert result is not None and result.status == "timeout"
+    assert inspector.signals[0] == (42424, signal.SIGTERM)
+
+
+def test_restore_active_refuses_multiple_live_process_groups(tmp_path):
+    first = ProcessIdentity(pid=42424, pgid=42424, started_at=987654321)
+    second = ProcessIdentity(pid=52525, pgid=52525, started_at=987654322)
+    write_running_manifest(tmp_path)
+    write_running_manifest(
+        tmp_path,
+        run_id="20260908T130000Z-bbbbbb",
+        process=second.as_manifest(),
+        started_at="2026-09-08T13:00:00+00:00",
+    )
+    inspector = FakeProcessInspector([first, second])
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=inspector,
+        lock_dir=None,
+        max_runtime=0,
+    )
+
+    with pytest.raises(RunRefusedError, match="multiple live pipeline processes"):
+        orchestrator.restore_active(tmp_path)
+
+    assert inspector.signals == []
+    assert json.loads(
+        (tmp_path / "2026-09-08" / "20260908T120000Z-aaaaaa" /
+         "manifest.json").read_text()
+    )["status"] == "running"
+    assert json.loads(
+        (tmp_path / "2026-09-08" / "20260908T130000Z-bbbbbb" /
+         "manifest.json").read_text()
+    )["status"] == "running"
+
+
+def test_process_inspector_identity_is_stable_for_real_process():
+    proc = subprocess.Popen(
+        ["sleep", "30"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    inspector = ProcessInspector()
+    try:
+        first = inspector.identity(proc.pid)
+        second = inspector.identity(proc.pid)
+        assert first is not None
+        assert first == second
+        assert first.pid == proc.pid
+        assert first.pgid == proc.pid
+        assert first.started_at >= 0
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5)
+
+
 def test_existing_lock_dir_refuses_the_run(tmp_path):
     lock_dir = tmp_path / "lock"
     lock_dir.mkdir()
@@ -291,6 +582,7 @@ def test_cancel_escalates_to_kill_when_terminate_is_ignored(tmp_path):
         lock_dir=None,
         poll_interval=0.0,
         kill_after=2,
+        max_runtime=0,
     )
     handle = orchestrator.start(request(tmp_path), state_root=tmp_path, today="2026-09-08")
     handle.cancel()
@@ -350,6 +642,38 @@ def test_waiting_warning_is_emitted_at_most_every_two_minutes(tmp_path):
     waiting = [n for n in notifications if "still working" in n.lower()]
     # The clock passes the 120s, 240s and 360s marks: at most one warning each.
     assert 1 <= len(waiting) <= 3
+
+
+def test_waiting_notice_does_not_suppress_terminal_notification(tmp_path):
+    proc = FakeProcess(
+        lines=["[10:00:00] Phase 1: Fetching jobs from portals...\n"],
+        hold_open=True,
+        ignore_terminate=True,
+    )
+    clock = FakeClock()
+    notifications = []
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        runner=lambda request, command, env, cwd: proc,
+        clock=clock,
+        sleeper=clock.advance,
+        lock_dir=None,
+        poll_interval=0.0,
+        stall_after=2,
+        warn_every=120,
+        max_runtime=5,
+        kill_after=1,
+        notify=notifications.append,
+    )
+
+    result = wait_for(orchestrator.start(
+        request(tmp_path), state_root=tmp_path, today="2026-09-08"
+    ))
+
+    assert any("still working" in text.lower() for text in notifications)
+    terminal = [text for text in notifications if "terminal: timeout" in text.lower()]
+    assert len(terminal) == 1
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is True
 
 
 def test_subscribers_see_progress_and_terminal_events(tmp_path):
@@ -438,6 +762,33 @@ def test_resume_explicit_id_must_exist_and_be_resumable(tmp_path):
     _write_manifest(tmp_path, "2026-09-08", "20260908T090000Z-aaaaaa", "complete")
     with pytest.raises(RunRefusedError):
         select_resumable(tmp_path, "2026-09-08", explicit="20260908T090000Z-aaaaaa")
+
+
+@pytest.mark.parametrize(
+    "status", ["complete", "failed", "cancelled", "timeout", "interrupted"]
+)
+def test_resume_never_selects_terminal_runs(tmp_path, status):
+    run_id = "20260908T090000Z-aaaaaa"
+    _write_manifest(tmp_path, "2026-09-08", run_id, status)
+
+    assert select_resumable(tmp_path, "2026-09-08") is None
+    with pytest.raises(RunRefusedError, match="already terminal"):
+        select_resumable(tmp_path, "2026-09-08", explicit=run_id)
+
+
+def test_stale_running_manifest_is_terminal_and_not_resumable(tmp_path):
+    manifest = write_running_manifest(tmp_path)
+    orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        process_inspector=FakeProcessInspector(),
+        lock_dir=None,
+    )
+
+    assert orchestrator.restore_active(tmp_path) is None
+    data = json.loads(manifest.read_text())
+    assert data["status"] == "interrupted"
+    assert data["resumable"] is False
+    assert select_resumable(tmp_path, "2026-09-08") is None
 
 
 def test_start_resolves_resume_request_against_manifests(tmp_path):

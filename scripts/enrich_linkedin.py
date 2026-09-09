@@ -987,11 +987,10 @@ def browser_fetcher(module, ledger, warn, log, state, guest=fetch_detail):
 
 # === The tier-3 path ========================================================
 # The third authenticated client, enabled only when the operator turns it on:
-# the matrix sets `linkedin.use_playwright` AND the environment carries a
-# session (`LINKEDIN_PLAYWRIGHT_STORAGE_STATE` pointing at an existing file, or
-# LINKEDIN_EMAIL/LINKEDIN_PASSWORD). Both conditions, never one: a provider
-# with no session can only land on a login wall, and a session nobody asked
-# this path to spend must not be spent by it.
+# the matrix sets `linkedin.use_playwright` AND the environment points
+# `LINKEDIN_PLAYWRIGHT_STORAGE_STATE` at a manually generated state file. Both
+# conditions, never one: a provider with no session can only land on a login
+# wall, and a session nobody asked this path to spend must not be spent by it.
 #
 # It engages only where tier 1 could not (WebBridge unavailable at pre-flight,
 # or `use_browser_extractor` off). The WebBridge browser and a Playwright
@@ -1039,10 +1038,21 @@ def _load_playwright_provider(warn, log, environ=None):
     if storage_state is not None and not storage_state.is_file():
         warn("LINKEDIN_PLAYWRIGHT_STORAGE_STATE names a missing file — ignoring it")
         storage_state = None
-    has_credentials = bool(env.get("LINKEDIN_EMAIL") and env.get("LINKEDIN_PASSWORD"))
-    if storage_state is None and not has_credentials:
-        return None, None, ("no LINKEDIN_PLAYWRIGHT_STORAGE_STATE file and no "
-                            "LINKEDIN_EMAIL/LINKEDIN_PASSWORD — tier 3 has no session")
+    if storage_state is None:
+        return None, None, (
+            "no session: LINKEDIN_PLAYWRIGHT_STORAGE_STATE must name a manually "
+            "generated file; run scripts/linkedin_session.py in a terminal"
+        )
+    try:
+        storage_mode = storage_state.stat().st_mode & 0o777
+    except OSError as exc:
+        warn("LINKEDIN_PLAYWRIGHT_STORAGE_STATE is unreadable "
+             f"({type(exc).__name__}) — ignoring it")
+        return None, None, "storage state is unreadable; regenerate it manually"
+    if storage_mode != 0o600:
+        warn("LINKEDIN_PLAYWRIGHT_STORAGE_STATE has mode "
+             f"{storage_mode:04o}, not exact 0600 — ignoring it")
+        return None, None, "storage state must have exact mode 0600"
 
     headless_raw = (env.get("LINKEDIN_PLAYWRIGHT_HEADLESS") or "true").strip().lower()
     headless = headless_raw not in {"false", "0", "no"}

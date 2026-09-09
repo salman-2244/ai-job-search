@@ -690,39 +690,74 @@ class TheTier3PlaywrightPathIsOptInAndSaysWhy(unittest.TestCase):
             warn, log, environ=environ if environ is not None else {})
         return provider, errors, reason, log, warn
 
-    def test_without_a_session_it_stays_disarmed_with_a_reason(self):
+    def test_without_storage_state_it_stays_disarmed_with_manual_fix(self):
         provider, errors, reason, _, _ = self.loader({})
         self.assertIsNone(provider)
         self.assertIsNone(errors)
-        # The reason names both ways a session can be absent; main() turns it
-        # into the one-line 'tier 3 not engaged (...)' log.
         self.assertIn("no session", reason)
-        self.assertIn("LINKEDIN_EMAIL", reason)
+        self.assertIn("linkedin_session.py", reason)
+        self.assertNotIn("LINKEDIN_EMAIL", reason)
 
-    def test_environment_credentials_arm_the_provider_offline(self):
-        provider, errors, reason, log, _ = self.loader(dict(self.CRED_ENV))
+    def test_environment_credentials_do_not_arm_the_provider(self):
+        provider, errors, reason, _, _ = self.loader(dict(self.CRED_ENV))
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("linkedin_session.py", reason)
+
+    def test_exact_0600_storage_state_arms_the_provider(self):
+        state = self._storage_state(0o600)
+        provider, errors, reason, log, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(state),
+        })
         self.assertIsNotNone(provider)
         self.assertIsNotNone(errors)
         self.assertIsNone(reason)
-        self.assertIsNone(provider.storage_state)
+        self.assertEqual(provider.storage_state, state)
         self.assertTrue(provider.headless)
         self.assertIn("tier 3 armed", log.text())
 
-    def test_a_missing_storage_state_file_is_ignored_not_fatal(self):
-        environ = dict(self.CRED_ENV)
-        environ["LINKEDIN_PLAYWRIGHT_STORAGE_STATE"] = "/nonexistent/state.json"
-        provider, _, _, _, warn = self.loader(environ)
-        self.assertIsNotNone(provider)
-        self.assertIsNone(provider.storage_state)
+    def test_a_missing_storage_state_file_disarms_the_provider(self):
+        provider, errors, reason, _, warn = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": "/nonexistent/state.json",
+        })
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("linkedin_session.py", reason)
         self.assertIn("missing file", warn.text())
 
+    def test_a_non_0600_storage_state_disarms_the_provider_before_first_fetch(self):
+        state = self._storage_state(0o640)
+        provider, errors, reason, _, warn = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(state),
+        })
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("0600", reason)
+        self.assertIn("0640", warn.text())
+
+    def _storage_state(self, mode=0o600):
+        import tempfile
+
+        directory = Path(tempfile.mkdtemp(prefix="linkedin-state-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        path = directory / "state.json"
+        path.write_text("{}", encoding="utf-8")
+        path.chmod(mode)
+        return path
+
     def _fetcher(self, provider, ledger, state, guest):
-        _, errors, _, _, _ = self.loader(dict(self.CRED_ENV))
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
         return enr.playwright_fetcher(provider, errors, ledger, quiet, quiet,
                                       state, guest=guest)
 
     def test_a_challenge_pauses_the_tier_and_lands_on_the_guest(self):
-        _, errors, _, _, _ = self.loader(dict(self.CRED_ENV))
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
         served = []
 
         class ChallengingProvider:
@@ -782,7 +817,10 @@ class TheTier3PlaywrightPathIsOptInAndSaysWhy(unittest.TestCase):
         catches DetailError and only DetailError, so anything escaping here
         would abort the whole phase mid-list — the failure mode
         browser_fetcher already guards against, mirrored for tier 3."""
-        _, errors, _, _, _ = self.loader(dict(self.CRED_ENV))
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
         served = []
 
         class ExplodingProvider:

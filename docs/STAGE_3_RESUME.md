@@ -1,14 +1,16 @@
-# Stage 3 — Resume checkpoint (final, 2026-09-08)
+# Stage 3 — Historical build checkpoint (2026-09-08)
 
-This file was the single place to look to pick the build back up. **All eleven
-tasks of `docs/superpowers/plans/2026-09-08-stage-3-completion.md` are now
-implemented, tested, and committed.** This file is kept as the build record;
-`docs/STAGE_3.md` is now the operations guide a user follows.
+> This is a historical record of the original Stage 3 build, not the current
+> working-tree status or an instruction to resume from here. The post-build audit
+> found issues that are being remediated separately; use `docs/STAGE_3.md` for
+> current operations and inspect Git directly for current implementation state.
 
-**Status in one line:** Tasks 1–11 complete. Branch
-`worktree-stage-3-completion` pushed; the PR carries the validation summary.
+At this checkpoint, the original eleven tasks from
+`docs/superpowers/plans/2026-09-08-stage-3-completion.md` had been implemented,
+tested, committed, and pushed on `worktree-stage-3-completion`. The commit and
+validation details below describe only that 2026-09-08 checkpoint.
 
-## Task status
+## Historical task status
 
 | # | Task | Status |
 |---|------|--------|
@@ -41,7 +43,7 @@ d67a58e  feat(stage3): model pipeline progress from logs                        
 bf4cdd5  test(stage3): lock down secure configuration                                   (Task 1)
 ```
 
-## Verification (Task 10, recorded 2026-09-08)
+## Historical verification (recorded 2026-09-08)
 
 ```
 .venv/bin/python -m pytest tests/test_stage3_config.py tests/test_stage3_progress.py \
@@ -101,7 +103,7 @@ Also fixed while landing Task 8: `checkpoint` URLs now classify as a *challenge*
 text) — LinkedIn's `checkpoint/challengesV2` router was being mislabeled as a
 lapsed login, sending the operator to re-provision a live session.
 
-## What the operator does next (user decisions, not agent actions)
+## Operator follow-up recorded at that checkpoint
 
 - Provision the **third** @BotFather token and `~/.jobsearch-stage3.env` (see
   `docs/STAGE_3.md` §1–2) — secrets never enter the repo or this workflow.
@@ -111,7 +113,7 @@ lapsed login, sending the operator to re-provision a live session.
   (see `docs/STAGE_3_HANDOFF.md` §9A) still needs the user's call: plain deletion
   leaves it in history; history rewrite rewrites public history.
 
-## Non-negotiable constraints (bind every task — copy into any review)
+## Security constraints recorded at that checkpoint
 
 - Secrets (`STAGE3_BOT_TOKEN`, `LINKEDIN_*`) live only in the owner-readable external
   env file; **never** in argv, logs, manifests, Telegram messages, exception text,

@@ -16,6 +16,7 @@ the shell and recorded in the task report, not re-proven by running the script.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import shutil
@@ -40,6 +41,13 @@ _listener_spec = importlib.util.spec_from_file_location(
 listener = importlib.util.module_from_spec(_listener_spec)
 sys.modules["selector_listener_testee"] = listener
 _listener_spec.loader.exec_module(listener)
+
+_batch_spec = importlib.util.spec_from_file_location(
+    "generate_batch_testee", REPO / "scripts" / "generate_batch.py"
+)
+batch = importlib.util.module_from_spec(_batch_spec)
+sys.modules["generate_batch_testee"] = batch
+_batch_spec.loader.exec_module(batch)
 
 
 def touch(path: Path) -> None:
@@ -106,6 +114,52 @@ class OutputPathLayout(TempDirCase):
             ts.doc_dir_for("2026-09-08", rid, "acme-role")  # must not raise
         finally:
             sys.path.remove(str(REPO))
+
+
+    def test_generate_one_prompt_targets_external_output_root(self):
+        external = self.tmp / "external"
+        captured = {}
+        row = ts.JobRow(
+            idx=0,
+            key="job-1",
+            company="Acme",
+            title="Data Role",
+            location="Remote",
+            score=90,
+            tier="strong",
+            source="synthetic",
+            language="pass",
+            experience="pass",
+            url="https://example.test/job",
+        )
+
+        class FakeProcess:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", b"synthetic stop after prompt capture"
+
+        async def fake_exec(*args, **kwargs):
+            captured["prompt"] = args[2]
+            return FakeProcess()
+
+        original = ts.asyncio.create_subprocess_exec
+        ts.asyncio.create_subprocess_exec = fake_exec
+        try:
+            asyncio.run(ts.generate_one(
+                row,
+                "2026-09-08",
+                asyncio.Semaphore(1),
+                self.tmp / "generation.log",
+                run_id="run-a",
+                output_root=external,
+            ))
+        finally:
+            ts.asyncio.create_subprocess_exec = original
+
+        self.assertIn(f"Use the output root: `{external}`", captured["prompt"])
+        self.assertIn(f"Create `{external}/cv/2026-09-08/run-a/{row.slug}/Salman-Resume.tex`", captured["prompt"])
+        self.assertNotIn("<OUTPUT_ROOT>", captured["prompt"])
 
 
 # -- completeness -----------------------------------------------------------------
@@ -175,6 +229,27 @@ class CompletenessTests(TempDirCase):
                 "acme-role", output_root=self.tmp, day="2026-09-08", run_id="run-a"
             )
         )
+
+    def test_batch_skip_gate_honours_complete_legacy_output(self):
+        legacy = ts.legacy_artifacts("acme-role", self.tmp)
+        for path in legacy:
+            touch(path)
+        before = {path: path.read_bytes() for path in legacy}
+        old_run_id = batch._RUN_ID
+        old_run_complete = batch._ts_is_complete
+        old_legacy_complete = getattr(batch, "_ts_legacy_is_complete", None)
+        try:
+            batch._RUN_ID = "run-a"
+            batch._ts_is_complete = lambda slug: False
+            batch._ts_legacy_is_complete = lambda slug: ts.legacy_is_complete(
+                slug, self.tmp
+            )
+            self.assertTrue(batch.is_complete("acme-role"))
+        finally:
+            batch._RUN_ID = old_run_id
+            batch._ts_is_complete = old_run_complete
+            batch._ts_legacy_is_complete = old_legacy_complete
+        self.assertEqual({path: path.read_bytes() for path in legacy}, before)
 
     def test_job_file_path_is_run_scoped_when_a_run_id_is_given(self):
         # Concurrent runs on one day must not collide on the JSON payload file.
@@ -258,11 +333,31 @@ class RunDailyThreading(TempDirCase):
         # empty) and the Phase 3 handoff carrying run_id/output_root.
         self.assertIn('JOB_COUNT_ARGS=("--budget" "$JOB_COUNT")', text)
         self.assertIn('JOB_COUNT_ARGS[@]+"${JOB_COUNT_ARGS[@]}', text)
-        self.assertIn(', "run_id": "%s"', text)
-        self.assertIn(', "output_root": "%s"', text)
+        self.assertIn('write_selection_handoff.py', text)
+        self.assertIn('"$TODAY" "$RANKSET_FILE" "$RUN_ID" "$OUTPUT_ROOT"', text)
         # The run id lands in new log metadata without touching the date-keyed
         # file names the earlier phases read.
         self.assertIn('log "Stage 3 run id: $RUN_ID"', text)
+
+    def test_handoff_writer_serializes_special_characters(self):
+        from scripts.write_selection_handoff import write_handoff
+
+        pending = self.tmp / "pending.json"
+        rankset = self.tmp / 'rankset-"quoted"-\\backslash\nline.json'
+        output_root = self.tmp / 'outputs-"quoted"-\\backslash\nline'
+        write_handoff(
+            pending,
+            today="2026-09-08",
+            rankset=rankset,
+            run_id="run-1",
+            output_root=output_root,
+        )
+
+        payload = json.loads(pending.read_text(encoding="utf-8"))
+        self.assertEqual(payload["rankset"], str(rankset))
+        self.assertEqual(payload["output_root"], str(output_root))
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(list(self.tmp.glob(".pending.json.*")), [])
 
 
 # -- listener handoff -------------------------------------------------------------------

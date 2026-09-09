@@ -9,8 +9,7 @@ startup from a KEY=VALUE file outside the tree, defaulting to
     STAGE3_BOT_TOKEN=123456:AA...        a *third* bot from @BotFather
     STAGE3_CHAT_ID=123456789             where unsolicited messages go
     STAGE3_ALLOWED_USER_IDS=123456789    comma-separated; nobody else is answered
-    LINKEDIN_EMAIL=you@example.com       optional, tier-3 enrichment only
-    LINKEDIN_PASSWORD=...                optional, tier-3 enrichment only
+    LINKEDIN_PLAYWRIGHT_STORAGE_STATE=~/.linkedin-state.json  optional manual session
     STAGE3_REPO=/Users/you/Projects/...  optional, defaults to this checkout
     STAGE3_MAX_RUNTIME=10800             optional seconds; 0 disables the ceiling
 
@@ -44,8 +43,8 @@ CLAUDE_BOT_ENV_PATH = Path.home() / "claude-code-telegram" / ".env"
 
 #: Keys whose values must never be logged, echoed or included in an exception.
 SECRET_KEYS = frozenset({
-    "STAGE3_BOT_TOKEN", "LINKEDIN_PASSWORD", "SELECTOR_BOT_TOKEN",
-    "TELEGRAM_BOT_TOKEN", "ANTHROPIC_API_KEY",
+    "STAGE3_BOT_TOKEN", "SELECTOR_BOT_TOKEN", "TELEGRAM_BOT_TOKEN",
+    "ANTHROPIC_API_KEY", "LINKEDIN_PASSWORD",
 })
 
 #: Seconds a run may take before the orchestrator stops it. Three hours: the observed
@@ -154,8 +153,6 @@ class Stage3Config:
     allowed_user_ids: tuple[int, ...]
     repo: Path = REPO_ROOT
     max_runtime: int = DEFAULT_MAX_RUNTIME
-    linkedin_email: str = ""
-    linkedin_password: str = ""
     run_state_root: Path = DEFAULT_RUN_STATE_ROOT
     schedule_path: Path = DEFAULT_SCHEDULE_PATH
     schedule_backup_path: Path = DEFAULT_SCHEDULE_BACKUP_PATH
@@ -170,8 +167,7 @@ class Stage3Config:
                 f"chat_id={self.chat_id}, "
                 f"allowed_user_ids={self.allowed_user_ids}, "
                 f"repo={str(self.repo)!r}, max_runtime={self.max_runtime}, "
-                f"linkedin_email={'set' if self.linkedin_email else 'unset'}, "
-                f"linkedin_password={'set' if self.linkedin_password else 'unset'})")
+                f"linkedin_storage_state={'set' if self.linkedin_storage_state else 'unset'})")
 
     __str__ = __repr__
 
@@ -182,31 +178,30 @@ class Stage3Config:
         except (TypeError, ValueError):
             return False
 
-    @property
-    def has_linkedin_credentials(self) -> bool:
-        return bool(self.linkedin_email and self.linkedin_password)
-
     def child_env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """The environment to hand `run_daily.sh`.
 
-        Credentials travel here rather than in argv: argv is world-readable through
-        `ps`, so `--password X` would expose the value to every process on the machine.
-        The bot's own token is *removed* from the child's environment — the pipeline has
-        no reason to hold it, and a subprocess that cannot read a secret cannot leak it.
+        The bot token and unsupported legacy LinkedIn credential variables are
+        removed from the child environment. Tier 3 accepts only the manually
+        generated storage-state path from configuration.
         """
         env = dict(os.environ)
-        env.pop("STAGE3_BOT_TOKEN", None)
-        if self.linkedin_email:
-            env["LINKEDIN_EMAIL"] = self.linkedin_email
-        if self.linkedin_password:
-            env["LINKEDIN_PASSWORD"] = self.linkedin_password
         # launchd and a bot started from a GUI both hand over a minimal PATH, and
         # `run_daily.sh` needs ~/.local/bin for tg-notify. Same fix as run_daily.sh:7.
         local_bin = str(Path.home() / ".local" / "bin")
         path = env.get("PATH", "")
         if local_bin not in path.split(":"):
             env["PATH"] = f"{local_bin}:{path}" if path else local_bin
+        if self.linkedin_storage_state is not None:
+            env["LINKEDIN_PLAYWRIGHT_STORAGE_STATE"] = str(
+                self.linkedin_storage_state
+            )
         env.update(extra or {})
+        # Unsupported credentials stay out even if inherited from the process or
+        # accidentally supplied as an orchestrator override.
+        env.pop("STAGE3_BOT_TOKEN", None)
+        env.pop("LINKEDIN_EMAIL", None)
+        env.pop("LINKEDIN_PASSWORD", None)
         return env
 
 
@@ -245,8 +240,8 @@ def load_config(path: Path | None = None, environ: dict | None = None,
     """Load and validate the configuration. Raises ConfigError with a fix, not a trace.
 
     Resolution order for each value: the env file, then the process environment. The
-    file wins because it is the durable configuration; the process environment is the
-    override for a one-off (`STAGE3_CHAT_ID=... python -m stage_3.bot`).
+    file wins because it is the durable configuration; the process environment fills
+    only keys that the file omits.
     """
     environ = os.environ if environ is None else environ
     env_path = Path(path or environ.get("JOBSEARCH_STAGE3_ENV") or DEFAULT_ENV_PATH)
@@ -310,8 +305,6 @@ def load_config(path: Path | None = None, environ: dict | None = None,
         raise ConfigError(f"STAGE3_MAX_RUNTIME must be a whole number of seconds "
                           f"(0 disables the ceiling), got {runtime_raw!r}")
 
-    email = get("LINKEDIN_EMAIL")
-    password = get("LINKEDIN_PASSWORD")
     run_state_root = Path(get("STAGE3_RUN_STATE_ROOT", str(DEFAULT_RUN_STATE_ROOT))).expanduser()
     schedule_path = Path(get("STAGE3_SCHEDULE_PATH", str(DEFAULT_SCHEDULE_PATH))).expanduser()
     schedule_backup_path = Path(
@@ -329,13 +322,6 @@ def load_config(path: Path | None = None, environ: dict | None = None,
         raise ConfigError("LINKEDIN_PLAYWRIGHT_TIMEOUT must be a positive number") from exc
     if playwright_timeout <= 0 or playwright_timeout > 300:
         raise ConfigError("LINKEDIN_PLAYWRIGHT_TIMEOUT must be between 0 and 300 seconds")
-    if warn is not None and bool(email) != bool(password):
-        # Half-configured credentials read as "tier 3 is available" and then fail at the
-        # login form, after the two cheaper tiers have already been skipped.
-        missing = "LINKEDIN_PASSWORD" if email else "LINKEDIN_EMAIL"
-        warn(f"{missing} is not set, so tier-3 LinkedIn enrichment stays disabled. "
-             "Enrichment falls back to WebBridge and guest snippets, which is the "
-             "normal path — set both keys only if you want the authenticated tier.")
 
     return Stage3Config(
         bot_token=token,
@@ -343,8 +329,6 @@ def load_config(path: Path | None = None, environ: dict | None = None,
         allowed_user_ids=tuple(allowed),
         repo=repo,
         max_runtime=int(runtime_raw),
-        linkedin_email=email,
-        linkedin_password=password,
         run_state_root=run_state_root,
         schedule_path=schedule_path,
         schedule_backup_path=schedule_backup_path,

@@ -581,8 +581,10 @@ async def generate_one(
         )
 
         doc_dir = doc_dir_for(today, run_id, row.slug)
+        output_base = str(Path(output_root)) if run_id and output_root is not None else "."
         prompt = DRAFT_PROMPT.read_text(encoding="utf-8")
         prompt = prompt.replace("<JOB_FILE_PATH>", str(job_file))
+        prompt = prompt.replace("<OUTPUT_ROOT>", output_base)
         prompt = prompt.replace("<OUTPUT_DIR>", doc_dir)
         prompt = prompt.replace("<OUTPUT_SLUG>", row.slug)
 
