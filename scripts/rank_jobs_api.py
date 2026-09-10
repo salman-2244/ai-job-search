@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import os
+import ssl
 import sys
 import tempfile
 import urllib.error
@@ -85,13 +86,26 @@ def messages_endpoint(base_url: str) -> str:
     return root + "/v1/messages"
 
 
+def _default_opener():
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile or paths.capath:
+        return urllib.request.build_opener()
+    system_ca = Path("/etc/ssl/cert.pem")
+    if not system_ca.is_file():
+        return urllib.request.build_opener()
+    context = ssl.create_default_context(cafile=str(system_ca))
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=context))
+
+
 def request_message(
     config: RankingConfig,
     ranking_prompt: str,
     timeout: float,
     *,
-    opener=urllib.request,
+    opener=None,
 ) -> str:
+    if opener is None:
+        opener = _default_opener()
     payload = json.dumps({
         "model": config.model,
         "max_tokens": 4096,
@@ -104,6 +118,7 @@ def request_message(
             "x-api-key": config.api_key,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
+            "User-Agent": "ai-job-search-stage3/1.0",
         },
         method="POST",
     )

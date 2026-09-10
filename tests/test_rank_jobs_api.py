@@ -113,6 +113,47 @@ class ConfigTests(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
+    def test_default_transport_builds_an_opener_before_requesting(self):
+        opener = RecordingOpener({"content": [{"type": "text", "text": "ok"}]})
+        original_build_opener = ranker.urllib.request.build_opener
+        ranker.urllib.request.build_opener = lambda *handlers: opener
+        try:
+            text = ranker.request_message(
+                ranker.RankingConfig("https://api.example.test", "m", "k"),
+                "prompt",
+                3,
+            )
+        finally:
+            ranker.urllib.request.build_opener = original_build_opener
+        self.assertEqual(text, "ok")
+        self.assertEqual(opener.timeout, 3)
+
+    def test_default_transport_uses_system_ca_when_python_has_no_trust_path(self):
+        original_paths = ranker.ssl.get_default_verify_paths
+        original_is_file = ranker.Path.is_file
+        original_context = ranker.ssl.create_default_context
+        original_handler = ranker.urllib.request.HTTPSHandler
+        original_build_opener = ranker.urllib.request.build_opener
+        captured = {}
+        ranker.ssl.get_default_verify_paths = lambda: type(
+            "Paths", (), {"cafile": None, "capath": None}
+        )()
+        ranker.Path.is_file = lambda path: str(path) == "/etc/ssl/cert.pem"
+        ranker.ssl.create_default_context = lambda **kwargs: captured.setdefault(
+            "cafile", kwargs.get("cafile")
+        ) or "context"
+        ranker.urllib.request.HTTPSHandler = lambda **kwargs: kwargs
+        ranker.urllib.request.build_opener = lambda *handlers: handlers
+        try:
+            ranker._default_opener()
+        finally:
+            ranker.ssl.get_default_verify_paths = original_paths
+            ranker.Path.is_file = original_is_file
+            ranker.ssl.create_default_context = original_context
+            ranker.urllib.request.HTTPSHandler = original_handler
+            ranker.urllib.request.build_opener = original_build_opener
+        self.assertEqual(captured["cafile"], "/etc/ssl/cert.pem")
+
     def test_request_uses_required_headers_runtime_model_and_timeout(self):
         opener = RecordingOpener({"content": [{"type": "text", "text": "ok"}]})
         config = ranker.RankingConfig(
@@ -126,6 +167,7 @@ class RequestTests(unittest.TestCase):
         self.assertEqual(headers["x-api-key"], "runtime-key")
         self.assertEqual(headers["anthropic-version"], "2023-06-01")
         self.assertEqual(headers["content-type"], "application/json")
+        self.assertEqual(headers["user-agent"], "ai-job-search-stage3/1.0")
         self.assertEqual(payload, {
             "model": "runtime-model",
             "max_tokens": 4096,
