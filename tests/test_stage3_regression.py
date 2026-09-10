@@ -5,12 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 from datetime import datetime, timezone
 
 import pytest
-
-sys.path.append("/Users/salman/Projects/ai-job-search/.venv/lib/python3.10/site-packages")
 
 from scripts import generate_batch
 from scripts.linkedin_playwright import (

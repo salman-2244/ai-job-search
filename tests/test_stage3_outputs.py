@@ -327,6 +327,35 @@ class RunDailyThreading(TempDirCase):
         validation_at = text.index('JOB_COUNT="${JOB_COUNT:-}"')
         self.assertLess(validation_at, text.index('SKIP_ALERTS="${SKIP_ALERTS:-0}"'))
 
+    def test_script_resolves_the_checkout_containing_it(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"', text)
+        self.assertIn('PROJECT_DIR=$(cd -P -- "$SCRIPT_DIR/.." && pwd)', text)
+        self.assertNotIn('PROJECT_DIR="/Users/salman/Projects/ai-job-search"', text)
+
+        # Execute only the setup prefix from a checkout path containing spaces.
+        checkout = self.tmp / "checkout with spaces"
+        (checkout / "scripts").mkdir(parents=True)
+        copy = checkout / "scripts" / "run_daily.sh"
+        copy.write_text(text, encoding="utf-8")
+        marker = 'CONFIG="$PROJECT_DIR/config/automation.json"'
+        prefix = text[: text.index(marker) + len(marker)]
+        prefix = prefix.replace(
+            'SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"',
+            f'SCRIPT_SOURCE="{copy}"',
+            1,
+        )
+        prefix += '\nprintf "%s\\n" "$PROJECT_DIR"\n'
+        proc = subprocess.run(
+            ["bash", "-c", prefix],
+            capture_output=True,
+            text=True,
+            env={"HOME": str(Path.home()), "PATH": "/usr/bin:/bin"},
+            cwd=self.tmp,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), str(checkout.resolve()))
+
     def test_run_scoped_log_is_created_with_owner_only_permissions(self):
         text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
         setup = text.index('if [[ -n "${STAGE3_PIPELINE_LOG:-}" ]]')

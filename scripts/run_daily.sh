@@ -4,10 +4,22 @@ set -euo pipefail
 # === Ensure claude CLI is in PATH ===
 # ~/.local/bin carries tg-notify, used by notify_result below. launchd hands this
 # script a minimal PATH, so it has to be named here or the ping silently no-ops.
-export PATH="$HOME/.local/bin:/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/v24.19.0/bin:$HOME/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # === Configuration ===
-PROJECT_DIR="/Users/salman/Projects/ai-job-search"
+# Resolve the physical checkout containing this script. In particular, never jump
+# from a worktree back to a differently-versioned original checkout: every helper
+# invoked below must come from the same commit as this entrypoint.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+    SCRIPT_SOURCE=$(readlink "$SCRIPT_SOURCE")
+    if [[ "$SCRIPT_SOURCE" != /* ]]; then
+        SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+    fi
+done
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+PROJECT_DIR=$(cd -P -- "$SCRIPT_DIR/.." && pwd)
 CONFIG="$PROJECT_DIR/config/automation.json"
 MATRIX="$PROJECT_DIR/config/search_matrix.json"
 LOG_DIR="$PROJECT_DIR/logs/daily"

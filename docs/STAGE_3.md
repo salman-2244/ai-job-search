@@ -24,8 +24,10 @@ repo, and treats every Telegram message as untrusted input.
    refuses to start the bot in that configuration.
 2. **Your numeric Telegram user id** (the chat id is the same number for a
    direct chat). Get it from `@userinfobot` or `@getmyid_bot`.
-3. Python 3.10+ with `python-telegram-bot` installed (see
-   `docs/STAGE_3_HANDOFF.md` §6 for the pinned versions).
+3. Python 3.10+ with the exact Stage 3 dependencies installed:
+   `pip install -r requirements-stage3.txt` (`python-telegram-bot==22.8` and
+   `playwright==1.62.0`; Playwright is optional at runtime unless tier 3 is enabled).
+   Scheduling uses the repository's own parser, not `croniter`.
 
 ## 2. Create the env file (outside the repo — never commit it)
 
@@ -72,6 +74,7 @@ minute.
 | Command | What it does |
 |---|---|
 | `/start` | Greet and show the command summary. |
+| `/help` | Show the same complete command summary without starting a run. |
 | `/health` or `/ping` | Confirm command reception and report non-sensitive uptime, active-run state, and schedule count. |
 | `/status` | Show live in-memory progress, including safely restored progress after a bot restart; when idle, show selected fields from the latest manifest. |
 | `/run [geo] [count]` | Start a run. Missing pieces come through inline keyboards (geo, then count 5/10/20/25/custom). |
@@ -79,7 +82,8 @@ minute.
 | `/schedule <YYYY-MM-DDTHH:MM> [geo] [count] [tz=Zone]` | One-shot run at a wall-clock time. |
 | `/schedule_recurring <min hr dom mon dow> [geo] [count] [tz=Zone]` | Five-field cron, e.g. `/schedule_recurring 0 8 * * 1-5 Germany 10`. |
 | `/list_schedules` | Sanitized list of stored schedules with their ids. |
-| `/cancel_schedule <id>` | Disable a schedule by its short id (`s` + 4 hex). |
+| `/cancel_schedule <id>` | Remove a schedule by its short id (`s` + 4 hex). |
+| `/unschedule [id]` | Remove the supplied schedule; without an id, list schedules so you can choose one. |
 
 Examples:
 
@@ -89,6 +93,8 @@ Examples:
 /run Germany 10          # starts immediately, 10 jobs, Germany-scoped
 /schedule 2026-09-09T08:30 Netherlands 15 tz=Europe/Amsterdam
 /schedule_recurring 0 8 * * 1-5 15
+/unschedule                 # lists schedule ids
+/unschedule s1a2b           # removes that schedule
 ```
 
 Every command and callback passes `Stage3Config.is_authorised` first; an
@@ -173,6 +179,14 @@ existing state without opening a browser.
 
 ## 8. Stopping and deploying
 
+- Install or refresh the repository's two launchd jobs with
+  `scripts/install_scheduler.sh`. The installer resolves the physical checkout
+  containing itself (including worktrees and paths with spaces), selects
+  `STAGE3_PYTHON`, `.venv/bin/python`, or `python3` in that order, renders both
+  source plist templates into `~/Library/LaunchAgents`, and loads them. The
+  installed plist and launchd log files are forced to mode `0600`; source
+  templates deliberately contain placeholders rather than one developer's
+  checkout path. Use `LAUNCH_AGENTS_DIR` only for isolated installation tests.
 - Stop the bot with Ctrl-C (or `kill -TERM` on the `python -m stage_3.bot`
   process). The pipeline runs in its own process group and keeps writing its
   run-scoped `pipeline.log`; on bot restart, the exact process identity must

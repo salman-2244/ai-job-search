@@ -129,8 +129,19 @@ def _load_geos(repo: Path) -> list[str]:
 async def start(update, context) -> None:
     if not await _authorised(update, context):
         return
+    await _send_help(update)
+
+
+async def help_command(update, context) -> None:
+    if not await _authorised(update, context):
+        return
+    await _send_help(update)
+
+
+async def _send_help(update) -> None:
     await update.effective_message.reply_text(
         "👋 <b>Job search control</b>\n\n"
+        "/help — show this command summary\n"
         "/run [geo] [count] — start a run now (e.g. <code>/run Germany 10</code>)\n"
         "/status — live progress or the last run's outcome\n"
         "/health — bot uptime, active run, and schedule count\n"
@@ -139,7 +150,8 @@ async def start(update, context) -> None:
         "/schedule &lt;YYYY-MM-DDTHH:MM&gt; [geo] [count] [tz=Zone] — one-shot\n"
         "/schedule_recurring &lt;min hr dom mon dow&gt; [geo] [count] [tz=Zone]\n"
         "/list_schedules — show saved schedules\n"
-        "/cancel_schedule &lt;id&gt; — remove one\n\n"
+        "/cancel_schedule &lt;id&gt; — remove one\n"
+        "/unschedule [id] — remove one, or list schedules when id is omitted\n\n"
         "Documents are written to disk only — nothing is sent here as a file.\n"
         "Times default to UTC; set <code>tz=Europe/Berlin</code> to change that.",
         parse_mode=ParseMode.HTML,
@@ -535,8 +547,18 @@ async def schedule_recurring(update, context) -> None:
         parse_mode=ParseMode.HTML)
 
 
-async def list_schedules(update, context) -> None:
+async def unschedule(update, context) -> None:
+    """Remove a schedule by id, or list ids when none was supplied."""
     if not await _authorised(update, context):
+        return
+    if not context.args:
+        await list_schedules(update, context, authorised=True)
+        return
+    await _remove_schedule(update, context, context.args[0], verb="unschedule")
+
+
+async def list_schedules(update, context, *, authorised: bool = False) -> None:
+    if not authorised and not await _authorised(update, context):
         return
     store: ScheduleStore = context.bot_data["schedules"]
     try:
@@ -563,11 +585,14 @@ async def list_schedules(update, context) -> None:
 async def cancel_schedule(update, context) -> None:
     if not await _authorised(update, context):
         return
-    store: ScheduleStore = context.bot_data["schedules"]
     if not context.args:
         await update.effective_message.reply_text("Usage: /cancel_schedule <id>")
         return
-    target = context.args[0]
+    await _remove_schedule(update, context, context.args[0], verb="cancel")
+
+
+async def _remove_schedule(update, context, target: str, *, verb: str) -> None:
+    store: ScheduleStore = context.bot_data["schedules"]
     try:
         records = store.load()
         remaining = [record for record in records if record.id != target]
@@ -582,7 +607,8 @@ async def cancel_schedule(update, context) -> None:
             f"⚠️ Could not cancel: {html.escape(str(exc))}")
         return
     await update.effective_message.reply_text(
-        f"🗑 Cancelled schedule <code>{html.escape(target)}</code>.",
+        f"🗑 {'Removed' if verb == 'unschedule' else 'Cancelled'} schedule "
+        f"<code>{html.escape(target)}</code>.",
         parse_mode=ParseMode.HTML)
 
 
@@ -732,6 +758,7 @@ def build_application(config: Stage3Config, orchestrator, schedules: ScheduleSto
         "started_monotonic": time.monotonic(),
     })
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("health", health))
     application.add_handler(CommandHandler("ping", health))
     application.add_handler(CommandHandler("status", status))
@@ -741,6 +768,7 @@ def build_application(config: Stage3Config, orchestrator, schedules: ScheduleSto
     application.add_handler(CommandHandler("schedule_recurring", schedule_recurring))
     application.add_handler(CommandHandler("list_schedules", list_schedules))
     application.add_handler(CommandHandler("cancel_schedule", cancel_schedule))
+    application.add_handler(CommandHandler("unschedule", unschedule))
     application.add_handler(CallbackQueryHandler(geo_callback, pattern=r"^geo:\d+$"))
     application.add_handler(CallbackQueryHandler(count_callback, pattern=r"^count:\d+$"))
     application.add_handler(CallbackQueryHandler(custom_callback, pattern=r"^custom$"))

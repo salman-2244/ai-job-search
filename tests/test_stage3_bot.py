@@ -1,29 +1,19 @@
 """Task 6 bot tests: fake updates drive the real handlers, offline.
 
-python-telegram-bot is only imported by `stage_3.bot`, so these tests run under
-the main repo's venv interpreter. Coroutines are driven with an explicit loop
-helper instead of pytest-asyncio (not installed; deliberate).
+python-telegram-bot is imported eagerly by `stage_3.bot`, so the selected test
+interpreter must have the exactly pinned Stage 3 dependencies installed.
+Coroutines are driven with an explicit loop helper instead of pytest-asyncio
+(not installed; deliberate).
 
 The handlers must treat `update`/`context` duck-typed: every attribute they read
 exists on the fakes below, and nothing PTB-specific is poked.
 """
-import sys
-
-# Stage 3's bot is the one module that imports telegram eagerly; all other
-# stage_3 modules compile cleanly under system python3 and their tests run there.
-# Keep the venv as the runner for this file only and note it explicitly.
-_sys_path = sys.path.copy()
-try:
-    sys.path.append("/Users/salman/Projects/ai-job-search/.venv/lib/python3.10/site-packages")
-    import telegram  # noqa: F401 — ensures the venv path was correct
-finally:
-    sys.path = _sys_path
-
 import asyncio
 import json
 from datetime import datetime, timezone
 
 import pytest
+import telegram  # noqa: F401 — fail clearly when Stage 3 dependencies are absent
 
 from stage_3.bot import (
     build_application,
@@ -34,6 +24,7 @@ from stage_3.bot import (
     count_callback,
     custom_count_text,
     health,
+    help_command,
     list_schedules,
     _start_background_tasks,
     _stop_background_tasks,
@@ -43,6 +34,7 @@ from stage_3.bot import (
     scheduler_tick,
     start,
     status,
+    unschedule,
     restore_active_run,
 )
 from stage_3.config import Stage3Config
@@ -231,6 +223,17 @@ def test_start_greets_and_lists_commands(tmp_path):
     text = update.message.replies[0][0]
     for command in ("/run", "/status", "/cancel", "/schedule"):
         assert command in text
+
+
+def test_help_is_authorized_and_lists_new_commands(tmp_path):
+    denied = FakeUpdate(message=FakeMessage("/help"), user_id=999)
+    run_coro(help_command(denied, FakeContext(tmp_path)))
+    assert "not authorized" in denied.message.replies[0][0].lower()
+
+    update = FakeUpdate(message=FakeMessage("/help"))
+    run_coro(help_command(update, FakeContext(tmp_path)))
+    text = update.message.replies[0][0]
+    assert "/help" in text and "/unschedule" in text
 
 
 # -- /run -------------------------------------------------------------------
@@ -473,6 +476,91 @@ def test_cancel_schedule_unknown_id_is_reported(tmp_path):
     assert "no schedule" in update.message.replies[0][0].lower()
 
 
+def test_unschedule_without_id_lists_saved_schedules(tmp_path):
+    context = FakeContext(tmp_path)
+    context.bot_data["schedules"].save([
+        Schedule(id="s1", kind="once", expression="2026-09-10T08:30",
+                 geo=None, job_count=10, timezone="UTC")
+    ])
+    update = FakeUpdate(message=FakeMessage("/unschedule"))
+    run_coro(unschedule(update, context))
+    assert "s1" in update.message.replies[0][0]
+
+
+def test_unschedule_removes_known_id_and_reports_unknown(tmp_path):
+    context = FakeContext(tmp_path)
+    context.bot_data["schedules"].save([
+        Schedule(id="s1", kind="once", expression="2026-09-10T08:30",
+                 geo=None, job_count=10, timezone="UTC")
+    ])
+    removed = FakeUpdate(message=FakeMessage("/unschedule s1"))
+    context.args = ["s1"]
+    run_coro(unschedule(removed, context))
+    assert context.bot_data["schedules"].load() == []
+    assert "removed" in removed.message.replies[0][0].lower()
+
+    unknown = FakeUpdate(message=FakeMessage("/unschedule nope"))
+    context.args = ["nope"]
+    run_coro(unschedule(unknown, context))
+    assert "no schedule" in unknown.message.replies[0][0].lower()
+
+
+def test_unauthorized_unschedule_cannot_remove_schedule(tmp_path):
+    context = FakeContext(tmp_path)
+    context.bot_data["schedules"].save([
+        Schedule(id="s1", kind="once", expression="2026-09-10T08:30",
+                 geo=None, job_count=10, timezone="UTC")
+    ])
+    update = FakeUpdate(message=FakeMessage("/unschedule s1"), user_id=999)
+    context.args = ["s1"]
+    run_coro(unschedule(update, context))
+    assert [record.id for record in context.bot_data["schedules"].load()] == ["s1"]
+
+
+def test_unschedule_persistence_failure_is_reported_without_success(tmp_path):
+    record = Schedule(id="s1", kind="once", expression="2026-09-10T08:30",
+                      geo=None, job_count=10, timezone="UTC")
+
+    class SaveFailingStore:
+        def load(self):
+            return [record]
+
+        def save(self, records):
+            from stage_3.schedules import ScheduleStoreError
+
+            raise ScheduleStoreError("synthetic persistence failure")
+
+    context = FakeContext(tmp_path, store=SaveFailingStore())
+    context.args = ["s1"]
+    update = FakeUpdate(message=FakeMessage("/unschedule s1"))
+    run_coro(unschedule(update, context))
+
+    text = update.message.replies[0][0].lower()
+    assert "could not cancel" in text
+    assert "removed schedule" not in text
+
+
+def test_all_expected_commands_are_registered(tmp_path):
+    application = build_application(
+        SYNTHETIC_CONFIG,
+        FakeOrchestrator(),
+        ScheduleStore(tmp_path / "commands.json"),
+        geos=GEOS,
+    )
+    commands = {
+        command
+        for group in application.handlers.values()
+        for handler in group
+        if hasattr(handler, "commands")
+        for command in handler.commands
+    }
+    assert commands == {
+        "start", "help", "health", "ping", "status", "run", "cancel",
+        "schedule", "schedule_recurring", "list_schedules",
+        "cancel_schedule", "unschedule",
+    }
+
+
 # -- scheduler tick ----------------------------------------------------------
 
 
@@ -668,8 +756,9 @@ def test_build_application_registers_every_command():
             if commands:
                 registered.update(commands)
     assert registered == {
-        "start", "health", "ping", "status", "run", "cancel", "schedule",
-        "schedule_recurring", "list_schedules", "cancel_schedule",
+        "start", "help", "health", "ping", "status", "run", "cancel",
+        "schedule", "schedule_recurring", "list_schedules", "cancel_schedule",
+        "unschedule",
     }
     assert app.bot_data["geos"] == GEOS
     assert isinstance(app.bot_data["schedules"], ScheduleStore)
