@@ -774,7 +774,7 @@ def _delivery_completed(future: Future, *, chat_id: int, preview: str) -> None:
 def _wire_notifications(application: Application, orchestrator: Orchestrator,
                         config: Stage3Config, loop) -> object:
     """Install the production monitor-thread to Telegram-loop callback."""
-    def notify(text: str) -> None:
+    def notify(text: str) -> Future:
         prepared = prepare_telegram_text(text)
         preview = safe_preview(prepared)
         LOGGER.info(
@@ -793,6 +793,7 @@ def _wire_notifications(application: Application, orchestrator: Orchestrator,
                 done, chat_id=config.chat_id, preview=preview,
             )
         )
+        return future
 
     LOGGER.info(
         "installing notification callback callback=%s",

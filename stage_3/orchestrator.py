@@ -24,6 +24,9 @@ Security posture:
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import inspect
 import json
 import logging
 import os
@@ -955,17 +958,11 @@ class Orchestrator:
             pass
 
     def _notify_text(self, handle, text: str, *, terminal: bool = False) -> None:
-        """Send a best-effort notice; deduplicate only terminal outcomes."""
-        if terminal:
-            if handle._manifest.get("terminal_notified"):
-                return
-            handle._manifest["terminal_notified"] = True
-            try:
-                atomic_json_write(handle.manifest_path, handle._manifest)
-            except OSError:
-                pass
+        """Send a best-effort notice; confirm terminal delivery before deduping."""
+        if terminal and handle._manifest.get("terminal_notified"):
+            return
         if self._notify is None:
-            self._logger.warning(
+            self._logger.error(
                 "notification callback unavailable terminal=%s preview=%s",
                 terminal, safe_preview(text),
             )
@@ -975,12 +972,23 @@ class Orchestrator:
             callable_reference(self._notify), terminal, safe_preview(text),
         )
         try:
-            self._notify(text)
-        except Exception as exc:
+            outcome = self._notify(text)
+            if isinstance(outcome, concurrent.futures.Future):
+                outcome.result()
+            elif inspect.isawaitable(outcome):
+                asyncio.run(outcome)
+        except (Exception, concurrent.futures.CancelledError) as exc:
             self._logger.exception(
-                "notification callback raised exception_type=%s preview=%s",
+                "notification delivery failed exception_type=%s preview=%s",
                 type(exc).__name__, safe_preview(text),
             )
+            return
+        if terminal:
+            handle._manifest["terminal_notified"] = True
+            try:
+                atomic_json_write(handle.manifest_path, handle._manifest)
+            except OSError:
+                pass
 
     def _emit(self, handle, kind: str, state: RunState) -> None:
         with handle._cb_lock:

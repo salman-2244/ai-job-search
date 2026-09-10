@@ -43,11 +43,10 @@ async def _exercise_callback(bot, texts):
         allowed_user_ids=(42,),
     )
     _wire_notifications(application, orchestrator, config, asyncio.get_running_loop())
-    for text in texts:
-        orchestrator.notify(text)
+    futures = [orchestrator.notify(text) for text in texts]
     await asyncio.sleep(0)
     await asyncio.sleep(0)
-    return bot.calls
+    return bot.calls, futures
 
 
 def test_notification_adapter_delivers_terminal_outcomes_and_limits_text():
@@ -58,9 +57,11 @@ def test_notification_adapter_delivers_terminal_outcomes_and_limits_text():
         "<untrusted>" + "x" * TELEGRAM_TEXT_LIMIT,
     ]
 
-    calls = asyncio.run(_exercise_callback(AsyncBot(), texts))
+    calls, futures = asyncio.run(_exercise_callback(AsyncBot(), texts))
 
     assert [chat_id for chat_id, _ in calls] == [42] * len(texts)
+    assert all(isinstance(future, concurrent.futures.Future) for future in futures)
+    assert all(future.done() and future.exception() is None for future in futures)
     assert [text for _, text in calls[:3]] == texts[:3]
     assert len(calls[-1][1]) == TELEGRAM_TEXT_LIMIT
     assert calls[-1][1].endswith("… [truncated by Stage 3]")

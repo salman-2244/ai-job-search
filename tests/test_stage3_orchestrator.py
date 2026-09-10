@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import json
 import os
 import signal
@@ -276,6 +278,77 @@ def test_set_notify_rejects_non_callable():
     orchestrator, _, _ = make_orchestrator()
     with pytest.raises(TypeError, match="callable"):
         orchestrator.set_notify(None)
+
+
+def _completed_run(tmp_path, notify=None, run_id="notify-run"):
+    orchestrator, _, _ = make_orchestrator(
+        lines=["[10:00:00] Pipeline complete.\n"],
+    )
+    if notify is not None:
+        orchestrator.set_notify(notify)
+    handle = orchestrator.start(
+        request(tmp_path, run_id=run_id),
+        state_root=tmp_path,
+        today="2026-09-08",
+    )
+    result = wait_for(handle)
+    return orchestrator, handle, result
+
+
+def test_terminal_notification_without_callback_remains_unconfirmed(tmp_path):
+    _, _, result = _completed_run(tmp_path)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is False
+
+
+def test_terminal_notification_sync_success_is_confirmed_and_deduplicated(tmp_path):
+    notifications = []
+    orchestrator, handle, result = _completed_run(tmp_path, notifications.append)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is True
+    orchestrator._notify_text(handle, "duplicate terminal", terminal=True)
+    assert len(notifications) == 1
+
+
+def test_terminal_notification_sync_exception_remains_unconfirmed(tmp_path):
+    def fail(_text):
+        raise RuntimeError("synthetic delivery failure")
+
+    _, _, result = _completed_run(tmp_path, fail)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is False
+
+
+@pytest.mark.parametrize("completion", ["exception", "cancelled"])
+def test_terminal_notification_async_failure_remains_unconfirmed(tmp_path, completion):
+    future = concurrent.futures.Future()
+    if completion == "exception":
+        future.set_exception(RuntimeError("synthetic async delivery failure"))
+    else:
+        future.cancel()
+
+    _, _, result = _completed_run(tmp_path, lambda _text: future)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is False
+
+
+def test_terminal_notification_future_success_is_confirmed(tmp_path):
+    future = concurrent.futures.Future()
+    future.set_result(object())
+
+    _, _, result = _completed_run(tmp_path, lambda _text: future)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is True
+
+
+def test_terminal_notification_coroutine_success_is_confirmed(tmp_path):
+    async def deliver(_text):
+        await asyncio.sleep(0)
+        return object()
+
+    _, _, result = _completed_run(tmp_path, deliver)
+
+    assert json.loads(result.manifest.read_text())["terminal_notified"] is True
 
 
 def test_notification_callback_actually_invoked_for_terminal_outcomes(tmp_path):
