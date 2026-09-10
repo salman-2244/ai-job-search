@@ -351,6 +351,62 @@ class RunDailyThreading(TempDirCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(log_path.stat().st_mode & 0o777, 0o600)
 
+    def test_critical_failures_survive_optional_reporting_and_cleanup(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('PIPELINE_EXIT=0', text)
+        self.assertIn('record_critical_failure "$RANK_EXIT" "Ranking failed', text)
+        self.assertIn('record_critical_failure 124 "Ranking timed out', text)
+        self.assertIn('record_critical_failure 1 "Application generation handoff failed', text)
+        self.assertIn('python3 scripts/aggregate_jobs.py "${PORTAL_FILES[@]}"', text)
+        self.assertIn('record_critical_failure "$FETCH_EXIT" "Fetching failed', text)
+        self.assertIn(
+            'Phase 1b: SKIPPED — fetch failed; preserving the empty corpus for the optional report',
+            text,
+        )
+        self.assertIn('if (( PIPELINE_EXIT != 0 )); then\n    SHORTLIST_JOBS=0', text)
+        self.assertIn('if (( PIPELINE_EXIT == 0 )); then\n        log "Pipeline complete."', text)
+        self.assertIn('exit "$PIPELINE_EXIT"', text)
+
+    def test_optional_report_failure_does_not_change_pipeline_outcome(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('REPORT_EXIT=0', text)
+        self.assertIn("PYTHON_SCRIPT\n\nif (( REPORT_EXIT == 0 )); then", text)
+        self.assertIn('record_optional_failure "Phase 5 report generation failed', text)
+        self.assertNotIn('record_critical_failure "$REPORT_EXIT"', text)
+
+    def test_pipeline_outcome_helpers_keep_first_critical_failure(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        start = text.index("# === Pipeline outcome ===")
+        end = text.index("# === Telegram ping ===")
+        helpers = text[start:end]
+        script = helpers + r'''
+log() { printf '%s\n' "$*"; }
+record_critical_failure 73 "ranking exhausted"
+record_critical_failure 74 "application handoff failed"
+record_optional_failure "report unavailable"
+finish_pipeline
+'''
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 73)
+        self.assertIn("WARNING: report unavailable", proc.stdout)
+        self.assertIn("Pipeline FAILED: ranking exhausted", proc.stdout)
+        self.assertNotIn("Pipeline complete.", proc.stdout)
+
+    def test_pipeline_outcome_helpers_preserve_full_success(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        start = text.index("# === Pipeline outcome ===")
+        end = text.index("# === Telegram ping ===")
+        helpers = text[start:end]
+        script = helpers + r'''
+log() { printf '%s\n' "$*"; }
+record_optional_failure "report unavailable"
+finish_pipeline
+'''
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("WARNING: report unavailable", proc.stdout)
+        self.assertIn("Pipeline complete.", proc.stdout)
+
     def test_job_count_cut_and_handoff_threading_present(self):
         text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
         # The Phase 1b-final cut (guarded, array-safe expansion — the plain

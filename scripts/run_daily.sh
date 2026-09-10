@@ -187,6 +187,35 @@ log() {
     echo "[$ts] $*" | tee -a "$LOG_FILE"
 }
 
+# === Pipeline outcome ===
+# Critical phases may fail before the optional report is generated. Keep their first
+# failure as the process outcome while still allowing reporting and cleanup to run.
+PIPELINE_EXIT=0
+CRITICAL_FAILURE=""
+
+record_critical_failure() {
+    local code="$1"
+    shift
+    if (( PIPELINE_EXIT == 0 )); then
+        PIPELINE_EXIT="$code"
+        CRITICAL_FAILURE="$*"
+    fi
+}
+
+record_optional_failure() {
+    log "WARNING: $*"
+}
+
+finish_pipeline() {
+    if (( PIPELINE_EXIT == 0 )); then
+        log "Pipeline complete."
+    else
+        log "Pipeline FAILED: ${CRITICAL_FAILURE:-critical phase failed}"
+    fi
+    log "=== End of Run ==="
+    return "$PIPELINE_EXIT"
+}
+
 # === Telegram ping ===
 # Called from the EXIT trap rather than after "Pipeline complete", so a hard
 # failure reports itself too. The 08:00 run on 2026-08-22 sat six hours in a
@@ -551,17 +580,36 @@ fi
 # decides how many files exist, so an explicit list would silently drop the rest.
 log "Aggregating results..."
 PORTAL_FILES=(/tmp/jobsearch_portal_*_${TODAY}.json)
+FETCH_EXIT=0
 if [[ ! -e "${PORTAL_FILES[0]}" ]]; then
-    log "FATAL: no portal output files found — Phase 1 produced nothing"
-    exit 1
+    FETCH_EXIT=1
+    record_critical_failure "$FETCH_EXIT" "Fetching failed: Phase 1 produced no portal output"
+    log "Phase 1 FAILED: no portal output files found"
+    echo '{"meta":{"unique":0},"results":[]}' > "$JOBS_FILE"
+else
+    log "  aggregating ${#PORTAL_FILES[@]} portal output files"
+    python3 scripts/aggregate_jobs.py "${PORTAL_FILES[@]}" > "$JOBS_FILE" 2>>"$LOG_FILE" || FETCH_EXIT=$?
+    if (( FETCH_EXIT != 0 )); then
+        record_critical_failure "$FETCH_EXIT" "Fetching failed while aggregating portal output"
+        log "Phase 1 FAILED: aggregation exited $FETCH_EXIT"
+        echo '{"meta":{"unique":0},"results":[]}' > "$JOBS_FILE"
+    fi
 fi
-log "  aggregating ${#PORTAL_FILES[@]} portal output files"
-python3 scripts/aggregate_jobs.py "${PORTAL_FILES[@]}" > "$JOBS_FILE" 2>>"$LOG_FILE"
 
 TOTAL_JOBS=$(python3 -c "import json; print(json.load(open('$JOBS_FILE'))['meta']['unique'])" 2>/dev/null || echo "0")
-log "Phase 1 complete: $TOTAL_JOBS unique jobs fetched"
+if (( FETCH_EXIT == 0 )); then
+    log "Phase 1 complete: $TOTAL_JOBS unique jobs fetched"
+fi
 
 fi  # end of the RESUME=1 branch opened before Phase 1
+
+if (( PIPELINE_EXIT != 0 )); then
+    log "Phase 1b: SKIPPED — fetch failed; preserving the empty corpus for the optional report"
+    echo '{"meta":{"unique":0},"results":[]}' > "$RANKSET_FILE"
+    echo '{"meta":{"unique":0},"results":[]}' > "$SHORTLIST_FILE"
+    echo '[]' > "$DEFERRED_FILE"
+    echo '{}' > "$PRERANK_FILE"
+fi
 
 # === Phase 1b: choose which fetched jobs are worth Phase 2's model pass ===
 # Fetching stays broad — coverage is unchanged — but the model ranker costs ~24s per
@@ -597,7 +645,9 @@ fi  # end of the RESUME=1 branch opened before Phase 1
 # costs no portal requests, so this does not violate the resume contract. An existing
 # rankset is reused rather than rebuilt: it carries the enrichment the earlier run
 # already paid LinkedIn requests for, and rebuilding from $JOBS_FILE would lose it.
-if [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
+if (( PIPELINE_EXIT != 0 )); then
+    : # Fetch failed above; synthetic artifacts let the optional report account for it.
+elif [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
     log "Phase 1b: SKIPPED (RESUME=1) — reusing the rankset at $RANKSET_FILE"
 else
     log "Phase 1b (shortlist): cutting $TOTAL_JOBS fetched jobs down to a wide shortlist..."
@@ -617,7 +667,9 @@ fi
 # No --deferred on the shortlist stage. The deferred list is written once, by the final
 # stage, from the corpus — so it accounts for the jobs cut at *both* stages. A deferred
 # file written here would be overwritten by a shorter, wronger one anyway.
-if [[ "$RESUME" != "1" || ! -s "$RANKSET_FILE" ]]; then
+if (( PIPELINE_EXIT != 0 )); then
+    SHORTLIST_JOBS=0
+elif [[ "$RESUME" != "1" || ! -s "$RANKSET_FILE" ]]; then
     if [[ ! -s "$SHORTLIST_FILE" ]]; then
         log "FATAL: Phase 1b (shortlist) left no shortlist at $SHORTLIST_FILE"
         exit 1
@@ -907,6 +959,7 @@ if (( RANK_TIMED_OUT == 1 )); then
     # gate evaluates nothing rather than half a record — and warn, because a ranker
     # that was killed must never read as "nothing qualified today".
     RANKED_COUNT=0
+    record_critical_failure 124 "Ranking timed out after ${RANK_TIMEOUT}s"
     echo "[]" > "$TOP5_FILE"
     echo "Ranking did not finish within ${RANK_TIMEOUT}s and was stopped, so no jobs were scored and no CVs or cover letters were generated. It was not retried: a second attempt would spend the same ${RANK_TIMEOUT}s on the same corpus. The $TOTAL_JOBS fetched jobs are unaffected. Either shrink the corpus handed to the ranker or raise RANK_TIMEOUT." >> "$WARN_FILE"
 elif (( RANK_EXIT == 0 )); then
@@ -925,6 +978,7 @@ print(len(data) if data is not None else 0)
     fi
 else
     RANKED_COUNT=0
+    record_critical_failure "$RANK_EXIT" "Ranking failed after ${RANK_ATTEMPT} attempt(s)"
     # Keep the failing stdout before overwriting it. The 2026-08-23 run replaced the
     # only copy of the ranker's output with "[]", which is why that failure had to be
     # diagnosed from a timestamp and an exit code.
@@ -1021,6 +1075,7 @@ if (( SELECTED_JOBS > 0 )); then
     if launchctl kickstart -k "$SELECTOR_LABEL" 2>>"$LOG_FILE"; then
         log "Phase 3 complete: selector started; awaiting selection on Telegram"
     else
+        record_critical_failure 1 "Application generation handoff failed: selector did not start"
         log "Phase 3 FAILED: could not start $SELECTOR_LABEL"
         echo "The ranked list could not be sent for selection: launchctl could not start $SELECTOR_LABEL. The ranking is intact in this report, and \`launchctl kickstart -k $SELECTOR_LABEL\` will send the list once the job is loaded. Until then no CVs or cover letters will be produced." >> "$WARN_FILE"
     fi
@@ -1071,8 +1126,9 @@ fi
 # === Phase 5: Generate Report ===
 log "Phase 5: Generating report..."
 
+REPORT_EXIT=0
 python3 - "$TODAY" "$JOBS_FILE" "$TOP5_FILE" "$APPLICABLE_FILE" "$QA_FILE" "$REPORT_FILE" \
-    "$NOT_DRAFTED_FILE" "$WARN_FILE" "$PRERANK_FILE" "$ALERT_JOBS_FILE" <<'PYTHON_SCRIPT'
+    "$NOT_DRAFTED_FILE" "$WARN_FILE" "$PRERANK_FILE" "$ALERT_JOBS_FILE" <<'PYTHON_SCRIPT' || REPORT_EXIT=$?
 import json
 import re
 import sys
@@ -1449,7 +1505,11 @@ with open(report_file, "w") as f:
 print(f"Report written to {report_file}")
 PYTHON_SCRIPT
 
-log "Phase 5 complete: $REPORT_FILE"
+if (( REPORT_EXIT == 0 )); then
+    log "Phase 5 complete: $REPORT_FILE"
+else
+    record_optional_failure "Phase 5 report generation failed (exit $REPORT_EXIT); critical pipeline outcome unchanged"
+fi
 
 # === Phase 6: retired ===
 # The digest used to be mailed here, with the generated PDFs attached. Both halves
@@ -1512,5 +1572,5 @@ else
     find /tmp -maxdepth 1 -name 'jobsearch_rank_failed_stdout_*.txt' -mtime +3 -delete 2>/dev/null || true
 fi
 
-log "Pipeline complete."
-log "=== End of Run ==="
+finish_pipeline
+exit "$PIPELINE_EXIT"

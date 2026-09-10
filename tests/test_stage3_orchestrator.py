@@ -323,6 +323,24 @@ def test_failing_run_is_classified_not_completed(tmp_path):
     assert manifest["resumable"] is True
 
 
+def test_complete_marker_cannot_override_nonzero_process_exit(tmp_path):
+    lines = [
+        "[10:00:00] Phase 1 complete: 5 unique jobs fetched\n",
+        "[10:01:00] Pipeline complete.\n",
+    ]
+    orchestrator, _, _ = make_orchestrator(lines=lines, exit_code=73)
+    result = wait_for(
+        orchestrator.start(request(tmp_path), state_root=tmp_path, today="2026-09-08")
+    )
+    manifest = json.loads(result.manifest.read_text())
+    assert result.state.complete is True
+    assert result.status == "failed"
+    assert result.exit_code == 73
+    assert manifest["status"] == "failed"
+    assert manifest["exit_code"] == 73
+    assert manifest["resumable"] is True
+
+
 def test_job_count_is_bounded(tmp_path):
     orchestrator, _, _ = make_orchestrator()
     with pytest.raises(RunRefusedError):
