@@ -598,7 +598,10 @@ class Orchestrator:
                     "Concurrent runs are refused, not queued — /cancel it first."
                 )
             run_dir = state_root / date / run_id
-            run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(state_root, 0o700)
+            os.chmod(run_dir.parent, 0o700)
+            os.chmod(run_dir, 0o700)
             handle = RunHandle(run_id, run_dir / "manifest.json")
             handle._manifest = self._initial_manifest(request, run_id, date)
             try:

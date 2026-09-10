@@ -3,6 +3,7 @@ import concurrent.futures
 import json
 import os
 import signal
+import stat
 import subprocess
 import threading
 from datetime import datetime, timezone
@@ -220,6 +221,21 @@ def test_successful_run_projects_log_into_state_and_manifest(tmp_path):
     assert result.manifest.parent == tmp_path / "2026-09-08" / result.run_id
     log_text = (result.manifest.parent / "pipeline.log").read_text()
     assert "Phase 1 complete" in log_text
+
+
+def test_new_run_state_directories_are_owner_only(tmp_path):
+    orchestrator, _, _ = make_orchestrator(
+        lines=["[10:00:00] Pipeline complete.\n"],
+    )
+
+    handle = orchestrator.start(
+        request(tmp_path), state_root=tmp_path, today="2026-09-08"
+    )
+    result = wait_for(handle)
+
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE((tmp_path / "2026-09-08").stat().st_mode) == 0o700
+    assert stat.S_IMODE(result.manifest.parent.stat().st_mode) == 0o700
 
 
 def test_run_environment_carries_run_id_count_geo_and_no_token(tmp_path):
