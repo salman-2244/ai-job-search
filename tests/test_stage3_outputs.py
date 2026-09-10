@@ -490,6 +490,45 @@ rank_attempt() {{
         self.assertIn('RANK_MODEL="$RANK_FALLBACK_MODEL"', text)
         self.assertNotIn("claude-opus-5-thinking", text)
 
+    def test_ranking_invokes_direct_api_helper_without_secrets_in_argv(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        phase2 = text[
+            text.index("# === Phase 2:") : text.index("# === Phase 2b:")
+        ]
+        self.assertIn('python3 "$PROJECT_DIR/scripts/rank_jobs_api.py"', phase2)
+        self.assertIn('--settings "$PROJECT_SETTINGS"', phase2)
+        self.assertIn('--model "$RANK_MODEL"', phase2)
+        self.assertIn('--jobs "$RANKSET_FILE"', phase2)
+        self.assertIn('--output "$TOP5_FILE"', phase2)
+        self.assertIn('--not-drafted "$NOT_DRAFTED_FILE"', phase2)
+        self.assertNotIn("claude -p", phase2)
+        self.assertNotIn("RANK_CLAUDE_ENV", phase2)
+        self.assertNotIn("$RANK_AUTH_TOKEN", phase2)
+        self.assertNotIn("$RANK_BASE_URL", phase2)
+
+    def test_empty_rankset_skips_the_provider_and_writes_valid_gate_inputs(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        phase2 = text[
+            text.index("# === Phase 2:") : text.index("# === Phase 2b:")
+        ]
+        self.assertIn('if (( SELECTED_JOBS == 0 )); then', phase2)
+        empty_branch = phase2[
+            phase2.index('if (( SELECTED_JOBS == 0 )); then'):
+            phase2.index("\nelse", phase2.index('if (( SELECTED_JOBS == 0 )); then'))
+        ]
+        self.assertIn('printf \'[]\\n\' > "$TOP5_FILE"', empty_branch)
+        self.assertIn('printf \'[]\\n\' > "$NOT_DRAFTED_FILE"', empty_branch)
+        self.assertNotIn("rank_attempt", empty_branch)
+        self.assertNotIn("rank_jobs_api.py", empty_branch)
+
+    def test_ranking_classifies_only_sanitized_helper_stderr(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        classifier = text[
+            text.index("rank_error_class() {") : text.index("\nrank_gateway_error_message")
+        ]
+        self.assertIn('cat "$RANK_ERR_FILE"', classifier)
+        self.assertNotIn("$TOP5_FILE", classifier)
+
     def test_gateway_unavailable_gets_backoff_fallback_and_actionable_error(self):
         text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
         self.assertIn('*"503"*|*"no available channel"*', text)

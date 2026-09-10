@@ -320,17 +320,17 @@ class RankPromptSpecGuards(unittest.TestCase):
                       "a low Career score must be auditable against a named track")
 
     def test_prompt_states_the_document_gate(self):
-        self.assertIn("score >= 75", self.prompt, "gate threshold 75 missing")
-        self.assertIn("alert_matched.json", self.prompt,
-                      "the alert-matched 60 gate must read alert_matched.json")
+        self.assertIn("Strong Fit 75+", self.prompt, "gate threshold 75 missing")
+        self.assertIn("Local alert state is supplied by the wrapper", self.prompt,
+                      "the trusted wrapper must supply authoritative alert state")
 
     def test_prompt_forbids_an_alert_score_bonus(self):
         self.assertIn("Do not add points for it", self.prompt,
                       "alert-match must lower the gate, never add points")
 
     def test_prompt_tolerates_a_missing_alert_file(self):
-        self.assertIn("missing file is normal", self.prompt,
-                      "a missing alert_matched.json must degrade gracefully, not fail the phase")
+        self.assertIn("missing alert store is normal", self.prompt,
+                      "a missing alert store must degrade gracefully, not fail the phase")
 
     def test_prompt_keeps_the_untrusted_posting_rule(self):
         self.assertIn("untrusted data", self.prompt,
@@ -340,9 +340,11 @@ class RankPromptSpecGuards(unittest.TestCase):
         self.assertIn("Do NOT fetch any URLs", self.prompt,
                       "the ranker scores from fetched data only; fetching is /apply's job")
 
-    def test_prompt_writes_the_not_drafted_list(self):
-        self.assertIn("<NOT_DRAFTED_FILE_PATH>", self.prompt,
+    def test_wrapper_derives_the_not_drafted_list_without_filesystem_tools(self):
+        self.assertIn("wrapper also derives the not-drafted list", self.prompt,
                       "Good Fits that miss the gate must stay visible to the user")
+        self.assertIn("no filesystem, browser, network, or external tools", self.prompt)
+        self.assertIn("Do not claim to read, fetch, or write files", self.prompt)
 
 
 class FrameworkAlignment(unittest.TestCase):
@@ -412,6 +414,8 @@ class SandboxGateGuards(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if not SANDBOX_PROMPT.is_file():
+            raise unittest.SkipTest("historical sandbox prompt is not present in this checkout")
         cls.prompt = SANDBOX_PROMPT.read_text(encoding="utf-8")
 
     def at(self, needle):
@@ -571,6 +575,8 @@ class ProductionSpecUntouched(unittest.TestCase):
         """Cheap drift alarm. The sandbox copy started as production plus four path
         lines; anything beyond the gate work means the copies have diverged for a
         reason nobody recorded."""
+        if not SANDBOX_PROMPT.is_file():
+            self.skipTest("historical sandbox prompt is not present in this checkout")
         sandbox = SANDBOX_PROMPT.read_text(encoding="utf-8")
         self.assertIn("manual_run_2026-08-19/seen_jobs.json", sandbox)
         self.assertNotIn("manual_run_2026-08-19/", self.production,

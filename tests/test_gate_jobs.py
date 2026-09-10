@@ -457,8 +457,9 @@ class PipelineWiring(unittest.TestCase):
         self.assertIn('>> "$WARN_FILE"', self.SCRIPT_TEXT)
 
     def test_the_prompt_and_the_code_state_the_same_gate(self):
-        self.assertIn("score >= 75", self.PROMPT)
-        self.assertIn("alert_matched.json", self.PROMPT)
+        self.assertIn("Strong Fit 75+", self.PROMPT)
+        self.assertIn("alert state is supplied by the wrapper", self.PROMPT)
+        self.assertIn("Good Fits that miss the deterministic gate", self.PROMPT)
         self.assertEqual((gate.STRONG_SCORE, gate.MIN_SCORE), (75, 60),
                          "the code's thresholds must match the prompt's wording")
 
@@ -475,17 +476,17 @@ class PipelineWiring(unittest.TestCase):
         """
         self.assertNotIn("Skip any job whose `dedup_key`", self.PROMPT,
                          "the old skip instruction must be gone, not just amended")
-        self.assertIn("Score every job, including ones you have seen before",
-                      self.PROMPT)
+        self.assertIn("Evaluate every supplied job exactly once", self.PROMPT)
 
-    def test_the_prompt_specifies_the_repeat_marker(self):
-        self.assertIn("🔁 seen", self.PROMPT)
-        self.assertIn("runs_ago", self.PROMPT)
-        self.assertIn("rank_date", self.PROMPT)
+    def test_the_wrapper_preserves_repeat_provenance(self):
+        helper = (REPO / "scripts" / "rank_jobs_api.py").read_text()
+        self.assertIn('if "repeat" in job:', helper)
+        self.assertIn('result["repeat"] = job["repeat"]', helper)
 
-    def test_the_prompt_keeps_the_marker_out_of_the_score(self):
-        """A repeat is provenance. Scoring it would re-implement the filter softly."""
-        self.assertIn("Never let a repeat marker", self.PROMPT)
+    def test_the_prompt_keeps_repeat_provenance_out_of_scoring(self):
+        """A repeat is wrapper-owned provenance, not model scoring input."""
+        scoring = self.PROMPT[self.PROMPT.index("## Scoring dimensions"):]
+        self.assertNotIn("repeat", scoring.lower())
 
     def test_the_gate_no_longer_decides_what_gets_drafted(self):
         """SKIP_DRAFT is retired because pipeline-time drafting is retired.

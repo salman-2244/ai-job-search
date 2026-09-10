@@ -174,7 +174,7 @@ if [[ ! -f "$PROJECT_SETTINGS" ]] && command -v git >/dev/null 2>&1; then
         [[ -f "$SHARED_PROJECT_SETTINGS" ]] && PROJECT_SETTINGS="$SHARED_PROJECT_SETTINGS"
     fi
 fi
-read_project_model_setting() {
+read_project_env_setting() {
     local key="$1"
     python3 - "$PROJECT_SETTINGS" "$key" <<'PYTHON_SCRIPT'
 import json
@@ -192,10 +192,13 @@ else:
     print(value if isinstance(value, str) else "")
 PYTHON_SCRIPT
 }
-RANK_PRIMARY_MODEL="${RANK_PRIMARY_MODEL:-$(read_project_model_setting ANTHROPIC_MODEL)}"
-RANK_FALLBACK_MODEL="${RANK_FALLBACK_MODEL:-$(read_project_model_setting ANTHROPIC_FALLBACK_MODEL)}"
+read_project_model_setting() {
+    read_project_env_setting "$1"
+}
+RANK_PRIMARY_MODEL="${RANK_PRIMARY_MODEL:-${ANTHROPIC_MODEL:-$(read_project_model_setting ANTHROPIC_MODEL)}}"
+RANK_FALLBACK_MODEL="${RANK_FALLBACK_MODEL:-${ANTHROPIC_FALLBACK_MODEL:-$(read_project_model_setting ANTHROPIC_FALLBACK_MODEL)}}"
 if [[ -z "$RANK_PRIMARY_MODEL" ]]; then
-    echo "FATAL: ranking model is not configured in project settings (env.ANTHROPIC_MODEL)" >&2
+    echo "FATAL: ranking model is not configured in the environment or project settings" >&2
     exit 1
 fi
 RESUME="${RESUME:-0}"
@@ -896,21 +899,20 @@ if (( SELECTED_JOBS == 0 )); then
     echo "Pre-ranking selected 0 of the $TOTAL_JOBS fetched jobs for deep ranking, so no job was scored today. Since already-seen jobs are re-included rather than skipped, this is no longer routine — read the deferral reasons below. A wall of hard-gate discards means the corpus genuinely did not qualify; anything else points at a vocabulary or config problem." >> "$WARN_FILE"
 fi
 
-# === Phase 2: Rank jobs via Claude Code ===
-log "Phase 2: Ranking jobs via Claude Code..."
+# === Phase 2: Rank jobs via direct Messages API ===
+if (( SELECTED_JOBS == 0 )); then
+    # Keep Phase 2b and the report on their normal paths without paying for an empty
+    # provider request. No seen-state mutation is needed because no job was scored.
+    printf '[]\n' > "$TOP5_FILE"
+    printf '[]\n' > "$NOT_DRAFTED_FILE"
+    RANKED_COUNT=0
+    log "Phase 2: SKIPPED — no selected jobs to score"
+else
+    log "Phase 2: Ranking jobs via direct Messages API..."
 
-# Build the prompt with the file paths injected. Both placeholders must be
-# substituted: the prompt writes its "matched but below the drafting gate" list to
-# <NOT_DRAFTED_FILE_PATH>, so leaving it unsubstituted would create a file with that
-# literal name and lose the list from the report.
-RANK_PROMPT=$(cat prompts/pipeline_phase1_rank.md)
-RANK_PROMPT="${RANK_PROMPT//<JOBS_FILE_PATH>/$RANKSET_FILE}"
-RANK_PROMPT="${RANK_PROMPT//<NOT_DRAFTED_FILE_PATH>/$NOT_DRAFTED_FILE}"
-
-if [[ "$RANK_PROMPT" == *"<JOBS_FILE_PATH>"* || "$RANK_PROMPT" == *"<NOT_DRAFTED_FILE_PATH>"* ]]; then
-    log "FATAL: a placeholder in prompts/pipeline_phase1_rank.md was not substituted"
-    exit 1
-fi
+# The helper owns request construction, strict response validation, and atomic output
+# persistence. This shell retains operational policy: timeout, retries, backoff, model
+# fallback, cancellation, and the final deterministic gate in Phase 2b.
 
 # Run with timeout via background process (macOS has no timeout command)
 #
@@ -928,10 +930,22 @@ fi
 rank_attempt() {
     RANK_EXIT=0
     RANK_TIMED_OUT=0
-    claude -p "$RANK_PROMPT" \
+    rm -f "$TOP5_FILE" "$NOT_DRAFTED_FILE"
+    python3 "$PROJECT_DIR/scripts/rank_jobs_api.py" \
+        --jobs "$RANKSET_FILE" \
+        --output "$TOP5_FILE" \
+        --not-drafted "$NOT_DRAFTED_FILE" \
+        --seen "$PROJECT_DIR/job_scraper/seen_jobs.json" \
+        --alerts "$ALERT_STORE" \
+        --tracker "$PROJECT_DIR/job_search_tracker.csv" \
+        --evaluation "$PROJECT_DIR/.claude/skills/job-application-assistant/04-job-evaluation.md" \
+        --profile "$PROJECT_DIR/.claude/skills/job-application-assistant/01-candidate-profile.md" \
+        --prompt "$PROJECT_DIR/prompts/pipeline_phase1_rank.md" \
+        --settings "$PROJECT_SETTINGS" \
         --model "$RANK_MODEL" \
-        --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Agent" \
-        --output-format text < /dev/null 2>>"$RANK_ERR_FILE" > "$TOP5_FILE" &
+        --today "$TODAY" \
+        --request-timeout "$RANK_TIMEOUT" \
+        < /dev/null 2>>"$RANK_ERR_FILE" &
     RANK_PID=$!
 
     local waited=0
@@ -963,11 +977,11 @@ rank_attempt() {
 # An unrecognised failure is treated as transient on purpose. The 2026-08-23 failure
 # this retry exists for wrote nothing to stderr at all, so a classifier that only
 # retried known-transient markers would not have retried the one case that motivated
-# it. Reads stdout too, since the CLI does not always put the error on stderr.
+# it. The helper writes only sanitized diagnostics to stderr; never classify output
+# files, which may contain untrusted posting text.
 rank_error_class() {
     local text=""
     [[ -f "$RANK_ERR_FILE" ]] && text+=$(cat "$RANK_ERR_FILE")
-    [[ -f "$TOP5_FILE" ]] && text+=$(cat "$TOP5_FILE")
     text=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
     case "$text" in
         *"401"*|*"403"*|*"invalid api key"*|*"invalid x-api-key"*|\
@@ -1073,10 +1087,9 @@ else
     else
         record_critical_failure "$RANK_EXIT" "Ranking failed after ${RANK_ATTEMPT} attempt(s)"
     fi
-    # Keep the failing stdout before overwriting it. The 2026-08-23 run replaced the
-    # only copy of the ranker's output with "[]", which is why that failure had to be
-    # diagnosed from a timestamp and an exit code.
-    cp "$TOP5_FILE" "$RANK_FAIL_FILE" 2>/dev/null || true
+    # Preserve sanitized diagnostics for post-run diagnosis before ensuring the gate
+    # receives an empty array.
+    cp "$RANK_ERR_FILE" "$RANK_FAIL_FILE" 2>/dev/null || true
     echo "[]" > "$TOP5_FILE"
     if [[ "$RANK_ERROR_CLASS" == non-retryable* ]]; then
         log "Phase 2 FAILED (exit $RANK_EXIT) on attempt ${RANK_ATTEMPT} — ${RANK_ERROR_CLASS}, not retried — skipping drafting"
@@ -1086,6 +1099,8 @@ else
         echo "The ranking step failed on all ${RANK_ATTEMPT} attempts, the last with exit $RANK_EXIT classified ${RANK_ERROR_CLASS:-unclassified}, so no jobs were scored and no documents were generated. Retries were spent, not skipped — this was not a one-off hiccup. The $TOTAL_JOBS fetched jobs are unaffected; re-run with RESUME=1 to retry the ranking without re-querying the portals. Ranker output: $RANK_ERR_FILE and $RANK_FAIL_FILE." >> "$WARN_FILE"
     fi
 fi
+
+fi  # SELECTED_JOBS > 0
 
 # === Phase 2b: Enforce the document-generation gate ===
 # The ranker is *told* the gate (score >= 75, or >= 60 when LinkedIn's own alert

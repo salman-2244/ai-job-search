@@ -1491,10 +1491,12 @@ class PipelineWiring(unittest.TestCase):
         self.assertLess(aggregate_at, enrich_at,
                         "there is no jobs file to enrich before aggregation")
 
-    def test_the_ranker_prompt_tells_the_model_to_use_the_full_description(self):
-        prompt = (REPO / "prompts" / "pipeline_phase1_rank.md").read_text()
-        self.assertIn("Phase 1c", prompt)
-        self.assertIn("description", prompt)
+    def test_the_ranker_receives_enriched_job_descriptions(self):
+        phase2 = self.SCRIPT_TEXT[self.SCRIPT_TEXT.index("# === Phase 2:"):]
+        self.assertIn('--jobs "$RANKSET_FILE"', phase2)
+        helper = (REPO / "scripts" / "rank_jobs_api.py").read_text()
+        self.assertIn("## Untrusted job postings", helper)
+        self.assertIn("_escaped_json(jobs)", helper)
 
     def test_a_failure_appends_a_warning_the_report_will_show(self):
         """A silent enrichment failure would misread as a thin LinkedIn day."""

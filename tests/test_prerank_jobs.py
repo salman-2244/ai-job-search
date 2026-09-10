@@ -1543,8 +1543,9 @@ class PipelineWiring(unittest.TestCase):
         self.assertNotIn("--no-two-axis", code)
 
     def test_the_ranker_reads_the_rankset_not_the_whole_corpus(self):
-        self.assertIn('RANK_PROMPT="${RANK_PROMPT//<JOBS_FILE_PATH>/$RANKSET_FILE}"',
-                      self.RUNNER)
+        phase2 = self.RUNNER[self.RUNNER.index("# === Phase 2:"):]
+        self.assertIn('--jobs "$RANKSET_FILE"', phase2)
+        self.assertNotIn('--jobs "$JOBS_FILE"', phase2)
 
     def test_neither_prerank_stage_falls_back_to_the_whole_corpus(self):
         """That fallback is the 3.5h timeout this phase exists to prevent."""
@@ -1592,6 +1593,7 @@ class PipelineWiring(unittest.TestCase):
                       "an age bound is what keeps today's rankset alive")
 
 
+@unittest.skipUnless((REPO / "manual_run_2026-08-19" / "run_manual.sh").is_file(), "historical sandbox runner is not present in this checkout")
 class SandboxPipelineWiring(unittest.TestCase):
     """The sandbox runner's stage order — the thing C5 actually changes.
 
@@ -1605,7 +1607,8 @@ class SandboxPipelineWiring(unittest.TestCase):
     catches.
     """
 
-    RUNNER = (REPO / "manual_run_2026-08-19" / "run_manual.sh").read_text()
+    RUNNER_PATH = REPO / "manual_run_2026-08-19" / "run_manual.sh"
+    RUNNER = RUNNER_PATH.read_text() if RUNNER_PATH.is_file() else ""
 
     def stage_at(self, needle):
         return self.RUNNER.index(needle)
