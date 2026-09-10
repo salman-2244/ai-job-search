@@ -58,6 +58,44 @@ class PhaseBase(unittest.TestCase):
         return s
 
 
+class TestStatePath(PhaseBase):
+    def test_different_same_day_runs_do_not_share_state(self):
+        first = sl.selection_state_path("2026-09-10", "run-a", root=self.tmp)
+        second = sl.selection_state_path("2026-09-10", "run-b", root=self.tmp)
+
+        state = ts.SelectionState(first)
+        state.job_message_ids = {idx: 100 + idx for idx in range(15)}
+        state.save()
+
+        current = ts.SelectionState(second)
+        current.load()
+        self.assertNotEqual(first, second)
+        self.assertEqual(sl.phase_of(current), "fresh")
+        self.assertEqual(
+            [idx for idx in range(15) if idx not in current.job_message_ids],
+            list(range(15)),
+        )
+
+    def test_same_run_restarts_resume_its_state(self):
+        path = sl.selection_state_path("2026-09-10", "run-a", root=self.tmp)
+        state = ts.SelectionState(path)
+        state.job_message_ids = {0: 100, 1: 101}
+        state.save()
+
+        restarted = ts.SelectionState(
+            sl.selection_state_path("2026-09-10", "run-a", root=self.tmp)
+        )
+        restarted.load()
+        self.assertEqual(sl.phase_of(restarted), "resume")
+        self.assertEqual(restarted.job_message_ids, {0: 100, 1: 101})
+
+    def test_missing_run_id_keeps_legacy_date_only_path(self):
+        self.assertEqual(
+            sl.selection_state_path("2026-09-10", root=self.tmp),
+            self.tmp / "jobsearch_selection_2026-09-10.json",
+        )
+
+
 class TestPhaseOf(PhaseBase):
     def test_no_state_is_fresh(self):
         """First run of the day: nothing sent, nothing decided."""

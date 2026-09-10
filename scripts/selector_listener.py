@@ -187,6 +187,17 @@ async def wait_for_selection(
                 return "poller-died"
 
 
+def selection_state_path(
+    today: str,
+    run_id: Optional[str] = None,
+    *,
+    root: Path = Path("/tmp"),
+) -> Path:
+    """Keep supervised runs separate while preserving legacy direct launches."""
+    suffix = f"_{run_id}" if run_id else ""
+    return root / f"jobsearch_selection_{today}{suffix}.json"
+
+
 def phase_of(state) -> str:
     """What a restarted process should do with an existing state file.
 
@@ -239,7 +250,9 @@ async def run(rows: list, cfg: dict, args: argparse.Namespace) -> int:
         return 0
 
     today = args.today
-    state = ts.SelectionState(Path(f"/tmp/jobsearch_selection_{today}.json"))
+    state = ts.SelectionState(
+        selection_state_path(today, getattr(args, "run_id", None))
+    )
     state.load()
     gen_log = Path(f"/tmp/jobsearch_select_generate_{today}.log")
     done = asyncio.Event()
