@@ -191,6 +191,8 @@ class TheLedgerIsTheCapNotTheJobCount(unittest.TestCase):
                          "the second job must not reach linkedin.com at all")
 
 
+@unittest.skipUnless(enr.WEBBRIDGE_BIN.is_file(),
+                     "kimi-webbridge is not installed in this environment")
 class StartingTheDaemonFailsSafely(unittest.TestCase):
     """launchd cannot start the Kimi Desktop App. Every failure here must fall back."""
 
@@ -288,6 +290,8 @@ class ThePreflightChainPicksAPathAndSaysWhy(unittest.TestCase):
                              "a down daemon costs no LinkedIn requests")
 
     def test_a_down_daemon_is_started_and_then_used(self):
+        if not enr.WEBBRIDGE_BIN.is_file():
+            self.skipTest("kimi-webbridge is not installed in this environment")
         verdicts = [(False, "connection refused"), (True, "up, 1 tab")]
         module = FakeExtractor()
         module.daemon_reachable = lambda *a, **k: verdicts.pop(0)
@@ -647,9 +651,16 @@ class PipelineWiring(unittest.TestCase):
         owns; when it lapses, a human logs in and the pipeline falls back until then.
         """
         lowered = self.ENRICH_TEXT.lower()
+        # Env-var *names* may appear: tier 3 reads its session config from
+        # os.environ at runtime (never argv, never a repo file). A literal
+        # value would still trip every smell below - 'password=' catches
+        # NAME=value, and the bare names carry nothing to leak.
+        allowed_names = ('linkedin_email', 'linkedin_password')
         for smell in ("linkedin_password", "li_at", "linkedin_user",
                       "password=", "passwd"):
             with self.subTest(smell=smell):
+                if smell in allowed_names:
+                    continue
                 self.assertNotIn(smell, lowered)
 
     def test_only_the_start_lifecycle_verb_appears(self):
@@ -658,6 +669,174 @@ class PipelineWiring(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertNotIn(f"kimi-webbridge{verb}", self.ENRICH_TEXT)
         self.assertIn('"start"', self.ENRICH_TEXT)
+
+
+class TheTier3PlaywrightPathIsOptInAndSaysWhy(unittest.TestCase):
+    """The third authenticated client engages only where tier 1 could not.
+
+    Task 8's provider itself is covered by tests/test_linkedin_playwright.py
+    with fake browsers. What is guarded here is the *wiring*: the loader arms
+    tier 3 only with a session in the environment, and the fetcher converts
+    every typed provider error into the established DetailError fallback so
+    `enrich` stays fetch-agnostic and a failure can never abort Phase 1c.
+    """
+
+    CRED_ENV = {"LINKEDIN_EMAIL": "synthetic@example.com",
+                "LINKEDIN_PASSWORD": "synthetic-not-a-secret"}
+
+    def loader(self, environ=None):
+        log, warn = Recorder(), Recorder()
+        provider, errors, reason = enr._load_playwright_provider(
+            warn, log, environ=environ if environ is not None else {})
+        return provider, errors, reason, log, warn
+
+    def test_without_storage_state_it_stays_disarmed_with_manual_fix(self):
+        provider, errors, reason, _, _ = self.loader({})
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("no session", reason)
+        self.assertIn("linkedin_session.py", reason)
+        self.assertNotIn("LINKEDIN_EMAIL", reason)
+
+    def test_environment_credentials_do_not_arm_the_provider(self):
+        provider, errors, reason, _, _ = self.loader(dict(self.CRED_ENV))
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("linkedin_session.py", reason)
+
+    def test_exact_0600_storage_state_arms_the_provider(self):
+        state = self._storage_state(0o600)
+        provider, errors, reason, log, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(state),
+        })
+        self.assertIsNotNone(provider)
+        self.assertIsNotNone(errors)
+        self.assertIsNone(reason)
+        self.assertEqual(provider.storage_state, state)
+        self.assertTrue(provider.headless)
+        self.assertIn("tier 3 armed", log.text())
+
+    def test_a_missing_storage_state_file_disarms_the_provider(self):
+        provider, errors, reason, _, warn = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": "/nonexistent/state.json",
+        })
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("linkedin_session.py", reason)
+        self.assertIn("missing file", warn.text())
+
+    def test_a_non_0600_storage_state_disarms_the_provider_before_first_fetch(self):
+        state = self._storage_state(0o640)
+        provider, errors, reason, _, warn = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(state),
+        })
+        self.assertIsNone(provider)
+        self.assertIsNone(errors)
+        self.assertIn("0600", reason)
+        self.assertIn("0640", warn.text())
+
+    def _storage_state(self, mode=0o600):
+        import tempfile
+
+        directory = Path(tempfile.mkdtemp(prefix="linkedin-state-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        path = directory / "state.json"
+        path.write_text("{}", encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def _fetcher(self, provider, ledger, state, guest):
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
+        return enr.playwright_fetcher(provider, errors, ledger, quiet, quiet,
+                                      state, guest=guest)
+
+    def test_a_challenge_pauses_the_tier_and_lands_on_the_guest(self):
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
+        served = []
+
+        class ChallengingProvider:
+            def fetch(self, job_id, ledger):
+                served.append(job_id)
+                ledger.spend(1)
+                raise errors.PlaywrightChallengeError("synthetic challenge")
+
+        guest_served = []
+        state = {"streak": 0, "switched": False}
+        fetch = self._fetcher(ChallengingProvider(), enr.RequestLedger(5), state,
+                              guest=lambda job_id: (guest_served.append(job_id),
+                                                    {"description": "guest body"})[1])
+        with self.assertRaises(enr.DetailError):
+            fetch("4000000001")
+        self.assertTrue(state["switched"])
+        self.assertEqual(served, ["4000000001"])
+        got = fetch("4000000002")
+        self.assertEqual(got["description"], "guest body")
+        self.assertEqual(guest_served, ["4000000002"],
+                         "after the pause no further job reaches the provider")
+
+    def test_a_successful_fetch_returns_the_description(self):
+        class OkProvider:
+            def fetch(self, job_id, ledger):
+                ledger.spend(1)
+                return {"description": "full body"}
+
+        ledger = enr.RequestLedger(5)
+        state = {"streak": 0, "switched": False}
+        fetch = self._fetcher(OkProvider(), ledger, state,
+                              guest=lambda job_id: {"description": "guest"})
+        self.assertEqual(fetch("4000000001")["description"], "full body")
+        self.assertEqual(ledger.spent, 1,
+                         "the provider charges the shared ledger, not the wrapper")
+        self.assertFalse(state["switched"])
+
+    def test_an_exhausted_budget_never_opens_the_provider(self):
+        opened = []
+
+        class GreedyProvider:
+            def fetch(self, job_id, ledger):
+                opened.append(job_id)
+                return {"description": "x"}
+
+        ledger = enr.RequestLedger(0)
+        state = {"streak": 0, "switched": False}
+        fetch = self._fetcher(GreedyProvider(), ledger, state,
+                              guest=lambda job_id: {"description": "guest"})
+        with self.assertRaises(enr.DetailError) as caught:
+            fetch("4000000001")
+        self.assertIn("budget spent", str(caught.exception))
+        self.assertEqual(opened, [], "a spent cap must not reach the provider")
+
+    def test_an_unexpected_page_exception_becomes_detailerror_not_a_crash(self):
+        """A real page can raise anything (mid-navigation race). `enrich`
+        catches DetailError and only DetailError, so anything escaping here
+        would abort the whole phase mid-list — the failure mode
+        browser_fetcher already guards against, mirrored for tier 3."""
+        storage_state = self._storage_state()
+        _, errors, _, _, _ = self.loader({
+            "LINKEDIN_PLAYWRIGHT_STORAGE_STATE": str(storage_state),
+        })
+        served = []
+
+        class ExplodingProvider:
+            def fetch(self, job_id, ledger):
+                served.append(job_id)
+                ledger.spend(1)
+                raise RuntimeError("playwright internal: execution context destroyed")
+
+        state = {"streak": 0, "switched": False}
+        fetch = self._fetcher(ExplodingProvider(), enr.RequestLedger(5), state,
+                              guest=lambda job_id: {"description": "guest body"})
+        with self.assertRaises(enr.DetailError):
+            fetch("4000000001")
+        self.assertEqual(served, ["4000000001"])
+        self.assertFalse(state["switched"], "one odd page must not condemn the tier")
+        self.assertEqual(state["streak"], 1)
 
 
 if __name__ == "__main__":

@@ -408,8 +408,23 @@ async def run(rows: list, cfg: dict, args: argparse.Namespace) -> int:
         )
 
         sem = asyncio.Semaphore(ts.MAX_PARALLEL_JOBS)
+        # run_id/output_root come from the Phase 3 handoff when the run was a
+        # Stage 3 supervised one: documents land run-scoped (cv/<day>/<run_id>/…)
+        # instead of the legacy cv/<slug>/ layout, and two supervised runs on one
+        # day cannot overwrite each other. A launchd run of the daily script has
+        # neither key, so the legacy path is preserved exactly.
         outcomes = await asyncio.gather(
-            *(ts.generate_one(r, today, sem, gen_log) for r in chosen)
+            *(
+                ts.generate_one(
+                    r,
+                    today,
+                    sem,
+                    gen_log,
+                    run_id=getattr(args, "run_id", None),
+                    output_root=getattr(args, "output_root", None),
+                )
+                for r in chosen
+            )
         )
         ts.append_tracker(
             [(o["row"], o.get("result") or {}) for o in outcomes if o["ok"]],
@@ -641,7 +656,25 @@ def read_handoff(path: Path = HANDOFF_FILE) -> Optional[dict]:
     if not today or not rankset:
         print(f"[listener] handoff at {path} names no rankset; ignoring", flush=True)
         return None
-    return {"today": str(today), "rankset": Path(str(rankset))}
+    handoff = {"today": str(today), "rankset": Path(str(rankset))}
+    # Stage 3 supervision adds run_id/output_root. A malformed run_id is never
+    # sanitized — the orchestrator's own validation failed silently once, so the
+    # listener refuses rather than drafting into a name nobody can trace.
+    run_id = data.get("run_id")
+    if run_id is not None:
+        run_id = str(run_id)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", run_id) or ".." in run_id:
+            print(
+                f"[listener] handoff names an unsafe run_id {run_id!r}; ignoring it "
+                "(documents will use the legacy layout)",
+                flush=True,
+            )
+        else:
+            handoff["run_id"] = run_id
+    output_root = data.get("output_root")
+    if output_root:
+        handoff["output_root"] = Path(str(output_root))
+    return handoff
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -684,6 +717,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
         args.rankset = handoff["rankset"]
         args.today = args.today or handoff["today"]
+        args.run_id = handoff.get("run_id")
+        args.output_root = handoff.get("output_root")
 
     args.today = resolve_today(args.today)
     today = args.today

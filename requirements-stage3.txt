@@ -1,0 +1,12 @@
+# Stage 3 runtime dependencies. Both are exactly pinned so unattended Telegram
+# polling and browser behavior cannot drift after an environment rebuild.
+# The schedule parser is implemented in stage_3/schedules.py; croniter is neither
+# imported nor installed and therefore is deliberately not listed.
+#
+# After installing, provision the optional Playwright browser itself:
+#
+#   pip install -r requirements-stage3.txt
+#   playwright install chromium
+#
+python-telegram-bot==22.8
+playwright==1.62.0

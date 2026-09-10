@@ -4,29 +4,69 @@ set -euo pipefail
 # === Ensure claude CLI is in PATH ===
 # ~/.local/bin carries tg-notify, used by notify_result below. launchd hands this
 # script a minimal PATH, so it has to be named here or the ping silently no-ops.
-export PATH="$HOME/.local/bin:/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.nvm/versions/node/v24.19.0/bin:$HOME/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
 # === Configuration ===
-PROJECT_DIR="/Users/salman/Projects/ai-job-search"
+# Resolve the physical checkout containing this script. In particular, never jump
+# from a worktree back to a differently-versioned original checkout: every helper
+# invoked below must come from the same commit as this entrypoint.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+    SCRIPT_SOURCE=$(readlink "$SCRIPT_SOURCE")
+    if [[ "$SCRIPT_SOURCE" != /* ]]; then
+        SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+    fi
+done
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+PROJECT_DIR=$(cd -P -- "$SCRIPT_DIR/.." && pwd)
 CONFIG="$PROJECT_DIR/config/automation.json"
 MATRIX="$PROJECT_DIR/config/search_matrix.json"
 LOG_DIR="$PROJECT_DIR/logs/daily"
 REPORT_DIR="$PROJECT_DIR/reports/daily"
 LOCK_DIR="/tmp/jobsearch_daily_pipeline.lock"
 TODAY=$(date +%Y-%m-%d)
-LOG_FILE="$LOG_DIR/${TODAY}.log"
+LOG_FILE="${STAGE3_PIPELINE_LOG:-$LOG_DIR/${TODAY}.log}"
+# Stage 3 logs can contain job-posting text and diagnostic details. Create a new
+# run-scoped log under an owner-only umask, and narrow an existing one before any
+# guard or stale-lock path can write to it.
+if [[ -n "${STAGE3_PIPELINE_LOG:-}" ]]; then
+    mkdir -p "$(dirname "$LOG_FILE")"
+    (umask 077; : >> "$LOG_FILE")
+    chmod 600 "$LOG_FILE"
+fi
 REPORT_FILE="$REPORT_DIR/${TODAY}.md"
+RESUME_ROOT="${STAGE3_RESUME_ROOT:-}"
+if [[ -n "$RESUME_ROOT" ]]; then
+    if [[ -z "${STAGE3_PIPELINE_LOG:-}" ||
+          "$RESUME_ROOT" != "$(dirname "$STAGE3_PIPELINE_LOG")/resume" ]]; then
+        echo "FATAL: STAGE3_RESUME_ROOT must be the supervised run's resume directory" >&2
+        exit 1
+    fi
+    mkdir -p "$RESUME_ROOT"
+    chmod 700 "$RESUME_ROOT"
+    find "$RESUME_ROOT" -maxdepth 1 -type f -exec chmod 600 {} +
+    umask 077
+    JOBS_FILE="$RESUME_ROOT/fetched_jobs.json"
+    SHORTLIST_FILE="$RESUME_ROOT/shortlist.json"
+    SHORTLIST_SUMMARY_FILE="$RESUME_ROOT/shortlist_summary.json"
+    RANKSET_FILE="$RESUME_ROOT/rankset.json"
+    DEFERRED_FILE="$RESUME_ROOT/deferred.json"
+    PRERANK_FILE="$RESUME_ROOT/prerank_summary.json"
+    ENRICH_FILE="$RESUME_ROOT/enrich_summary.json"
+else
+    JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"
+    SHORTLIST_FILE="/tmp/jobsearch_shortlist_${TODAY}.json"
+    SHORTLIST_SUMMARY_FILE="/tmp/jobsearch_shortlist_summary_${TODAY}.json"
+    RANKSET_FILE="/tmp/jobsearch_rankset_${TODAY}.json"
+    DEFERRED_FILE="/tmp/jobsearch_deferred_${TODAY}.json"
+    PRERANK_FILE="/tmp/jobsearch_prerank_summary_${TODAY}.json"
+    ENRICH_FILE="/tmp/jobsearch_enrich_summary_${TODAY}.json"
+fi
 PLAN_FILE="/tmp/jobsearch_plan_${TODAY}.tsv"
-JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"
 # The wide intermediate cut, between the two pre-rank stages. Enrichment reads it,
 # so it has to be a file rather than a pipe: Phase 1c writes descriptions back into
 # it and Phase 1b-final scores what Phase 1c left behind.
-SHORTLIST_FILE="/tmp/jobsearch_shortlist_${TODAY}.json"
-SHORTLIST_SUMMARY_FILE="/tmp/jobsearch_shortlist_summary_${TODAY}.json"
-RANKSET_FILE="/tmp/jobsearch_rankset_${TODAY}.json"
-DEFERRED_FILE="/tmp/jobsearch_deferred_${TODAY}.json"
-PRERANK_FILE="/tmp/jobsearch_prerank_summary_${TODAY}.json"
-ENRICH_FILE="/tmp/jobsearch_enrich_summary_${TODAY}.json"
 TOP5_FILE="/tmp/jobsearch_top5_${TODAY}.json"
 # Phase 2's stderr, kept out of the log so a failed attempt can be classified on its
 # own text rather than on the whole run's. Appended to the log either way, and the
@@ -50,8 +90,9 @@ ALERT_JOBS_FILE="/tmp/jobsearch_portal_linkedin-alert_${TODAY}.json"
 ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 
 # === Run controls (both default to off; the scheduled 08:00 run is unaffected) ===
-#   KEEP_TEMP=1   keep the /tmp artifacts for inspection instead of deleting them in
-#                 Phase 7, so the full fetched-jobs list survives the run.
+#   KEEP_TEMP=1   keep ephemeral /tmp artifacts for inspection instead of deleting
+#                 them in Phase 7. Stage 3 resume inputs are always durable under the
+#                 run directory supplied by STAGE3_RESUME_ROOT and ignore this flag.
 #   SKIP_NOTIFY=1 don't send the Telegram ping. The ping fires from the EXIT trap
 #                 on success and on failure alike, so leave it on for the 08:00 run.
 #   RANK_TIMEOUT  seconds Phase 2 may spend scoring before it is stopped. Phase 2
@@ -75,8 +116,9 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 portals, and skip enrichment. For recovering a run that fetched
 #                 successfully but died later: a second full run would fire another
 #                 ~45 LinkedIn searches on top of the ones already made today, which
-#                 breaks the approved per-day volume. Requires the Phase 1 output from
-#                 a KEEP_TEMP=1 run to still exist; refuses to invent one.
+#                 breaks the approved per-day volume. Stage 3 supplies a durable
+#                 STAGE3_RESUME_ROOT inside the selected run directory; direct legacy
+#                 invocations retain the old /tmp behavior.
 #   GEO_FILTER    restrict the LinkedIn half of the search plan to one or more geos,
 #                 comma-separated ("Germany", "Germany,Austria"). Names are matched
 #                 case-insensitively against config/search_matrix.json's `geos`, and an
@@ -85,6 +127,19 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 `/run <geo>` path; unset means the normal rotating sweep. The other
 #                 portals are unaffected — their geography lives inside each query's
 #                 own args, so there is nothing to narrow. The request cap still binds.
+#   JOB_COUNT     cap on how many jobs reach the rankset (Stage 3 /run [n]). The
+#                 Phase 1b-final cut takes the first N of the deep-rank budget; the
+#                 rest of that budget is passed over, not re-scored by the ranker.
+#                 Range 1-50, integers only, set in the environment not argv — a
+#                 validated run_id and a non-numeric count in the same env block
+#                 must fail the same way. Unset means the full budget, byte-for-byte
+#                 unchanged behavior.
+#   RUN_ID        Stage 3 run id stamped into new logs, reports and the selection
+#                 handoff so a day's artifacts can be traced to the run that made
+#                 them. Path-component safe by the same rule the orchestrator
+#                 enforces; a malformed value exits 1 rather than being sanitized.
+#   OUTPUT_ROOT   root for Stage 3 run-scoped document trees (cv/<day>/<run_id>/…).
+#                 Default empty = the repo, exactly as before.
 #   SKIP_ALERTS=1 don't read the LinkedIn job-alert mailbox in Phase 0b. The corpus
 #                 then contains only what the portal queries found, and no job can
 #                 reach the gate's alert-matched 60 tier. Costs no LinkedIn requests
@@ -106,11 +161,75 @@ KEEP_TEMP="${KEEP_TEMP:-0}"
 RANK_TIMEOUT="${RANK_TIMEOUT:-1800}"
 RANK_ATTEMPTS="${RANK_ATTEMPTS:-3}"
 RANK_BACKOFF="${RANK_BACKOFF:-20}"
+# Model selection is configuration, not source policy. The primary comes from this
+# checkout's Claude settings (the same setting interactive Claude Code uses). Operators
+# may configure a distinct fallback in the same env object or override either value for
+# one run; an absent fallback simply means retry the configured primary.
+PROJECT_SETTINGS="$PROJECT_DIR/.claude/settings.json"
+if [[ ! -f "$PROJECT_SETTINGS" ]] && command -v git >/dev/null 2>&1; then
+    GIT_COMMON_DIR=$(git -C "$PROJECT_DIR" rev-parse --path-format=absolute \
+        --git-common-dir 2>/dev/null || true)
+    if [[ -n "$GIT_COMMON_DIR" ]]; then
+        SHARED_PROJECT_SETTINGS="$(dirname "$GIT_COMMON_DIR")/.claude/settings.json"
+        [[ -f "$SHARED_PROJECT_SETTINGS" ]] && PROJECT_SETTINGS="$SHARED_PROJECT_SETTINGS"
+    fi
+fi
+read_project_env_setting() {
+    local key="$1"
+    python3 - "$PROJECT_SETTINGS" "$key" <<'PYTHON_SCRIPT'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    print("")
+else:
+    value = data.get("env", {}).get(key, "")
+    print(value if isinstance(value, str) else "")
+PYTHON_SCRIPT
+}
+read_project_model_setting() {
+    read_project_env_setting "$1"
+}
+RANK_PRIMARY_MODEL="${RANK_PRIMARY_MODEL:-${ANTHROPIC_MODEL:-$(read_project_model_setting ANTHROPIC_MODEL)}}"
+RANK_FALLBACK_MODEL="${RANK_FALLBACK_MODEL:-${ANTHROPIC_FALLBACK_MODEL:-$(read_project_model_setting ANTHROPIC_FALLBACK_MODEL)}}"
+if [[ -z "$RANK_PRIMARY_MODEL" ]]; then
+    echo "FATAL: ranking model is not configured in the environment or project settings" >&2
+    exit 1
+fi
 RESUME="${RESUME:-0}"
 # Defaulted rather than left unset because the script runs under `set -u`, where the
 # bare reference at the plan-builder call site would abort the run instead of meaning
 # "no filter".
 GEO_FILTER="${GEO_FILTER:-}"
+# Stage 3 on-demand controls. Defaults keep the launchd path byte-for-byte
+# identical; the orchestrator sets all three for a supervised run.
+RUN_ID="${RUN_ID:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
+JOB_COUNT="${JOB_COUNT:-}"
+if [[ -n "$RUN_ID" ]]; then
+    case "$RUN_ID" in
+        *[!A-Za-z0-9._-]*|.*|..*)
+            echo "FATAL: RUN_ID is not path-safe: '$RUN_ID'. Use 1-64 characters of " \
+                 "A-Za-z0-9._- without a leading dot. The orchestrator generates ids " \
+                 "that always pass; a hand-set value must too, because it names " \
+                 "directories documents and reports are written under." >&2
+            exit 1
+            ;;
+    esac
+fi
+if [[ -n "$JOB_COUNT" ]]; then
+    if ! [[ "$JOB_COUNT" =~ ^[0-9]+$ ]] || (( JOB_COUNT < 1 || JOB_COUNT > 50 )); then
+        echo "FATAL: JOB_COUNT must be a whole number between 1 and 50, got '$JOB_COUNT'. " \
+             "The Telegram bot bounds its own input; this is the script's independent bound, " \
+             "so a hand-set value cannot request absurdity." >&2
+        exit 1
+    fi
+fi
 SKIP_ALERTS="${SKIP_ALERTS:-0}"
 SKIP_NOTIFY="${SKIP_NOTIFY:-0}"
 # Phase 0b's total wall-clock ceiling: 8 minutes. Raised from 300s on 2026-08-24 after
@@ -142,6 +261,35 @@ log() {
     echo "[$ts] $*" | tee -a "$LOG_FILE"
 }
 
+# === Pipeline outcome ===
+# Critical phases may fail before the optional report is generated. Keep their first
+# failure as the process outcome while still allowing reporting and cleanup to run.
+PIPELINE_EXIT=0
+CRITICAL_FAILURE=""
+
+record_critical_failure() {
+    local code="$1"
+    shift
+    if (( PIPELINE_EXIT == 0 )); then
+        PIPELINE_EXIT="$code"
+        CRITICAL_FAILURE="$*"
+    fi
+}
+
+record_optional_failure() {
+    log "WARNING: $*"
+}
+
+finish_pipeline() {
+    if (( PIPELINE_EXIT == 0 )); then
+        log "Pipeline complete."
+    else
+        log "Pipeline FAILED: ${CRITICAL_FAILURE:-critical phase failed}"
+    fi
+    log "=== End of Run ==="
+    return "$PIPELINE_EXIT"
+}
+
 # === Telegram ping ===
 # Called from the EXIT trap rather than after "Pipeline complete", so a hard
 # failure reports itself too. The 08:00 run on 2026-08-22 sat six hours in a
@@ -167,7 +315,8 @@ notify_result() {
         "jobs fetched: ${TOTAL_JOBS:-?}
 ranked: ${RANKED_COUNT:-?}
 report: ${REPORT_FILE}
-log: ${LOG_FILE}" \
+log: ${LOG_FILE}
+run: ${RUN_ID:-manual}" \
         || echo "[notify] tg-notify failed" >&2
 }
 
@@ -221,6 +370,9 @@ trap 'exit 130' INT
 mkdir -p "$LOG_DIR" "$REPORT_DIR" "$APP_PACKAGES_DIR"
 
 log "=== Pipeline Run: $TODAY $(date +"%H:%M:%S") ==="
+if [[ -n "$RUN_ID" ]]; then
+    log "Stage 3 run id: $RUN_ID"
+fi
 log "Config: enabled=true, max_jobs=$(python3 -c "import json; print(json.load(open('$CONFIG'))['pipeline']['max_jobs_to_apply'])")"
 
 # === Read pipeline config ===
@@ -502,17 +654,36 @@ fi
 # decides how many files exist, so an explicit list would silently drop the rest.
 log "Aggregating results..."
 PORTAL_FILES=(/tmp/jobsearch_portal_*_${TODAY}.json)
+FETCH_EXIT=0
 if [[ ! -e "${PORTAL_FILES[0]}" ]]; then
-    log "FATAL: no portal output files found — Phase 1 produced nothing"
-    exit 1
+    FETCH_EXIT=1
+    record_critical_failure "$FETCH_EXIT" "Fetching failed: Phase 1 produced no portal output"
+    log "Phase 1 FAILED: no portal output files found"
+    echo '{"meta":{"unique":0},"results":[]}' > "$JOBS_FILE"
+else
+    log "  aggregating ${#PORTAL_FILES[@]} portal output files"
+    python3 scripts/aggregate_jobs.py "${PORTAL_FILES[@]}" > "$JOBS_FILE" 2>>"$LOG_FILE" || FETCH_EXIT=$?
+    if (( FETCH_EXIT != 0 )); then
+        record_critical_failure "$FETCH_EXIT" "Fetching failed while aggregating portal output"
+        log "Phase 1 FAILED: aggregation exited $FETCH_EXIT"
+        echo '{"meta":{"unique":0},"results":[]}' > "$JOBS_FILE"
+    fi
 fi
-log "  aggregating ${#PORTAL_FILES[@]} portal output files"
-python3 scripts/aggregate_jobs.py "${PORTAL_FILES[@]}" > "$JOBS_FILE" 2>>"$LOG_FILE"
 
 TOTAL_JOBS=$(python3 -c "import json; print(json.load(open('$JOBS_FILE'))['meta']['unique'])" 2>/dev/null || echo "0")
-log "Phase 1 complete: $TOTAL_JOBS unique jobs fetched"
+if (( FETCH_EXIT == 0 )); then
+    log "Phase 1 complete: $TOTAL_JOBS unique jobs fetched"
+fi
 
 fi  # end of the RESUME=1 branch opened before Phase 1
+
+if (( PIPELINE_EXIT != 0 )); then
+    log "Phase 1b: SKIPPED — fetch failed; preserving the empty corpus for the optional report"
+    echo '{"meta":{"unique":0},"results":[]}' > "$RANKSET_FILE"
+    echo '{"meta":{"unique":0},"results":[]}' > "$SHORTLIST_FILE"
+    echo '[]' > "$DEFERRED_FILE"
+    echo '{}' > "$PRERANK_FILE"
+fi
 
 # === Phase 1b: choose which fetched jobs are worth Phase 2's model pass ===
 # Fetching stays broad — coverage is unchanged — but the model ranker costs ~24s per
@@ -548,7 +719,9 @@ fi  # end of the RESUME=1 branch opened before Phase 1
 # costs no portal requests, so this does not violate the resume contract. An existing
 # rankset is reused rather than rebuilt: it carries the enrichment the earlier run
 # already paid LinkedIn requests for, and rebuilding from $JOBS_FILE would lose it.
-if [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
+if (( PIPELINE_EXIT != 0 )); then
+    : # Fetch failed above; synthetic artifacts let the optional report account for it.
+elif [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
     log "Phase 1b: SKIPPED (RESUME=1) — reusing the rankset at $RANKSET_FILE"
 else
     log "Phase 1b (shortlist): cutting $TOTAL_JOBS fetched jobs down to a wide shortlist..."
@@ -568,7 +741,9 @@ fi
 # No --deferred on the shortlist stage. The deferred list is written once, by the final
 # stage, from the corpus — so it accounts for the jobs cut at *both* stages. A deferred
 # file written here would be overwritten by a shorter, wronger one anyway.
-if [[ "$RESUME" != "1" || ! -s "$RANKSET_FILE" ]]; then
+if (( PIPELINE_EXIT != 0 )); then
+    SHORTLIST_JOBS=0
+elif [[ "$RESUME" != "1" || ! -s "$RANKSET_FILE" ]]; then
     if [[ ! -s "$SHORTLIST_FILE" ]]; then
         log "FATAL: Phase 1b (shortlist) left no shortlist at $SHORTLIST_FILE"
         exit 1
@@ -684,6 +859,15 @@ fi
 if [[ "$RESUME" == "1" && -s "$RANKSET_FILE" ]]; then
     log "Phase 1b-final: SKIPPED (RESUME=1) — reusing the rankset at $RANKSET_FILE"
 else
+    # JOB_COUNT (Stage 3 /run [n]): take the first N of the deep-rank budget into
+    # the rankset. Nothing else changes — scoring, gates and deferral all ran
+    # already, so this is a pure cut of an already-ranked file, and the deferred
+    # file is not rewritten (its entries describe why jobs missed the full budget).
+    JOB_COUNT_ARGS=()
+    if [[ -n "$JOB_COUNT" ]]; then
+        log "Phase 1b-final: capping the rankset at $JOB_COUNT job(s) (JOB_COUNT)"
+        JOB_COUNT_ARGS=("--budget" "$JOB_COUNT")
+    fi
     log "Phase 1b-final: re-scoring the $SHORTLIST_JOBS enriched shortlisted jobs and cutting to the deep-rank budget..."
     if ! python3 scripts/prerank_jobs.py --jobs "$SHORTLIST_FILE" \
             --corpus "$JOBS_FILE" \
@@ -691,6 +875,7 @@ else
             --matrix "$MATRIX" --today "$TODAY" \
             --alerts "$ALERT_STORE" \
             --stage final \
+            "${JOB_COUNT_ARGS[@]+"${JOB_COUNT_ARGS[@]}"}" \
             > "$PRERANK_FILE" 2>>"$LOG_FILE"; then
         log "FATAL: Phase 1b-final failed — refusing to fall back to ranking all $SHORTLIST_JOBS shortlisted jobs (see log)"
         exit 1
@@ -714,21 +899,20 @@ if (( SELECTED_JOBS == 0 )); then
     echo "Pre-ranking selected 0 of the $TOTAL_JOBS fetched jobs for deep ranking, so no job was scored today. Since already-seen jobs are re-included rather than skipped, this is no longer routine — read the deferral reasons below. A wall of hard-gate discards means the corpus genuinely did not qualify; anything else points at a vocabulary or config problem." >> "$WARN_FILE"
 fi
 
-# === Phase 2: Rank jobs via Claude Code ===
-log "Phase 2: Ranking jobs via Claude Code..."
+# === Phase 2: Rank jobs via direct Messages API ===
+if (( SELECTED_JOBS == 0 )); then
+    # Keep Phase 2b and the report on their normal paths without paying for an empty
+    # provider request. No seen-state mutation is needed because no job was scored.
+    printf '[]\n' > "$TOP5_FILE"
+    printf '[]\n' > "$NOT_DRAFTED_FILE"
+    RANKED_COUNT=0
+    log "Phase 2: SKIPPED — no selected jobs to score"
+else
+    log "Phase 2: Ranking jobs via direct Messages API..."
 
-# Build the prompt with the file paths injected. Both placeholders must be
-# substituted: the prompt writes its "matched but below the drafting gate" list to
-# <NOT_DRAFTED_FILE_PATH>, so leaving it unsubstituted would create a file with that
-# literal name and lose the list from the report.
-RANK_PROMPT=$(cat prompts/pipeline_phase1_rank.md)
-RANK_PROMPT="${RANK_PROMPT//<JOBS_FILE_PATH>/$RANKSET_FILE}"
-RANK_PROMPT="${RANK_PROMPT//<NOT_DRAFTED_FILE_PATH>/$NOT_DRAFTED_FILE}"
-
-if [[ "$RANK_PROMPT" == *"<JOBS_FILE_PATH>"* || "$RANK_PROMPT" == *"<NOT_DRAFTED_FILE_PATH>"* ]]; then
-    log "FATAL: a placeholder in prompts/pipeline_phase1_rank.md was not substituted"
-    exit 1
-fi
+# The helper owns request construction, strict response validation, and atomic output
+# persistence. This shell retains operational policy: timeout, retries, backoff, model
+# fallback, cancellation, and the final deterministic gate in Phase 2b.
 
 # Run with timeout via background process (macOS has no timeout command)
 #
@@ -746,9 +930,22 @@ fi
 rank_attempt() {
     RANK_EXIT=0
     RANK_TIMED_OUT=0
-    claude -p "$RANK_PROMPT" \
-        --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Agent" \
-        --output-format text < /dev/null 2>>"$RANK_ERR_FILE" > "$TOP5_FILE" &
+    rm -f "$TOP5_FILE" "$NOT_DRAFTED_FILE"
+    python3 "$PROJECT_DIR/scripts/rank_jobs_api.py" \
+        --jobs "$RANKSET_FILE" \
+        --output "$TOP5_FILE" \
+        --not-drafted "$NOT_DRAFTED_FILE" \
+        --seen "$PROJECT_DIR/job_scraper/seen_jobs.json" \
+        --alerts "$ALERT_STORE" \
+        --tracker "$PROJECT_DIR/job_search_tracker.csv" \
+        --evaluation "$PROJECT_DIR/.claude/skills/job-application-assistant/04-job-evaluation.md" \
+        --profile "$PROJECT_DIR/.claude/skills/job-application-assistant/01-candidate-profile.md" \
+        --prompt "$PROJECT_DIR/prompts/pipeline_phase1_rank.md" \
+        --settings "$PROJECT_SETTINGS" \
+        --model "$RANK_MODEL" \
+        --today "$TODAY" \
+        --request-timeout "$RANK_TIMEOUT" \
+        < /dev/null 2>>"$RANK_ERR_FILE" &
     RANK_PID=$!
 
     local waited=0
@@ -780,28 +977,36 @@ rank_attempt() {
 # An unrecognised failure is treated as transient on purpose. The 2026-08-23 failure
 # this retry exists for wrote nothing to stderr at all, so a classifier that only
 # retried known-transient markers would not have retried the one case that motivated
-# it. Reads stdout too, since the CLI does not always put the error on stderr.
+# it. The helper writes only sanitized diagnostics to stderr; never classify output
+# files, which may contain untrusted posting text.
 rank_error_class() {
     local text=""
     [[ -f "$RANK_ERR_FILE" ]] && text+=$(cat "$RANK_ERR_FILE")
-    [[ -f "$TOP5_FILE" ]] && text+=$(cat "$TOP5_FILE")
     text=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
     case "$text" in
         *"401"*|*"403"*|*"invalid api key"*|*"invalid x-api-key"*|\
         *"authentication_error"*|*"unauthorized"*|*"permission_error"*|\
         *"credit balance"*|*"insufficient"*)
             echo "non-retryable (auth/quota)" ;;
-        *"429"*|*"rate limit"*|*"overloaded"*|*"500"*|*"502"*|*"503"*|*"504"*|\
+        *"503"*|*"no available channel"*)
+            echo "gateway-unavailable" ;;
+        *"429"*|*"rate limit"*|*"overloaded"*|*"500"*|*"502"*|*"504"*|\
         *"econnreset"*|*"socket hang up"*|*"fetch failed"*|*"upstream"*)
             echo "transient" ;;
         *)  echo "unclassified" ;;
     esac
 }
 
+rank_gateway_error_message() {
+    printf '%s\n' "Ranking failed: AI model gateway unavailable (503). Retry later or check API configuration."
+}
+
 RANK_ATTEMPT=0
 RANK_EXIT=0
 RANK_TIMED_OUT=0
 RANK_ERROR_CLASS=""
+RANK_MODEL="$RANK_PRIMARY_MODEL"
+RANK_USED_FALLBACK=0
 
 while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
     RANK_ATTEMPT=$((RANK_ATTEMPT + 1))
@@ -810,7 +1015,7 @@ while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
         RANK_SLEEP=$(( RANK_BACKOFF * (1 << (RANK_ATTEMPT - 2)) ))
         log "Phase 2: waiting ${RANK_SLEEP}s before attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS}"
         sleep "$RANK_SLEEP"
-        log "Phase 2: retrying (attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS})"
+        log "Phase 2: retrying with configured model '$RANK_MODEL' (attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS})"
     fi
 
     : > "$RANK_ERR_FILE"
@@ -841,6 +1046,14 @@ while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
         log "Phase 2: not retrying — this error class does not clear on its own"
         break
     fi
+    if [[ "$RANK_ERROR_CLASS" == "gateway-unavailable" &&
+          "$RANK_USED_FALLBACK" == "0" &&
+          -n "$RANK_FALLBACK_MODEL" &&
+          "$RANK_FALLBACK_MODEL" != "$RANK_MODEL" ]]; then
+        RANK_MODEL="$RANK_FALLBACK_MODEL"
+        RANK_USED_FALLBACK=1
+        log "Phase 2: gateway unavailable; next attempt will use the configured fallback model '$RANK_MODEL'"
+    fi
 done
 
 if (( RANK_TIMED_OUT == 1 )); then
@@ -848,6 +1061,7 @@ if (( RANK_TIMED_OUT == 1 )); then
     # gate evaluates nothing rather than half a record — and warn, because a ranker
     # that was killed must never read as "nothing qualified today".
     RANKED_COUNT=0
+    record_critical_failure 124 "Ranking timed out after ${RANK_TIMEOUT}s"
     echo "[]" > "$TOP5_FILE"
     echo "Ranking did not finish within ${RANK_TIMEOUT}s and was stopped, so no jobs were scored and no CVs or cover letters were generated. It was not retried: a second attempt would spend the same ${RANK_TIMEOUT}s on the same corpus. The $TOTAL_JOBS fetched jobs are unaffected. Either shrink the corpus handed to the ranker or raise RANK_TIMEOUT." >> "$WARN_FILE"
 elif (( RANK_EXIT == 0 )); then
@@ -866,10 +1080,16 @@ print(len(data) if data is not None else 0)
     fi
 else
     RANKED_COUNT=0
-    # Keep the failing stdout before overwriting it. The 2026-08-23 run replaced the
-    # only copy of the ranker's output with "[]", which is why that failure had to be
-    # diagnosed from a timestamp and an exit code.
-    cp "$TOP5_FILE" "$RANK_FAIL_FILE" 2>/dev/null || true
+    if [[ "$RANK_ERROR_CLASS" == "gateway-unavailable" ]]; then
+        RANK_FAILURE_MESSAGE=$(rank_gateway_error_message)
+        record_critical_failure "$RANK_EXIT" "$RANK_FAILURE_MESSAGE"
+        log "$RANK_FAILURE_MESSAGE"
+    else
+        record_critical_failure "$RANK_EXIT" "Ranking failed after ${RANK_ATTEMPT} attempt(s)"
+    fi
+    # Preserve sanitized diagnostics for post-run diagnosis before ensuring the gate
+    # receives an empty array.
+    cp "$RANK_ERR_FILE" "$RANK_FAIL_FILE" 2>/dev/null || true
     echo "[]" > "$TOP5_FILE"
     if [[ "$RANK_ERROR_CLASS" == non-retryable* ]]; then
         log "Phase 2 FAILED (exit $RANK_EXIT) on attempt ${RANK_ATTEMPT} — ${RANK_ERROR_CLASS}, not retried — skipping drafting"
@@ -879,6 +1099,8 @@ else
         echo "The ranking step failed on all ${RANK_ATTEMPT} attempts, the last with exit $RANK_EXIT classified ${RANK_ERROR_CLASS:-unclassified}, so no jobs were scored and no documents were generated. Retries were spent, not skipped — this was not a one-off hiccup. The $TOTAL_JOBS fetched jobs are unaffected; re-run with RESUME=1 to retry the ranking without re-querying the portals. Ranker output: $RANK_ERR_FILE and $RANK_FAIL_FILE." >> "$WARN_FILE"
     fi
 fi
+
+fi  # SELECTED_JOBS > 0
 
 # === Phase 2b: Enforce the document-generation gate ===
 # The ranker is *told* the gate (score >= 75, or >= 60 when LinkedIn's own alert
@@ -950,7 +1172,8 @@ if (( SELECTED_JOBS > 0 )); then
     # reboot, a crash restart), and every one of those starts must be a no-op
     # unless a selection is genuinely pending.
     PENDING_FILE="/tmp/jobsearch_pending_selection.json"
-    printf '{"today": "%s", "rankset": "%s"}\n' "$TODAY" "$RANKSET_FILE" > "$PENDING_FILE"
+    python3 "$PROJECT_DIR/scripts/write_selection_handoff.py" \
+        "$PENDING_FILE" "$TODAY" "$RANKSET_FILE" "$RUN_ID" "$OUTPUT_ROOT"
 
     # kickstart -k, not `launchctl start`: -k kills an already-running instance
     # first. Without it, yesterday's listener still holding the token inside its
@@ -961,6 +1184,7 @@ if (( SELECTED_JOBS > 0 )); then
     if launchctl kickstart -k "$SELECTOR_LABEL" 2>>"$LOG_FILE"; then
         log "Phase 3 complete: selector started; awaiting selection on Telegram"
     else
+        record_critical_failure 1 "Application generation handoff failed: selector did not start"
         log "Phase 3 FAILED: could not start $SELECTOR_LABEL"
         echo "The ranked list could not be sent for selection: launchctl could not start $SELECTOR_LABEL. The ranking is intact in this report, and \`launchctl kickstart -k $SELECTOR_LABEL\` will send the list once the job is loaded. Until then no CVs or cover letters will be produced." >> "$WARN_FILE"
     fi
@@ -1011,8 +1235,9 @@ fi
 # === Phase 5: Generate Report ===
 log "Phase 5: Generating report..."
 
+REPORT_EXIT=0
 python3 - "$TODAY" "$JOBS_FILE" "$TOP5_FILE" "$APPLICABLE_FILE" "$QA_FILE" "$REPORT_FILE" \
-    "$NOT_DRAFTED_FILE" "$WARN_FILE" "$PRERANK_FILE" "$ALERT_JOBS_FILE" <<'PYTHON_SCRIPT'
+    "$NOT_DRAFTED_FILE" "$WARN_FILE" "$PRERANK_FILE" "$ALERT_JOBS_FILE" <<'PYTHON_SCRIPT' || REPORT_EXIT=$?
 import json
 import re
 import sys
@@ -1389,7 +1614,11 @@ with open(report_file, "w") as f:
 print(f"Report written to {report_file}")
 PYTHON_SCRIPT
 
-log "Phase 5 complete: $REPORT_FILE"
+if (( REPORT_EXIT == 0 )); then
+    log "Phase 5 complete: $REPORT_FILE"
+else
+    record_optional_failure "Phase 5 report generation failed (exit $REPORT_EXIT); critical pipeline outcome unchanged"
+fi
 
 # === Phase 6: retired ===
 # The digest used to be mailed here, with the generated PDFs attached. Both halves
@@ -1420,13 +1649,21 @@ if [[ "$KEEP_TEMP" == "1" ]]; then
 else
     log "Cleaning up temp files..."
     rm -f /tmp/jobsearch_portal_*_${TODAY}.json
-    rm -f "$PLAN_FILE" "$JOBS_FILE" "$TOP5_FILE" "$NOT_DRAFTED_FILE" "$WARN_FILE" "$ENRICH_FILE" "$GATE_FILE"
-    rm -f "$SHORTLIST_FILE" "$SHORTLIST_SUMMARY_FILE"
+    rm -f "$PLAN_FILE" "$TOP5_FILE" "$NOT_DRAFTED_FILE" "$WARN_FILE" "$GATE_FILE"
+    if [[ -z "$RESUME_ROOT" ]]; then
+        rm -f "$JOBS_FILE" "$SHORTLIST_FILE" "$SHORTLIST_SUMMARY_FILE"
+        rm -f "$DEFERRED_FILE" "$PRERANK_FILE" "$ENRICH_FILE"
+    else
+        log "  durable resume inputs preserved: $RESUME_ROOT"
+        find "$RESUME_ROOT" -maxdepth 1 -type f -exec chmod 600 {} +
+    fi
     # $RANKSET_FILE is deliberately NOT deleted here. Phase 3 handed it to the
     # selector, which reads it when the buttons are pressed — possibly hours from
     # now, and again after a crash restart. Deleting it would leave the listener
     # with nothing to offer and no way to recover.
-    rm -f "$DEFERRED_FILE" "$PRERANK_FILE"
+    if [[ -z "$RESUME_ROOT" ]]; then
+        rm -f "$DEFERRED_FILE" "$PRERANK_FILE"
+    fi
     rm -f "$APPLICABLE_FILE" "$QA_FILE"
     rm -rf "$APP_PACKAGES_DIR"
     # The ranker's stderr and its failed stdout are kept when Phase 2 did not
@@ -1452,5 +1689,5 @@ else
     find /tmp -maxdepth 1 -name 'jobsearch_rank_failed_stdout_*.txt' -mtime +3 -delete 2>/dev/null || true
 fi
 
-log "Pipeline complete."
-log "=== End of Run ==="
+finish_pipeline
+exit "$PIPELINE_EXIT"

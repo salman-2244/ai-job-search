@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/salman/Projects/ai-job-search/scripts/run_daily.sh</string>
+        <string>__PROJECT_DIR__/scripts/run_daily.sh</string>
     </array>
 
     <key>StartCalendarInterval</key>
@@ -20,20 +20,20 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/salman/Projects/ai-job-search/logs/daily/launchd-stdout.log</string>
+    <string>__PROJECT_DIR__/logs/daily/launchd-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/salman/Projects/ai-job-search/logs/daily/launchd-stderr.log</string>
+    <string>__PROJECT_DIR__/logs/daily/launchd-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/salman/Projects/ai-job-search</string>
+    <string>__PROJECT_DIR__</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.nvm/versions/node/v24.19.0/bin:__HOME__/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>/Users/salman</string>
+        <string>__HOME__</string>
         <key>TZ</key>
         <string>Europe/Budapest</string>
 

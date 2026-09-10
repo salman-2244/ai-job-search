@@ -32,6 +32,7 @@ import signal
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
 from typing import Optional
 
@@ -272,6 +273,14 @@ def release_lock(path: Optional[Path]) -> None:
 # ------------------------------------------------------------- disk inspection
 
 
+# The run id for this batch, set by main() from --run-id. Module-level rather
+# than threaded through every signature so `is_complete` keeps the same call
+# signature the sandbox runner and the dashboard already read.
+_RUN_ID: Optional[str] = None
+_ts_is_complete = None  # bound to telegram_select.is_complete by run() when run-scoped
+_ts_legacy_is_complete = None  # bound to the read-only legacy gate by run()
+
+
 def artifacts(slug: str) -> list[Path]:
     return [
         REPO / "cv" / slug / "Salman-Resume.tex",
@@ -286,7 +295,15 @@ def is_complete(slug: str) -> bool:
 
     All four are required: a .tex with no .pdf is a draft that never compiled,
     and sending a recruiter a missing PDF is worse than regenerating one.
+
+    With `--run-id` this delegates to the shared run-scoped layout, while also
+    honoring the shared read-only legacy gate. A complete legacy application is
+    never regenerated or migrated; a partial one does not block generation.
+    The legacy check stays local when no run id is active so a batch keeps
+    working without telegram_select.py loaded.
     """
+    if _RUN_ID is not None:
+        return _ts_legacy_is_complete(slug) or _ts_is_complete(slug)
     try:
         return all(p.exists() and p.stat().st_size > 0 for p in artifacts(slug))
     except OSError:
@@ -346,7 +363,15 @@ def install_signals(loop: asyncio.AbstractEventLoop) -> None:
 
 
 async def run(args: argparse.Namespace) -> int:
+    global _ts_is_complete, _ts_legacy_is_complete
     ts = load_ts()
+    if _RUN_ID is not None:
+        # A complete legacy application remains authoritative and read-only; if
+        # none exists, resume checks the current run's own output tree.
+        _ts_legacy_is_complete = partial(ts.legacy_is_complete, repo=REPO)
+        _ts_is_complete = partial(
+            ts.is_complete, day=args.date, run_id=_RUN_ID, output_root=args.output_root
+        )
     day, spath = args.date, state_path(args.date)
     log, rankset = log_path(day), Path(args.rankset)
 
@@ -410,7 +435,9 @@ async def run(args: argparse.Namespace) -> int:
             print(f"[batch] {n}/{len(todo)} starting {row.company} — {row.title}", flush=True)
 
             try:
-                outcome = await ts.generate_one(row, day, sem, log)
+                outcome = await ts.generate_one(
+                    row, day, sem, log, run_id=_RUN_ID, output_root=args.output_root
+                )
             except Exception as exc:  # a crashed child must not abort the batch
                 outcome = {"row": row, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -512,6 +539,18 @@ def main() -> int:
     ap.add_argument("--rankset", help="rankset JSON (default: /tmp/jobsearch_rankset_<date>.json)")
     ap.add_argument("--indices", default="", help="comma-separated rankset indices")
     ap.add_argument("--all-missing", action="store_true", help="every rankset job not yet complete")
+    ap.add_argument(
+        "--run-id",
+        default=None,
+        help="Stage 3 run id: documents land in cv/<date>/<run_id>/<slug>/ and the "
+        "completeness check follows the same shared layout",
+    )
+    ap.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="root the document tree here instead of the repo (with --run-id)",
+    )
     args = ap.parse_args()
 
     args.rankset = args.rankset or str(rankset_path(args.date))
@@ -526,6 +565,11 @@ def main() -> int:
     if not Path(args.rankset).exists():
         print(f"rankset not found: {args.rankset}", file=sys.stderr)
         return 2
+
+    global _RUN_ID
+    _RUN_ID = args.run_id
+    if _RUN_ID is not None and args.output_root is None:
+        args.output_root = REPO  # explicit beats implicit
 
     lock = acquire_lock(args.date)
     if lock is None:

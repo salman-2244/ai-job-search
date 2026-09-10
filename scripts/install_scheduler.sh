@@ -1,30 +1,52 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Install the daily job search pipeline scheduler via launchd.
-# This registers a daily job at 08:00 Europe/Budapest.
+# Install the daily pipeline and on-demand selector for this physical checkout.
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-$0}"
+while [[ -L "$SCRIPT_SOURCE" ]]; do
+    SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+    SCRIPT_SOURCE=$(readlink "$SCRIPT_SOURCE")
+    if [[ "$SCRIPT_SOURCE" != /* ]]; then
+        SCRIPT_SOURCE="$SCRIPT_DIR/$SCRIPT_SOURCE"
+    fi
+done
+SCRIPT_DIR=$(cd -P -- "$(dirname -- "$SCRIPT_SOURCE")" && pwd)
+PROJECT_DIR=$(cd -P -- "$SCRIPT_DIR/.." && pwd)
+LAUNCH_AGENTS_DIR="${LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+PYTHON_BIN="${STAGE3_PYTHON:-}"
+if [[ -z "$PYTHON_BIN" ]]; then
+    if [[ -x "$PROJECT_DIR/.venv/bin/python" ]]; then
+        PYTHON_BIN="$PROJECT_DIR/.venv/bin/python"
+    else
+        PYTHON_BIN=$(command -v python3 || true)
+    fi
+fi
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "FATAL: no executable Python found; set STAGE3_PYTHON" >&2
+    exit 1
+fi
+PYTHON_BIN=$(cd -P -- "$(dirname -- "$PYTHON_BIN")" && pwd)/$(basename -- "$PYTHON_BIN")
 
-PROJECT_DIR="/Users/salman/Projects/ai-job-search"
-PLIST_NAME="com.salman.jobsearch.daily"
-PLIST_SRC="${PROJECT_DIR}/${PLIST_NAME}.plist"
-PLIST_DST="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
+mkdir -p "$LAUNCH_AGENTS_DIR" "$PROJECT_DIR/logs/daily"
+chmod 700 "$LAUNCH_AGENTS_DIR" 2>/dev/null || true
+for log in launchd-stdout.log launchd-stderr.log selector-stdout.log selector-stderr.log; do
+    (umask 077; : >> "$PROJECT_DIR/logs/daily/$log")
+    chmod 600 "$PROJECT_DIR/logs/daily/$log"
+done
 
-# Ensure LaunchAgents directory exists
-mkdir -p "$HOME/Library/LaunchAgents"
+for name in com.salman.jobsearch.daily com.salman.jobsearch.selector; do
+    source_plist="$PROJECT_DIR/$name.plist"
+    installed_plist="$LAUNCH_AGENTS_DIR/$name.plist"
+    launchctl unload "$installed_plist" 2>/dev/null || true
+    "$PYTHON_BIN" "$PROJECT_DIR/scripts/render_launchd_plist.py" \
+        "$source_plist" "$installed_plist" "$PROJECT_DIR" "$PYTHON_BIN"
+    launchctl load "$installed_plist"
+done
 
-# Unload existing job if present (ignore errors)
-launchctl unload "$PLIST_DST" 2>/dev/null || true
-
-# Copy plist
-cp "$PLIST_SRC" "$PLIST_DST"
-
-# Load the job
-launchctl load "$PLIST_DST"
-
-echo "Scheduler installed successfully."
-echo "  Plist: $PLIST_DST"
+echo "Scheduler and selector installed successfully."
+echo "  Checkout: $PROJECT_DIR"
 echo "  Schedule: daily at 08:00 Europe/Budapest"
-echo "  Label: $PLIST_NAME"
+echo "  Labels: com.salman.jobsearch.daily, com.salman.jobsearch.selector"
 echo ""
-echo "Verify with: launchctl list | grep $PLIST_NAME"
-echo "Run manually: bash ${PROJECT_DIR}/scripts/run_daily.sh"
+echo "Verify with: launchctl list | grep com.salman.jobsearch"
+echo "Run manually: bash $PROJECT_DIR/scripts/run_daily.sh"

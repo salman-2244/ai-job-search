@@ -18,7 +18,12 @@ pressed" from "the work finished".
 import fnmatch
 import importlib.util
 import json
+import os
+import plistlib
 import re
+import shutil
+import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -232,6 +237,77 @@ class TestNoDeliberateNonzeroExit(unittest.TestCase):
         # A permanent poller would own the selector token's getUpdates and 409
         # any hand-run of telegram_select.py.
         self.assertNotIn("<key>RunAtLoad</key>", plist)
+
+
+class TestLaunchdInstallation(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_templates_have_no_checkout_specific_paths(self):
+        for name in (
+            "com.salman.jobsearch.daily.plist",
+            "com.salman.jobsearch.selector.plist",
+        ):
+            text = (REPO / name).read_text(encoding="utf-8")
+            self.assertNotIn("/Users/salman/Projects/ai-job-search", text)
+            self.assertIn("__PROJECT_DIR__", text)
+
+    def test_renderer_handles_spaces_and_xml_characters(self):
+        checkout = self.tmp / "checkout & worktree"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy2(REPO / "scripts" / "run_daily.sh", scripts / "run_daily.sh")
+        destination = self.tmp / "rendered.plist"
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO / "scripts" / "render_launchd_plist.py"),
+                str(REPO / "com.salman.jobsearch.selector.plist"),
+                str(destination),
+                str(checkout),
+                sys.executable,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        with destination.open("rb") as stream:
+            payload = plistlib.load(stream)
+        self.assertEqual(payload["WorkingDirectory"], str(checkout.resolve()))
+        self.assertEqual(payload["ProgramArguments"][0], str(Path(sys.executable).resolve()))
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+
+    def test_installer_renders_both_jobs_for_its_checkout(self):
+        checkout = self.tmp / "installed checkout"
+        shutil.copytree(REPO, checkout, ignore=shutil.ignore_patterns(".git"))
+        agents = self.tmp / "LaunchAgents"
+        fake_bin = self.tmp / "bin"
+        fake_bin.mkdir()
+        launchctl = fake_bin / "launchctl"
+        launchctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        launchctl.chmod(launchctl.stat().st_mode | stat.S_IXUSR)
+        env = os.environ.copy()
+        env.update({
+            "LAUNCH_AGENTS_DIR": str(agents),
+            "STAGE3_PYTHON": sys.executable,
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+        })
+        proc = subprocess.run(
+            ["bash", str(checkout / "scripts" / "install_scheduler.sh")],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for name in ("com.salman.jobsearch.daily", "com.salman.jobsearch.selector"):
+            path = agents / f"{name}.plist"
+            with path.open("rb") as stream:
+                payload = plistlib.load(stream)
+            self.assertEqual(payload["WorkingDirectory"], str(checkout.resolve()))
+            self.assertNotIn("__PROJECT_DIR__", path.read_text(encoding="utf-8"))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class TestResolveToday(unittest.TestCase):

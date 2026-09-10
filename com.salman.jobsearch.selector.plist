@@ -26,8 +26,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/salman/Projects/ai-job-search/.venv/bin/python</string>
-        <string>/Users/salman/Projects/ai-job-search/scripts/selector_listener.py</string>
+        <string>__PYTHON__</string>
+        <string>__PROJECT_DIR__/scripts/selector_listener.py</string>
     </array>
 
     <!-- Restart only on abnormal exit. The listener exits 0 for nearly every
@@ -64,13 +64,13 @@
     <integer>10</integer>
 
     <key>StandardOutPath</key>
-    <string>/Users/salman/Projects/ai-job-search/logs/daily/selector-stdout.log</string>
+    <string>__PROJECT_DIR__/logs/daily/selector-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/salman/Projects/ai-job-search/logs/daily/selector-stderr.log</string>
+    <string>__PROJECT_DIR__/logs/daily/selector-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/salman/Projects/ai-job-search</string>
+    <string>__PROJECT_DIR__</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -78,9 +78,9 @@
              it; claude is under the nvm bin. Both must be listed because launchd
              jobs do not inherit a login shell's PATH. -->
         <key>PATH</key>
-        <string>/Users/salman/.nvm/versions/node/v24.19.0/bin:/Users/salman/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <string>__HOME__/.nvm/versions/node/v24.19.0/bin:__HOME__/.bun/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
         <key>HOME</key>
-        <string>/Users/salman</string>
+        <string>__HOME__</string>
         <key>TZ</key>
         <string>Europe/Budapest</string>
     </dict>
