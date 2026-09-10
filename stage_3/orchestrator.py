@@ -176,8 +176,8 @@ def retain_run_logs(root: Path, keep_days: int = 7, today: str | None = None) ->
 def select_resumable(root: Path, date: str, explicit: str | None = None) -> str | None:
     """Pick the run a `RESUME=1` request should continue, deterministically.
 
-    An explicit id must exist and must not already be terminal. Without one, exactly
-    one unfinished run for the date may be resumed; several candidates is an error
+    An explicit id must exist and retain durable resume inputs. Without one, exactly
+    one resumable run for the date may be selected; several candidates is an error
     that names them, and none at all returns None (start fresh — the legacy path).
     A corrupt manifest is skipped: resume is best-effort and a fresh run is safe.
     """
@@ -191,13 +191,13 @@ def select_resumable(root: Path, date: str, explicit: str | None = None) -> str 
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise RunRefusedError(f"manifest for run {explicit} is unreadable") from exc
-        if data.get("status") in _TERMINAL_STATUSES:
+        if not data.get("resumable", False):
             raise RunRefusedError(
-                f"run {explicit} is already terminal ({data.get('status')}); "
-                "nothing to resume"
+                f"run {explicit} is not resumable ({data.get('status')}); "
+                "durable inputs are unavailable"
             )
         return explicit
-    unfinished: list[str] = []
+    resumable: list[str] = []
     try:
         candidates = sorted(entry.name for entry in date_dir.iterdir() if entry.is_dir())
     except OSError:
@@ -208,15 +208,15 @@ def select_resumable(root: Path, date: str, explicit: str | None = None) -> str 
             data = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if data.get("status") not in _TERMINAL_STATUSES:
-            unfinished.append(name)
-    if len(unfinished) > 1:
+        if data.get("resumable", False):
+            resumable.append(name)
+    if len(resumable) > 1:
         raise RunRefusedError(
-            "multiple unfinished runs for "
-            f"{date}: {', '.join(unfinished)}. Pass an explicit run_id instead of "
+            "multiple resumable runs for "
+            f"{date}: {', '.join(resumable)}. Pass an explicit run_id instead of "
             "letting the resume pick one for you."
         )
-    return unfinished[0] if unfinished else None
+    return resumable[0] if resumable else None
 
 
 def _classify_error(state: RunState) -> str:
@@ -606,7 +606,12 @@ class Orchestrator:
                 proc = self._runner(
                     request,
                     self._command(),
-                    self._child_env(request, run_id, run_dir / "pipeline.log"),
+                    self._child_env(
+                        request,
+                        run_id,
+                        run_dir / "pipeline.log",
+                        run_dir / "resume",
+                    ),
                     str(self._repo()),
                 )
             except OSError as exc:
@@ -683,13 +688,16 @@ class Orchestrator:
             )
 
     def _child_env(self, request: RunRequest, run_id: str,
-                   pipeline_log: Path | None = None) -> dict:
+                   pipeline_log: Path | None = None,
+                   resume_root: Path | None = None) -> dict:
         extra = dict(request.env or {})
         extra.setdefault("OUTPUT_ROOT", str(self._repo()))
         extra["RUN_ID"] = run_id  # authoritative: never inherited from the caller
         extra["JOB_COUNT"] = str(request.job_count)
         if pipeline_log is not None:
             extra["STAGE3_PIPELINE_LOG"] = str(pipeline_log)
+        if resume_root is not None:
+            extra["STAGE3_RESUME_ROOT"] = str(resume_root)
         if request.geo:
             extra["GEO_FILTER"] = request.geo
         if self._config is not None:
@@ -742,7 +750,7 @@ class Orchestrator:
             error_class="process_missing",
             finished_at=now_iso(),
             last_message="The recorded pipeline process is no longer running.",
-            resumable=False,
+            resumable=True,
         )
         try:
             atomic_json_write(path, data)
@@ -940,7 +948,7 @@ class Orchestrator:
         )
         if finished:
             data["finished_at"] = now_iso()
-            data["resumable"] = status != "complete"
+            data["resumable"] = status in {"failed", "timeout", "interrupted"}
         try:
             atomic_json_write(handle.manifest_path, data)
         except OSError:

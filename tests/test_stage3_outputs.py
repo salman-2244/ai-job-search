@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import shlex
 import shutil
 import subprocess
 import sys
@@ -406,6 +407,191 @@ finish_pipeline
         self.assertEqual(proc.returncode, 0)
         self.assertIn("WARNING: report unavailable", proc.stdout)
         self.assertIn("Pipeline complete.", proc.stdout)
+
+    def _run_ranking_retry_harness(self, attempts, fallback="fallback-model"):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        classifier = text[
+            text.index("rank_error_class() {") : text.index("\nRANK_ATTEMPT=0")
+        ]
+        loop = text[
+            text.index("RANK_ATTEMPT=0") : text.index("\nif (( RANK_TIMED_OUT == 1 ));")
+        ]
+        fixtures = " ".join(shlex.quote(item) for item in attempts)
+        script = classifier + loop.replace("sleep \"$RANK_SLEEP\"", 'DELAYS+=" $RANK_SLEEP"')
+        prelude = f'''set -euo pipefail
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+RANK_ERR_FILE="$TMP/stderr"
+TOP5_FILE="$TMP/stdout"
+LOG_FILE="$TMP/log"
+RANK_PRIMARY_MODEL=primary-model
+RANK_FALLBACK_MODEL={shlex.quote(fallback)}
+RANK_ATTEMPTS={len(attempts)}
+RANK_BACKOFF=2
+RANK_TIMEOUT=60
+FIXTURES=({fixtures})
+MODELS=""
+DELAYS=""
+log() {{ printf '%s\n' "$*" >> "$LOG_FILE"; }}
+rank_attempt() {{
+    MODELS+=" $RANK_MODEL"
+    local fixture="${{FIXTURES[$((RANK_ATTEMPT - 1))]}}"
+    RANK_TIMED_OUT=0
+    RANK_EXIT="${{fixture%%:*}}"
+    printf '%s' "${{fixture#*:}}" > "$RANK_ERR_FILE"
+    : > "$TOP5_FILE"
+}}
+'''
+        proc = subprocess.run(
+            ["bash", "-c", prelude + script + '\nprintf "MODELS=%s\\nDELAYS=%s\\nCLASS=%s\\nEXIT=%s\\n" "$MODELS" "$DELAYS" "$RANK_ERROR_CLASS" "$RANK_EXIT"'],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout
+
+    def test_ranking_uses_project_model_and_configured_fallback(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('PROJECT_SETTINGS="$PROJECT_DIR/.claude/settings.json"', text)
+        self.assertIn("git -C \"$PROJECT_DIR\" rev-parse --path-format=absolute", text)
+        self.assertIn('SHARED_PROJECT_SETTINGS="$(dirname "$GIT_COMMON_DIR")/.claude/settings.json"', text)
+        self.assertIn("read_project_model_setting ANTHROPIC_MODEL", text)
+        self.assertIn("read_project_model_setting ANTHROPIC_FALLBACK_MODEL", text)
+        self.assertIn('--model "$RANK_MODEL"', text)
+        self.assertIn('RANK_MODEL="$RANK_FALLBACK_MODEL"', text)
+        self.assertNotIn("claude-opus-5-thinking", text)
+
+    def test_gateway_unavailable_gets_backoff_fallback_and_actionable_error(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('*"503"*|*"no available channel"*', text)
+        self.assertIn('echo "gateway-unavailable"', text)
+        self.assertIn(
+            'RANK_SLEEP=$(( RANK_BACKOFF * (1 << (RANK_ATTEMPT - 2)) ))', text
+        )
+        self.assertIn(
+            "Ranking failed: AI model gateway unavailable (503). Retry later or check API configuration.",
+            text,
+        )
+        message_helper = text[
+            text.index("rank_gateway_error_message() {") :
+            text.index("\nRANK_ATTEMPT=0")
+        ]
+        proc = subprocess.run(
+            ["bash", "-c", message_helper + "\nrank_gateway_error_message"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip(),
+            "Ranking failed: AI model gateway unavailable (503). Retry later or check API configuration.",
+        )
+
+        for marker in ("HTTP 503 Service Unavailable", "No Available Channel"):
+            with self.subTest(marker=marker):
+                output = self._run_ranking_retry_harness(
+                    [f"1:{marker}", "0:success"]
+                )
+                self.assertIn("MODELS= primary-model fallback-model", output)
+                self.assertIn("DELAYS= 2", output)
+                self.assertIn("CLASS=gateway-unavailable", output)
+                self.assertIn("EXIT=0", output)
+
+    def test_ranking_fallback_exhaustion_uses_exponential_delays(self):
+        output = self._run_ranking_retry_harness(
+            ["1:HTTP 503", "1:no available channel", "1:HTTP 503"]
+        )
+        self.assertIn(
+            "MODELS= primary-model fallback-model fallback-model", output
+        )
+        self.assertIn("DELAYS= 2 4", output)
+        self.assertIn("CLASS=gateway-unavailable", output)
+        self.assertIn("EXIT=1", output)
+
+    def test_stage3_resume_inputs_live_under_run_state_and_survive_cleanup(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        self.assertIn('RESUME_ROOT="${STAGE3_RESUME_ROOT:-}"', text)
+        self.assertIn('JOBS_FILE="$RESUME_ROOT/fetched_jobs.json"', text)
+        self.assertIn('RANKSET_FILE="$RESUME_ROOT/rankset.json"', text)
+        self.assertIn('chmod 700 "$RESUME_ROOT"', text)
+        self.assertIn('"$RESUME_ROOT" != "$(dirname "$STAGE3_PIPELINE_LOG")/resume"', text)
+        self.assertIn('find "$RESUME_ROOT" -maxdepth 1 -type f -exec chmod 600 {} +', text)
+        self.assertIn("umask 077", text)
+        self.assertIn('if [[ -z "$RESUME_ROOT" ]]; then', text)
+        self.assertIn('durable resume inputs preserved: $RESUME_ROOT', text)
+        cleanup = text[text.index("# === Phase 7: Cleanup ==="):]
+        self.assertNotIn('rm -rf "$RESUME_ROOT"', cleanup)
+
+        run_dir = self.tmp / "run"
+        resume_root = run_dir / "resume"
+        resume_root.mkdir(parents=True, mode=0o700)
+        fetched = resume_root / "fetched_jobs.json"
+        fetched.write_text('{"meta":{"unique":1},"results":[{"id":"kept"}]}')
+        fetched.chmod(0o644)
+        log_file = run_dir / "pipeline.log"
+        log_file.touch()
+        setup = text[
+            text.index('RESUME_ROOT="${STAGE3_RESUME_ROOT:-}"') :
+            text.index('PLAN_FILE="/tmp/jobsearch_plan_${TODAY}.tsv"')
+        ]
+        cleanup = cleanup[
+            cleanup.index('if [[ "$KEEP_TEMP" == "1" ]]') :
+            cleanup.index("    # $RANKSET_FILE is deliberately NOT deleted here.")
+        ] + "fi\n"
+        script = setup + '''
+log() { :; }
+KEEP_TEMP=0
+TODAY=2099-01-01
+PLAN_FILE="$TMP/plan"
+TOP5_FILE="$TMP/top5"
+NOT_DRAFTED_FILE="$TMP/not-drafted"
+WARN_FILE="$TMP/warn"
+GATE_FILE="$TMP/gate"
+''' + cleanup + '''
+[[ -s "$JOBS_FILE" ]]
+python3 - "$JOBS_FILE" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))["results"][0]["id"] == "kept"
+PY
+'''
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={
+                "HOME": str(Path.home()),
+                "PATH": "/usr/bin:/bin",
+                "TMP": str(self.tmp),
+                "STAGE3_PIPELINE_LOG": str(log_file),
+                "STAGE3_RESUME_ROOT": str(resume_root),
+            },
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(fetched.is_file())
+        self.assertEqual(resume_root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(fetched.stat().st_mode & 0o777, 0o600)
+
+    def test_resume_branch_consumes_durable_corpus_without_portal_fetches(self):
+        text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")
+        branch = text[
+            text.index('if [[ "$RESUME" == "1" ]]; then', text.index("# === Phase 1:")) :
+            text.index("log \"Phase 1: Fetching jobs from portals...\"")
+        ]
+        branch = branch.removesuffix("else\n") + "else\n    printf 'FETCH_BRANCH_REACHED\\n'\nfi\n"
+        corpus = self.tmp / "fetched_jobs.json"
+        corpus.write_text('{"meta":{"unique":1},"results":[{"id":"kept"}]}')
+        script = f'''set -euo pipefail
+RESUME=1
+JOBS_FILE={shlex.quote(str(corpus))}
+log() {{ printf '%s\n' "$*"; }}
+{branch}
+printf 'FETCH_BRANCH_NOT_REACHED\n'
+'''
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("0 new portal requests", proc.stdout)
+        self.assertNotIn("FETCH_BRANCH_REACHED", proc.stdout)
+        self.assertIn("FETCH_BRANCH_NOT_REACHED", proc.stdout)
 
     def test_job_count_cut_and_handoff_threading_present(self):
         text = (REPO / "scripts" / "run_daily.sh").read_text(encoding="utf-8")

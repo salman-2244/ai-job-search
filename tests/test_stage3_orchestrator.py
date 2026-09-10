@@ -4,6 +4,7 @@ import signal
 import subprocess
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -244,6 +245,7 @@ def test_run_environment_carries_run_id_count_geo_and_no_token(tmp_path):
     assert env["JOB_COUNT"] == "10"
     assert env["RESUME"] == "1"
     assert env["RUN_ID"]
+    assert env["STAGE3_RESUME_ROOT"].endswith(f"/{env['RUN_ID']}/resume")
     assert "STAGE3_BOT_TOKEN" not in env
     assert "synthetic-secret-value" not in json.dumps(seen["env"])
     assert command_is_clean(seen["command"])
@@ -339,6 +341,60 @@ def test_complete_marker_cannot_override_nonzero_process_exit(tmp_path):
     assert manifest["status"] == "failed"
     assert manifest["exit_code"] == 73
     assert manifest["resumable"] is True
+
+
+def test_resume_reuses_same_run_scoped_input_directory(tmp_path):
+    first_seen = {}
+
+    def first_runner(req, command, env, cwd):
+        first_seen.update(env)
+        resume_root = Path(env["STAGE3_RESUME_ROOT"])
+        resume_root.mkdir(parents=True, exist_ok=True)
+        fetched = resume_root / "fetched_jobs.json"
+        fetched.write_text('{"meta":{"unique":1},"results":[{"id":"kept"}]}')
+        fetched.chmod(0o600)
+        return FakeProcess(lines=["[10:00:00] Phase 2 FAILED (exit 1)\n"], exit_code=1)
+
+    first_orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        runner=first_runner,
+        clock=FakeClock(),
+        sleeper=lambda _: None,
+        lock_dir=None,
+    )
+    first = wait_for(
+        first_orchestrator.start(
+            request(tmp_path), state_root=tmp_path, today="2026-09-08"
+        )
+    )
+    assert first.status == "failed"
+
+    second_seen = {}
+
+    def second_runner(req, command, env, cwd):
+        second_seen.update(env)
+        fetched = Path(env["STAGE3_RESUME_ROOT"]) / "fetched_jobs.json"
+        assert fetched.is_file()
+        assert json.loads(fetched.read_text())["results"][0]["id"] == "kept"
+        assert fetched.stat().st_mode & 0o777 == 0o600
+        return FakeProcess(lines=["[10:00:00] Pipeline complete.\n"])
+
+    second_orchestrator = Orchestrator(
+        config=SYNTHETIC_CONFIG,
+        runner=second_runner,
+        clock=FakeClock(),
+        sleeper=lambda _: None,
+        lock_dir=None,
+    )
+    resumed = wait_for(
+        second_orchestrator.start(
+            request(tmp_path, env={"RESUME": "1"}),
+            state_root=tmp_path,
+            today="2026-09-08",
+        )
+    )
+    assert resumed.run_id == first.run_id
+    assert second_seen["STAGE3_RESUME_ROOT"] == first_seen["STAGE3_RESUME_ROOT"]
 
 
 def test_job_count_is_bounded(tmp_path):
@@ -745,11 +801,13 @@ def test_retention_never_touches_today_or_non_date_dirs(tmp_path):
     assert (tmp_path / "not-a-date").exists()
 
 
-def _write_manifest(root, date, run_id, status):
+def _write_manifest(root, date, run_id, status, resumable=None):
     run_dir = root / date / run_id
     run_dir.mkdir(parents=True)
+    if resumable is None:
+        resumable = status in {"running", "failed", "timeout", "interrupted"}
     (run_dir / "manifest.json").write_text(
-        json.dumps({"run_id": run_id, "status": status})
+        json.dumps({"run_id": run_id, "status": status, "resumable": resumable})
     )
     return run_dir
 
@@ -782,16 +840,23 @@ def test_resume_explicit_id_must_exist_and_be_resumable(tmp_path):
         select_resumable(tmp_path, "2026-09-08", explicit="20260908T090000Z-aaaaaa")
 
 
-@pytest.mark.parametrize(
-    "status", ["complete", "failed", "cancelled", "timeout", "interrupted"]
-)
-def test_resume_never_selects_terminal_runs(tmp_path, status):
+@pytest.mark.parametrize("status", ["complete", "cancelled"])
+def test_resume_never_selects_nonresumable_terminal_runs(tmp_path, status):
     run_id = "20260908T090000Z-aaaaaa"
     _write_manifest(tmp_path, "2026-09-08", run_id, status)
 
     assert select_resumable(tmp_path, "2026-09-08") is None
-    with pytest.raises(RunRefusedError, match="already terminal"):
+    with pytest.raises(RunRefusedError, match="not resumable"):
         select_resumable(tmp_path, "2026-09-08", explicit=run_id)
+
+
+@pytest.mark.parametrize("status", ["failed", "timeout", "interrupted"])
+def test_resume_selects_resumable_terminal_runs(tmp_path, status):
+    run_id = "20260908T090000Z-aaaaaa"
+    _write_manifest(tmp_path, "2026-09-08", run_id, status)
+
+    assert select_resumable(tmp_path, "2026-09-08") == run_id
+    assert select_resumable(tmp_path, "2026-09-08", explicit=run_id) == run_id
 
 
 def test_stale_running_manifest_is_terminal_and_not_resumable(tmp_path):
@@ -805,8 +870,8 @@ def test_stale_running_manifest_is_terminal_and_not_resumable(tmp_path):
     assert orchestrator.restore_active(tmp_path) is None
     data = json.loads(manifest.read_text())
     assert data["status"] == "interrupted"
-    assert data["resumable"] is False
-    assert select_resumable(tmp_path, "2026-09-08") is None
+    assert data["resumable"] is True
+    assert select_resumable(tmp_path, "2026-09-08") == data["run_id"]
 
 
 def test_start_resolves_resume_request_against_manifests(tmp_path):

@@ -24,17 +24,37 @@ if [[ -n "${STAGE3_PIPELINE_LOG:-}" ]]; then
     chmod 600 "$LOG_FILE"
 fi
 REPORT_FILE="$REPORT_DIR/${TODAY}.md"
+RESUME_ROOT="${STAGE3_RESUME_ROOT:-}"
+if [[ -n "$RESUME_ROOT" ]]; then
+    if [[ -z "${STAGE3_PIPELINE_LOG:-}" ||
+          "$RESUME_ROOT" != "$(dirname "$STAGE3_PIPELINE_LOG")/resume" ]]; then
+        echo "FATAL: STAGE3_RESUME_ROOT must be the supervised run's resume directory" >&2
+        exit 1
+    fi
+    mkdir -p "$RESUME_ROOT"
+    chmod 700 "$RESUME_ROOT"
+    find "$RESUME_ROOT" -maxdepth 1 -type f -exec chmod 600 {} +
+    umask 077
+    JOBS_FILE="$RESUME_ROOT/fetched_jobs.json"
+    SHORTLIST_FILE="$RESUME_ROOT/shortlist.json"
+    SHORTLIST_SUMMARY_FILE="$RESUME_ROOT/shortlist_summary.json"
+    RANKSET_FILE="$RESUME_ROOT/rankset.json"
+    DEFERRED_FILE="$RESUME_ROOT/deferred.json"
+    PRERANK_FILE="$RESUME_ROOT/prerank_summary.json"
+    ENRICH_FILE="$RESUME_ROOT/enrich_summary.json"
+else
+    JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"
+    SHORTLIST_FILE="/tmp/jobsearch_shortlist_${TODAY}.json"
+    SHORTLIST_SUMMARY_FILE="/tmp/jobsearch_shortlist_summary_${TODAY}.json"
+    RANKSET_FILE="/tmp/jobsearch_rankset_${TODAY}.json"
+    DEFERRED_FILE="/tmp/jobsearch_deferred_${TODAY}.json"
+    PRERANK_FILE="/tmp/jobsearch_prerank_summary_${TODAY}.json"
+    ENRICH_FILE="/tmp/jobsearch_enrich_summary_${TODAY}.json"
+fi
 PLAN_FILE="/tmp/jobsearch_plan_${TODAY}.tsv"
-JOBS_FILE="/tmp/jobsearch_fetched_jobs_${TODAY}.json"
 # The wide intermediate cut, between the two pre-rank stages. Enrichment reads it,
 # so it has to be a file rather than a pipe: Phase 1c writes descriptions back into
 # it and Phase 1b-final scores what Phase 1c left behind.
-SHORTLIST_FILE="/tmp/jobsearch_shortlist_${TODAY}.json"
-SHORTLIST_SUMMARY_FILE="/tmp/jobsearch_shortlist_summary_${TODAY}.json"
-RANKSET_FILE="/tmp/jobsearch_rankset_${TODAY}.json"
-DEFERRED_FILE="/tmp/jobsearch_deferred_${TODAY}.json"
-PRERANK_FILE="/tmp/jobsearch_prerank_summary_${TODAY}.json"
-ENRICH_FILE="/tmp/jobsearch_enrich_summary_${TODAY}.json"
 TOP5_FILE="/tmp/jobsearch_top5_${TODAY}.json"
 # Phase 2's stderr, kept out of the log so a failed attempt can be classified on its
 # own text rather than on the whole run's. Appended to the log either way, and the
@@ -58,8 +78,9 @@ ALERT_JOBS_FILE="/tmp/jobsearch_portal_linkedin-alert_${TODAY}.json"
 ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 
 # === Run controls (both default to off; the scheduled 08:00 run is unaffected) ===
-#   KEEP_TEMP=1   keep the /tmp artifacts for inspection instead of deleting them in
-#                 Phase 7, so the full fetched-jobs list survives the run.
+#   KEEP_TEMP=1   keep ephemeral /tmp artifacts for inspection instead of deleting
+#                 them in Phase 7. Stage 3 resume inputs are always durable under the
+#                 run directory supplied by STAGE3_RESUME_ROOT and ignore this flag.
 #   SKIP_NOTIFY=1 don't send the Telegram ping. The ping fires from the EXIT trap
 #                 on success and on failure alike, so leave it on for the 08:00 run.
 #   RANK_TIMEOUT  seconds Phase 2 may spend scoring before it is stopped. Phase 2
@@ -83,8 +104,9 @@ ALERT_STORE="$PROJECT_DIR/job_scraper/alert_matched.json"
 #                 portals, and skip enrichment. For recovering a run that fetched
 #                 successfully but died later: a second full run would fire another
 #                 ~45 LinkedIn searches on top of the ones already made today, which
-#                 breaks the approved per-day volume. Requires the Phase 1 output from
-#                 a KEEP_TEMP=1 run to still exist; refuses to invent one.
+#                 breaks the approved per-day volume. Stage 3 supplies a durable
+#                 STAGE3_RESUME_ROOT inside the selected run directory; direct legacy
+#                 invocations retain the old /tmp behavior.
 #   GEO_FILTER    restrict the LinkedIn half of the search plan to one or more geos,
 #                 comma-separated ("Germany", "Germany,Austria"). Names are matched
 #                 case-insensitively against config/search_matrix.json's `geos`, and an
@@ -127,6 +149,43 @@ KEEP_TEMP="${KEEP_TEMP:-0}"
 RANK_TIMEOUT="${RANK_TIMEOUT:-1800}"
 RANK_ATTEMPTS="${RANK_ATTEMPTS:-3}"
 RANK_BACKOFF="${RANK_BACKOFF:-20}"
+# Model selection is configuration, not source policy. The primary comes from this
+# checkout's Claude settings (the same setting interactive Claude Code uses). Operators
+# may configure a distinct fallback in the same env object or override either value for
+# one run; an absent fallback simply means retry the configured primary.
+PROJECT_SETTINGS="$PROJECT_DIR/.claude/settings.json"
+if [[ ! -f "$PROJECT_SETTINGS" ]] && command -v git >/dev/null 2>&1; then
+    GIT_COMMON_DIR=$(git -C "$PROJECT_DIR" rev-parse --path-format=absolute \
+        --git-common-dir 2>/dev/null || true)
+    if [[ -n "$GIT_COMMON_DIR" ]]; then
+        SHARED_PROJECT_SETTINGS="$(dirname "$GIT_COMMON_DIR")/.claude/settings.json"
+        [[ -f "$SHARED_PROJECT_SETTINGS" ]] && PROJECT_SETTINGS="$SHARED_PROJECT_SETTINGS"
+    fi
+fi
+read_project_model_setting() {
+    local key="$1"
+    python3 - "$PROJECT_SETTINGS" "$key" <<'PYTHON_SCRIPT'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    print("")
+else:
+    value = data.get("env", {}).get(key, "")
+    print(value if isinstance(value, str) else "")
+PYTHON_SCRIPT
+}
+RANK_PRIMARY_MODEL="${RANK_PRIMARY_MODEL:-$(read_project_model_setting ANTHROPIC_MODEL)}"
+RANK_FALLBACK_MODEL="${RANK_FALLBACK_MODEL:-$(read_project_model_setting ANTHROPIC_FALLBACK_MODEL)}"
+if [[ -z "$RANK_PRIMARY_MODEL" ]]; then
+    echo "FATAL: ranking model is not configured in project settings (env.ANTHROPIC_MODEL)" >&2
+    exit 1
+fi
 RESUME="${RESUME:-0}"
 # Defaulted rather than left unset because the script runs under `set -u`, where the
 # bare reference at the plan-builder call site would abort the run instead of meaning
@@ -858,6 +917,7 @@ rank_attempt() {
     RANK_EXIT=0
     RANK_TIMED_OUT=0
     claude -p "$RANK_PROMPT" \
+        --model "$RANK_MODEL" \
         --allowedTools "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Agent" \
         --output-format text < /dev/null 2>>"$RANK_ERR_FILE" > "$TOP5_FILE" &
     RANK_PID=$!
@@ -902,17 +962,25 @@ rank_error_class() {
         *"authentication_error"*|*"unauthorized"*|*"permission_error"*|\
         *"credit balance"*|*"insufficient"*)
             echo "non-retryable (auth/quota)" ;;
-        *"429"*|*"rate limit"*|*"overloaded"*|*"500"*|*"502"*|*"503"*|*"504"*|\
+        *"503"*|*"no available channel"*)
+            echo "gateway-unavailable" ;;
+        *"429"*|*"rate limit"*|*"overloaded"*|*"500"*|*"502"*|*"504"*|\
         *"econnreset"*|*"socket hang up"*|*"fetch failed"*|*"upstream"*)
             echo "transient" ;;
         *)  echo "unclassified" ;;
     esac
 }
 
+rank_gateway_error_message() {
+    printf '%s\n' "Ranking failed: AI model gateway unavailable (503). Retry later or check API configuration."
+}
+
 RANK_ATTEMPT=0
 RANK_EXIT=0
 RANK_TIMED_OUT=0
 RANK_ERROR_CLASS=""
+RANK_MODEL="$RANK_PRIMARY_MODEL"
+RANK_USED_FALLBACK=0
 
 while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
     RANK_ATTEMPT=$((RANK_ATTEMPT + 1))
@@ -921,7 +989,7 @@ while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
         RANK_SLEEP=$(( RANK_BACKOFF * (1 << (RANK_ATTEMPT - 2)) ))
         log "Phase 2: waiting ${RANK_SLEEP}s before attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS}"
         sleep "$RANK_SLEEP"
-        log "Phase 2: retrying (attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS})"
+        log "Phase 2: retrying with configured model '$RANK_MODEL' (attempt ${RANK_ATTEMPT} of ${RANK_ATTEMPTS})"
     fi
 
     : > "$RANK_ERR_FILE"
@@ -952,6 +1020,14 @@ while (( RANK_ATTEMPT < RANK_ATTEMPTS )); do
         log "Phase 2: not retrying — this error class does not clear on its own"
         break
     fi
+    if [[ "$RANK_ERROR_CLASS" == "gateway-unavailable" &&
+          "$RANK_USED_FALLBACK" == "0" &&
+          -n "$RANK_FALLBACK_MODEL" &&
+          "$RANK_FALLBACK_MODEL" != "$RANK_MODEL" ]]; then
+        RANK_MODEL="$RANK_FALLBACK_MODEL"
+        RANK_USED_FALLBACK=1
+        log "Phase 2: gateway unavailable; next attempt will use the configured fallback model '$RANK_MODEL'"
+    fi
 done
 
 if (( RANK_TIMED_OUT == 1 )); then
@@ -978,7 +1054,13 @@ print(len(data) if data is not None else 0)
     fi
 else
     RANKED_COUNT=0
-    record_critical_failure "$RANK_EXIT" "Ranking failed after ${RANK_ATTEMPT} attempt(s)"
+    if [[ "$RANK_ERROR_CLASS" == "gateway-unavailable" ]]; then
+        RANK_FAILURE_MESSAGE=$(rank_gateway_error_message)
+        record_critical_failure "$RANK_EXIT" "$RANK_FAILURE_MESSAGE"
+        log "$RANK_FAILURE_MESSAGE"
+    else
+        record_critical_failure "$RANK_EXIT" "Ranking failed after ${RANK_ATTEMPT} attempt(s)"
+    fi
     # Keep the failing stdout before overwriting it. The 2026-08-23 run replaced the
     # only copy of the ranker's output with "[]", which is why that failure had to be
     # diagnosed from a timestamp and an exit code.
@@ -1540,13 +1622,21 @@ if [[ "$KEEP_TEMP" == "1" ]]; then
 else
     log "Cleaning up temp files..."
     rm -f /tmp/jobsearch_portal_*_${TODAY}.json
-    rm -f "$PLAN_FILE" "$JOBS_FILE" "$TOP5_FILE" "$NOT_DRAFTED_FILE" "$WARN_FILE" "$ENRICH_FILE" "$GATE_FILE"
-    rm -f "$SHORTLIST_FILE" "$SHORTLIST_SUMMARY_FILE"
+    rm -f "$PLAN_FILE" "$TOP5_FILE" "$NOT_DRAFTED_FILE" "$WARN_FILE" "$GATE_FILE"
+    if [[ -z "$RESUME_ROOT" ]]; then
+        rm -f "$JOBS_FILE" "$SHORTLIST_FILE" "$SHORTLIST_SUMMARY_FILE"
+        rm -f "$DEFERRED_FILE" "$PRERANK_FILE" "$ENRICH_FILE"
+    else
+        log "  durable resume inputs preserved: $RESUME_ROOT"
+        find "$RESUME_ROOT" -maxdepth 1 -type f -exec chmod 600 {} +
+    fi
     # $RANKSET_FILE is deliberately NOT deleted here. Phase 3 handed it to the
     # selector, which reads it when the buttons are pressed — possibly hours from
     # now, and again after a crash restart. Deleting it would leave the listener
     # with nothing to offer and no way to recover.
-    rm -f "$DEFERRED_FILE" "$PRERANK_FILE"
+    if [[ -z "$RESUME_ROOT" ]]; then
+        rm -f "$DEFERRED_FILE" "$PRERANK_FILE"
+    fi
     rm -f "$APPLICABLE_FILE" "$QA_FILE"
     rm -rf "$APP_PACKAGES_DIR"
     # The ranker's stderr and its failed stdout are kept when Phase 2 did not
