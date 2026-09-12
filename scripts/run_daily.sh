@@ -985,9 +985,17 @@ rank_error_class() {
     text=$(printf '%s' "$text" | tr '[:upper:]' '[:lower:]')
     case "$text" in
         *"401"*|*"403"*|*"invalid api key"*|*"invalid x-api-key"*|\
-        *"authentication_error"*|*"unauthorized"*|*"permission_error"*|\
+        *"authentication_error"*|*"unauthorized"*|*"permission_error"*)
+            # Split from quota deliberately. Both are non-retryable and the
+            # `non-retryable*` guards below treat them identically, but this label
+            # is quoted verbatim into the Phase 2 failure message, and that message
+            # is the *only* text stage_3/orchestrator.py::_classify_error reads. The
+            # old combined "auth/quota" contained none of its auth markers and did
+            # contain "quota", so a rejected credential was reported to Salman's
+            # phone as an exhausted balance. Name one cause, not two.
+            echo "non-retryable (auth)" ;;
         *"credit balance"*|*"insufficient"*)
-            echo "non-retryable (auth/quota)" ;;
+            echo "non-retryable (quota)" ;;
         *"503"*|*"no available channel"*)
             echo "gateway-unavailable" ;;
         *"429"*|*"rate limit"*|*"overloaded"*|*"500"*|*"502"*|*"504"*|\

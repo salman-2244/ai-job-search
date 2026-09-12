@@ -67,7 +67,15 @@ _TERMINAL_STATUSES = frozenset({
 _EOF = object()  # sentinel: the child's stdout closed
 
 _ERROR_CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("auth", ("authentication", "login failed", "sign in", "401", "credential")),
+    # Bare "auth" is here because run_daily.sh's rank_error_class() emits
+    # "non-retryable (auth)" and that phrase is all this classifier ever sees:
+    # _classify_error reads the failed phase's own message, not the pipeline log, so
+    # the underlying "HTTP status 401" never reaches it. Without this marker a
+    # rejected credential matches no class and lands on "transient", which reads as
+    # "try again later" for the one failure that never clears on its own. The older
+    # combined label "auth/quota" matched no auth marker and did match "quota",
+    # which is how run 20260912T011743Z reported a 401 to Salman as a spent balance.
+    ("auth", ("auth", "authentication", "login failed", "sign in", "401", "credential")),
     ("permission", ("permission denied", "unauthorized", "forbidden")),
     ("quota", ("quota", "rate limit", "429")),
     ("credit", ("credit", "billing", "payment")),
