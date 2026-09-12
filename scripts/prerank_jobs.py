@@ -1041,7 +1041,8 @@ def main():
              "gate_failed_language": 0, "gate_failed_experience": 0,
              "gate_failed_sponsorship": 0,
              "gate_failed_seniority": 0, "gate_failed_pure_technical": 0,
-             "gate_failed_closed": 0}
+             "gate_failed_closed": 0, "gate_failed_geography": 0,
+             "gate_failed_recency": 0}
 
     # The gates run only under the two-axis model, for the same reason the slot fixes
     # do (see `preference_key`), and because `pure_technical_verdict` reads the axis
@@ -1090,7 +1091,7 @@ def main():
         # about whether the posting demands fluent Hungarian or eight years.
         gates = None
         if gating:
-            gates = _gates.evaluate(job, row[AXES], min_body_domains)
+            gates = _gates.evaluate(job, row[AXES], min_body_domains, today)
             gate_log[id(job)] = gates
             if gates["overall"] == _gates.FAIL:
                 stats["gate_failed"] += 1

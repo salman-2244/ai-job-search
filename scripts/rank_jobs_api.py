@@ -22,6 +22,9 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 SCORE_FIELDS = ("technical", "experience", "behavioral", "career")
 SCORE_WEIGHTS = (0.30, 0.25, 0.15, 0.30)
 GATE_VALUES = {"PASS", "FLAG", "FAIL"}
+# The one verdict this module now *acts* on rather than merely spells-checks. Named
+# so the enforcement in `derive_outputs` cannot drift from the validator above.
+FAIL_VERDICT = "FAIL"
 
 
 class RankingConfigError(Exception):
@@ -283,9 +286,45 @@ def derive_outputs(
     live_alerts = _alert_keys(alerts, today)
     ranked = []
     not_drafted = []
+    dropped = []
 
     for decision in decisions:
-        if decision["decision"] == "drop":
+        # LAW 0. A gate verdict is a verdict, not an annotation.
+        #
+        # Until 2026-09-12 this loop copied `location_gate` and `language_gate` into
+        # the result dict (below) and never compared either to FAIL. `"FAIL"` appeared
+        # exactly once in this module — in the `GATE_VALUES` spelling check — so a
+        # reply of {"decision":"score","location_gate":"FAIL"} was scored, gated,
+        # drafted and delivered exactly like a clean one. The model was being asked
+        # the right question on every run and its answer was thrown away, which is the
+        # whole reason "European countries only" and the language rule never bit.
+        #
+        # Coerced rather than raised: having `validate_decisions` reject the batch
+        # would sink 25 good jobs over one inconsistent row, and the safe reading of
+        # "score 82, location FAIL" is unambiguous — the gate wins. The coercion is
+        # recorded so a model that starts doing this often stays visible.
+        gate_failed = [name[: -len("_gate")]
+                       for name in ("location_gate", "language_gate")
+                       if str(decision.get(name) or "").upper() == FAIL_VERDICT]
+        if decision["decision"] == "drop" or gate_failed:
+            reason = decision.get("drop_reason") or ""
+            if gate_failed and decision["decision"] != "drop":
+                reason = (f"{', '.join(gate_failed)} gate returned FAIL alongside a "
+                          "score decision - the gate wins"
+                          + (f"; {reason}" if reason else ""))
+            job = jobs_by_key[decision["key"]]
+            dropped.append({
+                "key": decision["key"],
+                "title": job.get("title"),
+                "company": job.get("company"),
+                "location": job.get("location"),
+                "portal": job.get("portal"),
+                "url": job.get("url"),
+                "drop_reason": reason,
+                "location_gate": decision.get("location_gate"),
+                "language_gate": decision.get("language_gate"),
+                "coerced": bool(gate_failed and decision["decision"] != "drop"),
+            })
             continue
         key = decision["key"]
         job = jobs_by_key[key]
@@ -333,6 +372,21 @@ def derive_outputs(
 
     ranked.sort(key=lambda item: (-item["score"], not item["alert_matched"], not bool(jobs_by_key[item["key"]].get("description"))))
     not_drafted.sort(key=lambda item: -item["score"])
+    # Every exclusion names itself. The funnel's standing rule is that nothing is cut
+    # silently (deferred lists, closest-miss tables, unverified-gate surfacing all
+    # exist for this), and drops were the one cut that vanished without a trace — the
+    # model's `drop_reason` was parsed, validated as non-empty, and then discarded by
+    # the `continue` this block replaced. stderr rather than stdout so the line lands
+    # in the run log without touching any consumer that parses stdout.
+    for item in dropped:
+        print(f"[rank] dropped {item['company']} — {item['title']} "
+              f"({item.get('location') or 'location unstated'}): {item['drop_reason']}"
+              + ("  [gate-coerced]" if item["coerced"] else ""),
+              file=sys.stderr)
+    if dropped:
+        print(f"[rank] {len(dropped)} of {len(decisions)} job(s) dropped "
+              f"({sum(1 for d in dropped if d['coerced'])} by gate coercion)",
+              file=sys.stderr)
     return ranked, not_drafted, seen
 
 

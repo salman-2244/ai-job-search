@@ -64,6 +64,7 @@ This module is pure. It reads no files and writes nothing.
 
 import re
 import unicodedata
+from datetime import date as _date
 from functools import lru_cache
 
 # --------------------------------------------------------------------- verdicts
@@ -1252,9 +1253,260 @@ def pure_technical_verdict(axes: dict, min_body_domains: int = 2) -> dict:
                          else "the posting shows no business domain at all")}
 
 
+# ------------------------------------------------------------- geography gate
+#
+# LAW 2. Europe-only is a stated deal-breaker and until 2026-09-12 no code in this
+# pipeline enforced it. `prerank_jobs.preference_key` *ordered* Hungary and remote-EU
+# ahead of the rest and said so in its own docstring ("this orders rather than
+# excludes", prerank_jobs.py:699-701). The rank prompt asked the model for a
+# `location_gate`, and `rank_jobs_api.derive_outputs` copied that field into the output
+# dict without ever comparing it to FAIL. So a San Francisco posting could be fetched,
+# enriched, ranked, gated and drafted with three separate layers recording its location
+# and none of them acting on it.
+#
+# The asymmetry here follows the rest of the module rather than the naive reading of
+# "Europe only". A location string is short and structured, but it is also routinely
+# absent, partial ("Remote"), or a bare city name. Convicting on the *absence* of a
+# European name would discard most of the non-LinkedIn corpus, which is a far larger
+# error than letting a job through to the sponsorship and language gates. So:
+#
+#   FAIL    — the text positively names a non-European country, a US state, or an
+#             unambiguous non-European metro: "Austin, TX", "Remote (US only)".
+#   PASS    — the text positively names a European country or target metro.
+#   UNKNOWN — everything else, including a bare "Remote" or "Anywhere".
+#
+# Non-European is tested *first* and wins ties, which is what makes the metro table
+# safe: "Paris, TX" and "Berlin, NH" match a European metro and a US state, and the
+# state is the more specific signal. Genuinely ambiguous names appear in neither
+# table — "Georgia" is a US state and a Council-of-Europe country, and "Cambridge",
+# "Birmingham" and "Perth" each name a British city and a non-European one. Matching
+# any of those would convict or acquit on a coin flip.
+
+NON_EUROPEAN_MARKERS = (
+    "united states", "united states of america", "usa", "u s a",
+    "north america", "latin america", "south america", "central america",
+    "canada", "mexico", "brazil", "argentina", "chile", "colombia", "peru",
+    "australia", "new zealand", "sydney", "melbourne", "auckland",
+    "india", "bangalore", "bengaluru", "hyderabad", "mumbai", "delhi", "pune",
+    "chennai", "gurgaon", "noida", "pakistan", "karachi", "lahore", "islamabad",
+    "bangladesh", "sri lanka", "nepal",
+    "china", "beijing", "shanghai", "shenzhen", "japan", "tokyo", "osaka",
+    "south korea", "seoul", "taiwan", "taipei", "hong kong", "singapore",
+    "malaysia", "kuala lumpur", "indonesia", "jakarta", "philippines", "manila",
+    "vietnam", "hanoi", "thailand", "bangkok",
+    "united arab emirates", "uae", "dubai", "abu dhabi", "qatar", "doha",
+    "saudi arabia", "riyadh", "jeddah", "kuwait", "bahrain", "oman", "muscat",
+    "israel", "tel aviv", "jerusalem",
+    "south africa", "johannesburg", "cape town", "nigeria", "lagos", "kenya",
+    "nairobi", "egypt", "cairo", "morocco", "ghana", "ethiopia", "tanzania",
+    "us only", "usa only", "us based", "us-based", "united states only",
+    "americas only", "north america only",
+)
+
+# "City, ST" is the dominant US/Canadian posting format and a two-letter token is far
+# too short to match loosely — the comma and the end-of-field anchor are what make
+# this precise. Canadian provinces sit in the same table because the verdict is the
+# same. "IN" (Indiana), "OR" (Oregon) and "DE" (Delaware) are real English words and
+# real country codes, so they are reachable only through this anchored pattern and
+# never as bare substrings.
+_US_CA_SUBDIVISIONS = (
+    "al", "ak", "az", "ar", "ca", "co", "ct", "de", "fl", "ga", "hi", "id",
+    "il", "in", "ia", "ks", "ky", "la", "me", "md", "ma", "mi", "mn", "ms",
+    "mo", "mt", "ne", "nv", "nh", "nj", "nm", "ny", "nc", "nd", "oh", "ok",
+    "or", "pa", "ri", "sc", "sd", "tn", "tx", "ut", "vt", "va", "wa", "wv",
+    "wi", "wy", "dc",
+    "ab", "bc", "mb", "nb", "nl", "ns", "nt", "nu", "on", "pe", "qc", "sk", "yt",
+)
+_SUBDIVISION_SUFFIX = re.compile(
+    r",\s*(" + "|".join(_US_CA_SUBDIVISIONS) + r")\s*(?:,\s*(?:usa|us|canada))?\s*$"
+)
+
+# Full US state names, minus the ones that collide with a European or
+# Council-of-Europe place name. "Georgia" is the country as often as the state in a
+# job feed, so it is absent by design and reachable only via the ", GA" suffix above.
+_US_STATE_NAMES = (
+    "alabama", "alaska", "arizona", "arkansas", "california", "colorado",
+    "connecticut", "delaware", "florida", "hawaii", "idaho", "illinois",
+    "indiana", "iowa", "kansas", "kentucky", "louisiana", "maryland",
+    "massachusetts", "michigan", "minnesota", "mississippi", "missouri",
+    "montana", "nebraska", "nevada", "new hampshire", "new jersey",
+    "new mexico", "new york", "north carolina", "north dakota", "ohio",
+    "oklahoma", "oregon", "pennsylvania", "rhode island", "south carolina",
+    "south dakota", "tennessee", "texas", "utah", "vermont", "virginia",
+    "washington", "west virginia", "wisconsin", "wyoming",
+)
+
+EUROPEAN_MARKERS = (
+    # Countries — the geographic continent, not just the EU, because the profile's
+    # target list includes the UK, Switzerland and Norway.
+    "albania", "andorra", "austria", "belarus", "belgium", "bosnia", "bulgaria",
+    "croatia", "cyprus", "czech republic", "czechia", "denmark", "estonia",
+    "finland", "france", "germany", "greece", "hungary", "iceland", "ireland",
+    "italy", "kosovo", "latvia", "liechtenstein", "lithuania", "luxembourg",
+    "malta", "moldova", "monaco", "montenegro", "netherlands", "holland",
+    "north macedonia", "norway", "poland", "portugal", "romania", "san marino",
+    "serbia", "slovakia", "slovenia", "spain", "sweden", "switzerland",
+    "ukraine", "united kingdom", "great britain", "england", "scotland",
+    "wales", "northern ireland",
+    # Supranational phrasings that appear in remote postings.
+    "europe", "european union", "european economic area", "eea",
+    "remote eu", "eu remote", "eu only", "europe only", "eu-based", "eu based",
+    # Target metros, so a bare city still decides.
+    "budapest", "debrecen", "szeged",
+    "berlin", "munich", "muenchen", "hamburg", "frankfurt", "cologne", "koln",
+    "stuttgart", "dusseldorf", "dortmund", "leipzig", "dresden", "nuremberg",
+    "hannover", "bonn", "essen", "bremen", "karlsruhe", "mannheim",
+    "vienna", "wien", "graz", "linz", "salzburg",
+    "prague", "brno", "bratislava", "ljubljana", "zagreb", "belgrade",
+    "warsaw", "krakow", "wroclaw", "gdansk", "poznan",
+    "amsterdam", "rotterdam", "the hague", "eindhoven", "utrecht", "groningen",
+    "brussels", "antwerp", "ghent", "leuven",
+    "luxembourg city", "zurich", "geneva", "basel", "bern", "lausanne", "zug",
+    "stockholm", "gothenburg", "goteborg", "malmo", "uppsala",
+    "oslo", "bergen", "trondheim",
+    "copenhagen", "aarhus", "odense", "aalborg",
+    "helsinki", "espoo", "tampere", "vantaa", "oulu", "turku",
+    "dublin", "cork", "galway", "limerick",
+    "london", "manchester", "edinburgh", "glasgow", "bristol", "leeds",
+    "liverpool", "sheffield", "nottingham", "belfast", "cardiff", "reading",
+    "paris", "lyon", "toulouse", "marseille", "bordeaux", "lille", "nantes",
+    "madrid", "barcelona", "valencia", "seville", "malaga", "bilbao",
+    "lisbon", "porto", "milan", "rome", "turin", "bologna", "florence",
+    "naples", "athens", "thessaloniki", "bucharest", "cluj", "timisoara",
+    "sofia", "tallinn", "riga", "vilnius", "reykjavik",
+)
+
+
+@lru_cache(maxsize=4096)
+def _boundary(marker: str) -> re.Pattern:
+    """A marker anchored at both ends, so 'us' never matches inside 'business'."""
+    return re.compile(r"(?<![a-z0-9])" + re.escape(marker) + r"(?![a-z0-9])")
+
+
+def _word_in(marker: str, text: str) -> bool:
+    return bool(text) and bool(_boundary(marker).search(text))
+
+
+def _excerpt_plain(raw: str, marker: str) -> str:
+    """The window of original text around a marker, for the report's evidence column."""
+    hit = _boundary(marker).search(_norm(raw))
+    if not hit:
+        return " ".join(str(raw).split())[:120]
+    start = max(0, hit.start() - 40)
+    span = " ".join(str(raw)[start:hit.end() + 40].split())
+    return (((_ELLIPSIS if start else "") + span))[:_QUOTE_CHARS]
+
+
+def geography_verdict(location, title="", description="") -> dict:
+    """Is this role located somewhere the profile can realistically work?
+
+    Reads the structured `location` field first and falls back to title and body,
+    because remote postings routinely carry the restriction in the title
+    ("Data Analyst (US Remote)") and leave the location field empty.
+
+    Convicts only on positive evidence, never on silence — see the section note
+    above for why "no European name found" is not a rejection.
+    """
+    raw = " ".join(str(part or "") for part in (location, title, description))
+    text = _norm(raw)
+    field = _norm(location)
+
+    # Runs against the raw field, not `_norm`'s output: the comma is the whole
+    # signal here and `_norm` drops it.
+    if _SUBDIVISION_SUFFIX.search(str(location or "").strip().lower()):
+        return {"verdict": FAIL, "marker": "us/ca subdivision",
+                "quote": " ".join(str(location).split())[:120],
+                "reason": f"location '{str(location).strip()[:60]}' is a "
+                          "US/Canadian state-or-province address"}
+    for marker in NON_EUROPEAN_MARKERS:
+        if _word_in(marker, text):
+            return {"verdict": FAIL, "marker": marker,
+                    "quote": _excerpt_plain(raw, marker),
+                    "reason": "the posting places the role outside Europe "
+                              f"('{marker}')"}
+    for marker in _US_STATE_NAMES:
+        if _word_in(marker, text):
+            return {"verdict": FAIL, "marker": marker,
+                    "quote": _excerpt_plain(raw, marker),
+                    "reason": f"the posting names the US state '{marker}'"}
+    for marker in EUROPEAN_MARKERS:
+        if _word_in(marker, field) or _word_in(marker, text):
+            return {"verdict": PASS, "marker": marker, "quote": None,
+                    "reason": f"the posting places the role in Europe ('{marker}')"}
+    if not str(location or "").strip():
+        return {"verdict": UNKNOWN, "marker": None, "quote": None,
+                "reason": "the posting carries no location field to judge"}
+    return {"verdict": UNKNOWN, "marker": None, "quote": None,
+            "reason": f"location '{str(location).strip()[:60]}' names no country "
+                      "this gate recognises either way"}
+
+
+# --------------------------------------------------------------- recency gate
+#
+# LAW 3. "Prioritising recent jobs" was ordering-only too: `_recency_key` is a
+# tie-break inside `preference_key` (prerank_jobs.py:670-702), and `jobage_days: 14`
+# constrains the LinkedIn *search*, not the aggregated corpus. Alert-sourced and
+# non-LinkedIn portals contribute postings of any age, and a stale posting is the
+# cheapest possible waste: it spends an enrichment request and a rank slot to produce
+# an application nobody is reading.
+#
+# Same asymmetry once more. A parsable date older than the cap is positive evidence
+# and convicts. A missing or unparsable date is not evidence of staleness — several
+# portals simply omit the field — so it returns UNKNOWN and the job survives on its
+# other merits. `today` is injected rather than read from the clock, so the module
+# stays pure and the tests stay deterministic; without it the gate cannot judge and
+# says so rather than guessing.
+
+MAX_POSTING_AGE_DAYS = 45
+
+
+def recency_verdict(date_posted, today=None,
+                    max_age_days: int = MAX_POSTING_AGE_DAYS) -> dict:
+    """Is this posting recent enough to be worth an application?
+
+    `date_posted` arrives ISO 8601 with a timezone on LinkedIn
+    ("2026-08-19T08:55:16.000Z") and as a bare date elsewhere; both reduce to their
+    leading YYYYMMDD. `today` is the same bare-date string the rest of the pipeline
+    passes around.
+    """
+    posted = _ymd(date_posted)
+    now = _ymd(today)
+    if posted is None:
+        return {"verdict": UNKNOWN, "marker": None, "quote": None,
+                "reason": "the posting carries no readable date"}
+    if now is None:
+        return {"verdict": UNKNOWN, "marker": None, "quote": None,
+                "reason": "no reference date supplied to measure posting age against"}
+    age = (now - posted).days
+    if age > max_age_days:
+        return {"verdict": FAIL, "marker": str(date_posted)[:10],
+                "quote": str(date_posted)[:40],
+                "reason": f"posted {age} days ago, past the {max_age_days}-day "
+                          "freshness limit"}
+    if age < 0:
+        # A future date is a portal bug, not freshness. Unjudgeable beats promoting
+        # it to the newest posting in the corpus.
+        return {"verdict": UNKNOWN, "marker": str(date_posted)[:10], "quote": None,
+                "reason": f"posting date {str(date_posted)[:10]} is in the future"}
+    return {"verdict": PASS, "marker": str(date_posted)[:10], "quote": None,
+            "reason": f"posted {age} days ago"}
+
+
+def _ymd(value):
+    """The leading YYYYMMDD of any date-ish string, as a date. None when unreadable."""
+    digits = "".join(c for c in str(value or "") if c.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return _date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+    except ValueError:
+        return None
+
+
 # ------------------------------------------------------------------ combined
 
-def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
+def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2,
+             today=None) -> dict:
     """Run all five gates over one job and return a single verdict block.
 
     `overall` is FAIL if any gate failed, PASS if all decided and none failed, and
@@ -1315,12 +1567,31 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
     # `closed_verdict`. A closed banner convicts on a snippet; a clean snippet does
     # not acquit, because the banner sits in the region a snippet truncates.
     closed = closed_verdict(title, body, full_text=full_text, caveat=caveat)
+    # Geography and recency read structured fields rather than prose, so neither is
+    # subject to the `_unverified` completeness cap: a `location` string and a
+    # `date_posted` stamp are whole or missing, never truncated mid-sentence. Both
+    # return UNKNOWN when the field is absent, which is the same protection by a
+    # different route.
+    geography = geography_verdict(job.get("location"), title, body)
+    recency = recency_verdict(job.get("date_posted"), today)
 
     verdicts = (language["verdict"], experience["verdict"], sponsorship["verdict"],
-                seniority["verdict"], technical["verdict"], closed["verdict"])
+                seniority["verdict"], technical["verdict"], closed["verdict"],
+                geography["verdict"], recency["verdict"])
     if FAIL in verdicts:
         overall = FAIL
-    elif UNKNOWN in verdicts:
+    # Geography and recency are deliberately excluded from the UNKNOWN roll-up, and
+    # only from that half. UNKNOWN here means one thing operationally: "spend an
+    # enrichment request on this job, the answer is in the body we have not fetched"
+    # (see `enrich_linkedin`'s priority 0). That is true of language, experience,
+    # sponsorship and closed. It is false of these two — fetching a posting body does
+    # not add a `location` field or a `date_posted` stamp, so their UNKNOWN is
+    # permanent and rolling it up would mark most of the corpus unverified-forever,
+    # drowning the signal that actually buys something. Their FAIL still convicts
+    # above, which is the half that enforces the rule.
+    elif UNKNOWN in (language["verdict"], experience["verdict"],
+                     sponsorship["verdict"], seniority["verdict"],
+                     technical["verdict"], closed["verdict"]):
         overall = UNKNOWN
     else:
         overall = PASS
@@ -1329,7 +1600,8 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
               (("language", language), ("experience", experience),
                ("sponsorship", sponsorship),
                ("seniority", seniority), ("pure_technical", technical),
-               ("closed", closed))
+               ("closed", closed), ("geography", geography),
+               ("recency", recency))
               if block["verdict"] == FAIL]
     return {
         "overall": overall,
@@ -1340,6 +1612,8 @@ def evaluate(job: dict, axes: dict = None, min_body_domains: int = 2) -> dict:
         "seniority": seniority,
         "pure_technical": technical,
         "closed": closed,
+        "geography": geography,
+        "recency": recency,
         "evidence_chars": len(body),
         "evidence_source": ("description_truncated" if cut_body
                             else "description" if description
