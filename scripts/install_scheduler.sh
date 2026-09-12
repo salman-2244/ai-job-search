@@ -29,24 +29,55 @@ PYTHON_BIN=$(cd -P -- "$(dirname -- "$PYTHON_BIN")" && pwd)/$(basename -- "$PYTH
 
 mkdir -p "$LAUNCH_AGENTS_DIR" "$PROJECT_DIR/logs/daily"
 chmod 700 "$LAUNCH_AGENTS_DIR" 2>/dev/null || true
-for log in launchd-stdout.log launchd-stderr.log selector-stdout.log selector-stderr.log; do
+for log in launchd-stdout.log launchd-stderr.log selector-stdout.log selector-stderr.log \
+           stage3-stdout.log stage3-stderr.log; do
     (umask 077; : >> "$PROJECT_DIR/logs/daily/$log")
     chmod 600 "$PROJECT_DIR/logs/daily/$log"
 done
 
-for name in com.salman.jobsearch.daily com.salman.jobsearch.selector; do
-    source_plist="$PROJECT_DIR/$name.plist"
-    installed_plist="$LAUNCH_AGENTS_DIR/$name.plist"
-    launchctl unload "$installed_plist" 2>/dev/null || true
+# Runs are triggered from Telegram, so the Stage 3 bot is what has to be up; the
+# 08:00 clock trigger is off. com.salman.jobsearch.daily is still rendered and
+# installed so `launchctl kickstart` and a manual bash run_daily.sh keep working,
+# but it is deliberately NOT loaded -- appending it to the load list below would
+# silently resurrect the schedule every time this installer runs.
+#
+# Set JOBSEARCH_ENABLE_DAILY=1 to put the 08:00 trigger back.
+LOAD_LABELS=(com.salman.jobsearch.stage3 com.salman.jobsearch.selector)
+RENDER_ONLY_LABELS=(com.salman.jobsearch.daily)
+if [[ "${JOBSEARCH_ENABLE_DAILY:-0}" == "1" ]]; then
+    LOAD_LABELS+=(com.salman.jobsearch.daily)
+    RENDER_ONLY_LABELS=()
+fi
+
+render_plist() {
+    local name="$1"
     "$PYTHON_BIN" "$PROJECT_DIR/scripts/render_launchd_plist.py" \
-        "$source_plist" "$installed_plist" "$PROJECT_DIR" "$PYTHON_BIN"
-    launchctl load "$installed_plist"
+        "$PROJECT_DIR/$name.plist" "$LAUNCH_AGENTS_DIR/$name.plist" \
+        "$PROJECT_DIR" "$PYTHON_BIN"
+}
+
+for name in ${RENDER_ONLY_LABELS+"${RENDER_ONLY_LABELS[@]}"}; do
+    launchctl unload "$LAUNCH_AGENTS_DIR/$name.plist" 2>/dev/null || true
+    render_plist "$name"
 done
 
-echo "Scheduler and selector installed successfully."
+for name in "${LOAD_LABELS[@]}"; do
+    launchctl unload "$LAUNCH_AGENTS_DIR/$name.plist" 2>/dev/null || true
+    render_plist "$name"
+    launchctl load "$LAUNCH_AGENTS_DIR/$name.plist"
+done
+
+echo "Stage 3 bot and selector installed successfully."
 echo "  Checkout: $PROJECT_DIR"
-echo "  Schedule: daily at 08:00 Europe/Budapest"
-echo "  Labels: com.salman.jobsearch.daily, com.salman.jobsearch.selector"
+if [[ "${JOBSEARCH_ENABLE_DAILY:-0}" == "1" ]]; then
+    echo "  Schedule: daily at 08:00 Europe/Budapest (JOBSEARCH_ENABLE_DAILY=1)"
+else
+    echo "  Schedule: none -- runs are started from Telegram with /run <count>"
+    echo "            (08:00 trigger rendered but not loaded; set"
+    echo "             JOBSEARCH_ENABLE_DAILY=1 to re-enable it)"
+fi
+echo "  Loaded: ${LOAD_LABELS[*]}"
 echo ""
 echo "Verify with: launchctl list | grep com.salman.jobsearch"
+echo "Start a run: send /run 15 to the Stage 3 bot on Telegram"
 echo "Run manually: bash $PROJECT_DIR/scripts/run_daily.sh"

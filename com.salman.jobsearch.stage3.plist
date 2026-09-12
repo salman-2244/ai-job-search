@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.salman.jobsearch.stage3</string>
+
+    <!-- The Telegram supervisor. This is the process that makes `/run 15` work.
+         Without it nothing in stage_3/ ever executes: the bot owns the only code
+         path that constructs an Orchestrator, so a machine with no such process
+         has no way to start a run, no progress card, and no notifications.
+         Orchestrator._notify is installed solely by bot.py:830 and the progress
+         editor solely by bot.py:227, which means every line of stage_3/render.py
+         is unreachable while this job is absent. It was absent.
+
+         This replaces the 08:00 com.salman.jobsearch.daily trigger rather than
+         joining it. Runs start when Salman asks for one from his phone, not on a
+         clock; see install_scheduler.sh, which no longer loads the daily job.
+
+         KeepAlive is unconditional here, unlike the selector's
+         KeepAlive/SuccessfulExit=false dict. The two are opposites on purpose:
+         the selector is a short-lived, on-demand listener whose token allows one
+         getUpdates consumer and which exits 0 for most outcomes it decides
+         deliberately, so restarting it on a clean exit would relaunch it straight
+         back into the same decision. This bot is the reverse: a long-lived
+         poller that should never be down, holding a *third* token of its own
+         (config.validate_token_isolation refuses to start otherwise), so it
+         cannot 409 against the selector or the Claude Code bot no matter how long
+         it polls. Any exit at all, clean or not, means phone control is dead and
+         the right response is to come back up.
+
+         A misconfiguration therefore becomes a 10s restart loop rather than a
+         silent absence. That is the intended trade: load_config raises
+         ConfigError naming the missing key, ThrottleInterval floors the retry,
+         and the reason lands in stage3-stderr.log on every pass. A loop that
+         says why is better than the failure this plist exists to fix, which
+         announced itself only by Telegram going quiet for three days. -->
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>-m</string>
+        <string>stage_3.bot</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- launchd's restart floor is 10s regardless; stating it makes the throttle
+         explicit rather than incidental. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/logs/daily/stage3-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/logs/daily/stage3-stderr.log</string>
+
+    <!-- Required, not cosmetic: ProgramArguments uses `-m stage_3.bot`, which
+         resolves the package against the working directory. -->
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd jobs do not inherit a login shell's PATH. lualatex lives in
+             /Library/TeX/texbin and the drafters shell out to it; claude is under
+             the nvm bin; tg-notify is in ~/.local/bin. Stage3Config.child_env
+             also prepends ~/.local/bin for the child, but this process runs
+             subprocesses of its own, so it needs a usable PATH itself. -->
+        <key>PATH</key>
+        <string>__HOME__/.nvm/versions/node/v24.19.0/bin:__HOME__/.bun/bin:__HOME__/.local/bin:/Library/TeX/texbin:/Library/Frameworks/Python.framework/Versions/3.10/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>TZ</key>
+        <string>Europe/Budapest</string>
+        <!-- Without this, Python block-buffers stdout when it is a file rather
+             than a tty, so the bot's own log trails minutes behind the run it is
+             supervising, exactly when it is being read to diagnose one. -->
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <!-- Belt and braces with config.child_env, which sets this for the
+             pipeline child unconditionally. Enrichment must never open a visible
+             browser window on an unattended run. -->
+        <key>LINKEDIN_PLAYWRIGHT_HEADLESS</key>
+        <string>true</string>
+    </dict>
+
+    <!-- No secrets here. STAGE3_BOT_TOKEN and the LinkedIn values are read by
+         load_config from ~/.jobsearch-stage3.env at mode 0600. This file is
+         committed to the repo, and `launchctl print` echoes EnvironmentVariables
+         to anyone who can run it. -->
+</dict>
+</plist>

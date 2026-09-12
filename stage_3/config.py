@@ -196,6 +196,14 @@ class Stage3Config:
             env["LINKEDIN_PLAYWRIGHT_STORAGE_STATE"] = str(
                 self.linkedin_storage_state
             )
+        # Headless is decided here, not inherited. enrich_linkedin.py:1057 reads this
+        # variable and only defaults to "true" when it is *absent*; a parent shell that
+        # exported LINKEDIN_PLAYWRIGHT_HEADLESS=false (a leftover from a manual debug
+        # session) would otherwise flow straight through into a visible Chromium on an
+        # unattended run. Setting it unconditionally closes that inheritance path.
+        env["LINKEDIN_PLAYWRIGHT_HEADLESS"] = (
+            "true" if self.playwright_headless else "false"
+        )
         env.update(extra or {})
         # Unsupported credentials stay out even if inherited from the process or
         # accidentally supplied as an orchestrator override.

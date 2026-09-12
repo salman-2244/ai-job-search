@@ -34,8 +34,16 @@ _LOG_RE = re.compile(r"^\[(?P<timestamp>\d{2}:\d{2}:\d{2})\]\s*(?P<message>.*)$"
 _PHASE_RE = re.compile(rf"\bPhase\s+(?P<phase>{_PHASE_ALTERNATION})(?![\w-])", re.IGNORECASE)
 _COUNT_RE = re.compile(
     r"(?:complete(?:\s+on\s+attempt[^:]*)?:\s*|offering\s+)(?P<count>\d+)\s+"
-    r"(?:of\s+\d+\s+)?(?:unique\s+)?(?:job|jobs|job\(s\))\b",
+    r"(?:of\s+\d+\s+)?(?:[a-z][a-z-]*\s+){0,2}?(?:job|jobs|job\(s\))\b",
     re.IGNORECASE,
+)
+#: A failure word with a count in front of it is an *item tally*, not a phase
+#: verdict. `Phase 1c complete: 25 of 25 job(s) enriched, 0 failed` is a success
+#: line that happens to contain "failed", and reading it as a verdict marked every
+#: healthy enrichment phase ❌ in Telegram. Stripped before the verdict is read, so
+#: a bare `Phase 2 failed` still convicts.
+_ITEM_TALLY_RE = re.compile(
+    r"\b\d+\s+(?:failed|failures?|timeouts?|timed\s+out)\b", re.IGNORECASE
 )
 _VALID_STATUSES = frozenset({"pending", "running", "done", "skipped", "failed"})
 
@@ -108,11 +116,19 @@ def parse_log_line(line: str) -> ParsedLogLine | None:
         return None
     phase_id = phase_match.group("phase").lower()
     lowered = message.lower()
-    if "failed" in lowered or "fatal" in lowered or "timeout" in lowered:
+    # Item tallies are removed first so a phase that finished with some of its
+    # items failing still reads as finished. `Phase 1c complete: ... 0 failed` is
+    # the line this exists for; `Phase 2 failed` keeps no digits and still convicts.
+    #
+    # The phase token goes first and is non-negotiable: the phase's *own* number is
+    # a digit, so `Phase 2 failed` is itself shaped exactly like an item tally and
+    # would be erased whole, turning a hard failure into a silent "running".
+    verdict = _ITEM_TALLY_RE.sub(" ", _PHASE_RE.sub(" phase ", lowered))
+    if "failed" in verdict or "fatal" in verdict or "timeout" in verdict:
         status = "failed"
-    elif "skipped" in lowered:
+    elif "skipped" in verdict:
         status = "skipped"
-    elif "complete" in lowered:
+    elif "complete" in verdict:
         status = "done"
     else:
         status = "running"
