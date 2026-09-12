@@ -1162,7 +1162,17 @@ fi
 #
 # The offered list is the full rankset, not $TOP5_FILE: the point of choosing by
 # hand is to see the jobs the gate rejected too.
-if (( SELECTED_JOBS > 0 )); then
+# RANKED_COUNT, not SELECTED_JOBS alone. SELECTED_JOBS is how many jobs went *into*
+# the ranker (line 890: len(rankset['results']), written by Phase 1b-final); it stays
+# at 15 whether Phase 2 succeeded, 401'd or timed out. Guarding on it alone is what
+# made the 2026-09-12 01:17 run hand Salman 15 cards it logged as "ranked" seconds
+# after the ranker had been rejected with HTTP 401 — the rankset records carry no
+# `score` key at all, so those were prerank-ordered jobs presented as deep-ranked
+# ones, and tapping any of them would have drafted a CV for a job nothing had
+# judged. RANKED_COUNT is the ranker's *output* count: 0 on timeout (line 1063), 0
+# on every failure path (line 1082), non-zero only when the model actually returned
+# records. Defaulted because line 316 already treats it as possibly-unset.
+if (( SELECTED_JOBS > 0 && ${RANKED_COUNT:-0} > 0 )); then
     log "Phase 3: offering $SELECTED_JOBS ranked job(s) on Telegram for selection"
 
     # The handoff. `launchctl kickstart` takes no arguments, so the rankset path
@@ -1188,6 +1198,14 @@ if (( SELECTED_JOBS > 0 )); then
         log "Phase 3 FAILED: could not start $SELECTOR_LABEL"
         echo "The ranked list could not be sent for selection: launchctl could not start $SELECTOR_LABEL. The ranking is intact in this report, and \`launchctl kickstart -k $SELECTOR_LABEL\` will send the list once the job is loaded. Until then no CVs or cover letters will be produced." >> "$WARN_FILE"
     fi
+elif (( SELECTED_JOBS > 0 )); then
+    # Shortlisted jobs exist but nothing scored them. Deliberately worded without
+    # the words failed/fatal/timeout: stage_3/progress.py reads these lines as phase
+    # verdicts, and any of those three would paint Phase 3 ❌ on the Telegram card
+    # for a phase that did the correct thing. Phase 2 already carries the ❌.
+    log "Phase 3: skipped (ranker returned no scores — the $SELECTED_JOBS shortlisted job(s) are unranked and were not offered)"
+    rm -f /tmp/jobsearch_pending_selection.json
+    echo "The $SELECTED_JOBS shortlisted jobs were NOT offered for selection, because the ranking step never scored them. They are real postings that passed every hard gate, but their order is the prerank heuristic and nothing has judged their fit — offering them would invite a CV to be drafted for a job no model has read. The shortlist is preserved; re-run with RESUME=1 to rank it without re-querying the portals." >> "$WARN_FILE"
 else
     log "Phase 3: skipped (no ranked jobs to offer)"
     # No pending selection, so retract any marker still naming a previous day's

@@ -39,11 +39,32 @@ class RankingResponseError(Exception):
     """The provider returned an unusable ranking response."""
 
 
+# How the credential is presented on the wire. Anthropic and every gateway that
+# speaks its Messages API accept two different credential kinds and they are NOT
+# interchangeable: a first-party key goes in `x-api-key`, and an OAuth-style or
+# gateway-issued token goes in `Authorization: Bearer`. Sending the second one in
+# the first one's header is a 401, not a fallback.
+AUTH_HEADER = "x-api-key"
+AUTH_BEARER = "bearer"
+
+# What this client calls itself. Configurable because some Anthropic-compatible
+# gateways refuse unrecognised clients outright: agentrouter.org answers this exact
+# string with 401 `unauthorized_client_error` while accepting a `claude-cli/...`
+# one, same token, same endpoint. That is a decision about how to represent
+# ourselves to a third party, so it is Salman's to make in settings, not a default
+# baked in here. Set RANK_USER_AGENT in the environment or in .claude/settings.json.
+DEFAULT_USER_AGENT = "ai-job-search-stage3/1.0"
+
+
 @dataclass(frozen=True)
 class RankingConfig:
     base_url: str
     model: str
     api_key: str
+    #: Defaults to the first-party scheme so a 3-argument construction keeps the
+    #: behaviour it had before this field existed.
+    auth_scheme: str = AUTH_HEADER
+    user_agent: str = DEFAULT_USER_AGENT
 
 
 def _setting(settings: Mapping[str, object], name: str) -> str:
@@ -57,12 +78,27 @@ def load_config(
     project_settings: Mapping[str, object],
     model_override: str | None = None,
 ) -> RankingConfig:
-    api_key = (
-        environ.get("ANTHROPIC_API_KEY", "").strip()
-        or environ.get("ANTHROPIC_AUTH_TOKEN", "").strip()
-        or _setting(project_settings, "ANTHROPIC_API_KEY")
-        or _setting(project_settings, "ANTHROPIC_AUTH_TOKEN")
-    )
+    # The slot a credential arrives in decides the header it leaves in. This
+    # ordering is the same one Claude Code itself applies, so a settings.json that
+    # works for the CLI works here without a second, differently-shaped config.
+    #
+    # Getting this wrong is silent and total: before 2026-09-12 every slot was read
+    # and every one of them was then sent as `x-api-key`. Salman's gateway
+    # credential lives in ANTHROPIC_AUTH_TOKEN, so the ranking call had never once
+    # succeeded — it 401'd, run_daily.sh classified 401 as non-retryable "auth/quota",
+    # and the run reported "class quota" as though a balance had run out.
+    api_key = ""
+    auth_scheme = AUTH_HEADER
+    for candidate, scheme in (
+        (environ.get("ANTHROPIC_API_KEY", "").strip(), AUTH_HEADER),
+        (environ.get("ANTHROPIC_AUTH_TOKEN", "").strip(), AUTH_BEARER),
+        (_setting(project_settings, "ANTHROPIC_API_KEY"), AUTH_HEADER),
+        (_setting(project_settings, "ANTHROPIC_AUTH_TOKEN"), AUTH_BEARER),
+    ):
+        if candidate:
+            api_key = candidate
+            auth_scheme = scheme
+            break
     model = (
         (model_override or "").strip()
         or environ.get("ANTHROPIC_MODEL", "").strip()
@@ -73,11 +109,16 @@ def load_config(
         or _setting(project_settings, "ANTHROPIC_BASE_URL")
         or DEFAULT_BASE_URL
     )
+    user_agent = (
+        environ.get("RANK_USER_AGENT", "").strip()
+        or _setting(project_settings, "RANK_USER_AGENT")
+        or DEFAULT_USER_AGENT
+    )
     if not api_key:
         raise RankingConfigError("ranking API credential is not configured")
     if not model:
         raise RankingConfigError("ranking model is not configured")
-    return RankingConfig(base_url, model, api_key)
+    return RankingConfig(base_url, model, api_key, auth_scheme, user_agent)
 
 
 def messages_endpoint(base_url: str) -> str:
@@ -114,14 +155,21 @@ def request_message(
         "max_tokens": 4096,
         "messages": [{"role": "user", "content": ranking_prompt}],
     }).encode("utf-8")
+    # Exactly one credential header. Sending both would leak the token into a
+    # header the gateway may log differently, and some gateways reject the pair
+    # outright rather than picking one.
+    if config.auth_scheme == AUTH_BEARER:
+        credential_header = {"Authorization": f"Bearer {config.api_key}"}
+    else:
+        credential_header = {AUTH_HEADER: config.api_key}
     request = urllib.request.Request(
         messages_endpoint(config.base_url),
         data=payload,
         headers={
-            "x-api-key": config.api_key,
+            **credential_header,
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json",
-            "User-Agent": "ai-job-search-stage3/1.0",
+            "User-Agent": config.user_agent,
         },
         method="POST",
     )
@@ -129,8 +177,21 @@ def request_message(
         with opener.open(request, timeout=timeout) as response:
             document = json.load(response)
     except urllib.error.HTTPError as exc:
+        # The body, not just the code. Swallowing it cost a full day of diagnosis on
+        # 2026-09-12: the status alone said 401, run_daily.sh classified that as
+        # "auth/quota", and the run reported an exhausted balance — while the body
+        # said `unauthorized_client_error: unauthorized client detected`, which is a
+        # rejected User-Agent and has nothing to do with the credential or the
+        # balance. Truncated because a gateway can return an HTML error page, and
+        # read defensively because a body is not guaranteed. The request is never
+        # echoed, so the credential cannot reach the log through here.
+        try:
+            detail = exc.read()[:300].decode("utf-8", "replace").strip().replace("\n", " ")
+        except Exception:  # noqa: BLE001 - a body we cannot read must not mask the status
+            detail = ""
         raise RankingRequestError(
             f"ranking API request failed with HTTP status {exc.code}"
+            + (f": {detail}" if detail else "")
         ) from None
     except (urllib.error.URLError, TimeoutError, OSError):
         raise RankingRequestError("ranking API request failed") from None
