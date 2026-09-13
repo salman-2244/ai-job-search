@@ -210,6 +210,13 @@ class JobRow:
     experience: str
     url: str
     raw: dict = field(default_factory=dict, repr=False)
+    # Appended after `raw`, all defaulted, so existing positional construction
+    # keeps working unchanged.
+    gates: dict = field(default_factory=dict, repr=False)
+    scores: dict = field(default_factory=dict, repr=False)
+    facts: dict = field(default_factory=dict, repr=False)
+    date_posted: str = ""
+    employment: str = ""
 
     @property
     def slug(self) -> str:
@@ -222,6 +229,78 @@ def _slug(text: str) -> str:
     cleaned = re.sub(r"[^\w\s-]", "", text or "", flags=re.UNICODE)
     cleaned = re.sub(r"[\s-]+", "_", cleaned).strip("_")
     return cleaned[:60] or "unknown"
+
+
+def _load_sibling(name: str):
+    """Import a sibling script by path, so this works run from any directory.
+
+    Same pattern prerank_jobs.py uses for hard_gates — one implementation,
+    imported, never a second copy that drifts.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: Salary and work mode. Descriptive facts, not gates — see posting_facts.py.
+_facts = _load_sibling("posting_facts")
+
+#: How each display verdict is marked. "unverified" gets its own glyph rather
+#: than borrowing the pass tick, because a gate that could not read the posting
+#: has not cleared the job and must not look as though it had.
+_GATE_ICON = {"pass": "✅", "fail": "❌", "unverified": "⬜"}
+
+#: Every gate hard_gates.evaluate() returns, in the order the card shows them:
+#: the ones Salman named first, then the rest. Nothing is hidden — a gate that
+#: exists in the pipeline but not in this tuple would be invisible on the card
+#: while still discarding jobs, which is the failure mode this ordering exists
+#: to make impossible to reintroduce quietly.
+_GATE_ORDER = (
+    ("language", "Language"),
+    ("experience", "Experience"),
+    ("sponsorship", "Sponsorship"),
+    ("geography", "Location"),
+    ("recency", "Recency"),
+    ("closed", "Open"),
+    ("seniority", "Seniority"),
+    ("pure_technical", "Scope"),
+)
+
+
+def _gate_detail(name: str, block: dict) -> str:
+    """The requirement a gate judged, in the posting's own terms.
+
+    Every branch reads a field the gate actually wrote. Where a gate exposes a
+    structured answer — the years it demanded, the languages it listed, whether
+    sponsorship was offered — that is preferred over its prose `reason`, because
+    the structured field is what the verdict was computed from. Falls back to
+    `reason`, and to nothing at all rather than inventing a requirement.
+    """
+    if not block:
+        return "no verdict recorded"
+    if name == "language":
+        required = block.get("languages_required") or []
+        if required:
+            return ", ".join(str(x) for x in required) + " required"
+    if name == "experience":
+        years = block.get("years_required")
+        if years is not None:
+            return f"{years} yrs demanded"
+    if name == "sponsorship":
+        if block.get("sponsorship_offered"):
+            return "offered"
+        bar = block.get("bar")
+        if bar:
+            return f"bar: {bar}"
+    # Geography only. Recency's marker is the posting date, which the card
+    # already shows on its own line — its `reason` ("posted 2 days ago") is the
+    # part that says what the verdict was actually measuring.
+    if name == "geography" and block.get("marker"):
+        return str(block["marker"])
+    return str(block.get("reason") or "no reason recorded")
 
 
 def _verdict(raw: Optional[str], *, enriched: bool) -> str:
@@ -283,8 +362,16 @@ def load_rankset(path: Path) -> list[JobRow]:
                 company=str(rec.get("company") or "unknown"),
                 title=str(rec.get("title") or "untitled"),
                 location=str(rec.get("location") or "n/a"),
-                score=prerank.get("score", rec.get("score")),
-                tier=str(prerank.get("hybrid_tier") or rec.get("verdict") or "n/a"),
+                # The ranker's own numbers win; prerank's are the fallback. The
+                # order used to be the other way round and was harmless only
+                # because `prerank` never survived into the ranker's output — now
+                # that it does, reading it first would quietly replace the LLM's
+                # overall score with the heuristic shortlist score on every card.
+                # The fallback stays because load_rankset is also pointed at bare
+                # prerank files, which carry no ranker score at all.
+                score=(rec["score"] if rec.get("score") is not None
+                       else prerank.get("score")),
+                tier=str(rec.get("verdict") or prerank.get("hybrid_tier") or "n/a"),
                 source=str(rec.get("portal") or "n/a"),
                 language=_verdict(
                     (gates.get("language") or {}).get("verdict"), enriched=enriched
@@ -294,6 +381,25 @@ def load_rankset(path: Path) -> list[JobRow]:
                 ),
                 url=str(rec.get("url") or ""),
                 raw=rec,
+                gates=gates,
+                scores=rec.get("scores") or {},
+                # Computed here rather than carried, because the ranker already
+                # forwards `posting_text` and re-deriving two regex answers from
+                # it costs nothing — whereas a fifth field on the wire is a fifth
+                # thing that can silently stop being written.
+                facts=_facts.extract({
+                    # `posting_text` is what the ranker forwards; the other two
+                    # are what a raw prerank/shortlist record carries. Reading
+                    # all three means the same row renders identically whichever
+                    # file load_rankset was pointed at.
+                    "description": (rec.get("posting_text")
+                                    or rec.get("description")
+                                    or rec.get("description_snippet") or ""),
+                    "title": rec.get("title") or "",
+                    "location": rec.get("location") or "",
+                }),
+                date_posted=str(rec.get("date_posted") or ""),
+                employment=str(rec.get("employmentType") or ""),
             )
         )
 
@@ -306,28 +412,189 @@ def load_rankset(path: Path) -> list[JobRow]:
     return rows
 
 
+#: Telegram's hard cap on one message body. Cards are built to fit by shedding
+#: whole blocks, never by cutting the string, so a card is never delivered with
+#: a severed HTML tag or half a gate verdict.
+MAX_MESSAGE_CHARS = 4096
+
+#: Longest one gate's detail text may run. A gate `reason` is prose and is
+#: occasionally long; clipping each keeps all eight readable rather than letting
+#: one verbose gate push the rest of the card into the shedding path.
+GATE_DETAIL_CHARS = 96
+
+
+def _clip(text: str, limit: int) -> str:
+    """Collapse whitespace and cap length, marking any cut with an ellipsis."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _days_ago(posted: str, *, today: Optional[date] = None) -> Optional[int]:
+    """Whole days since a posting date, or None when that cannot be read.
+
+    None for a future date too: a posting stamped tomorrow is a quirk of the
+    source, and "-1 days ago" would dress a data problem up as an age.
+    """
+    try:
+        when = date.fromisoformat(str(posted or "")[:10])
+    except ValueError:
+        return None
+    delta = ((today or date.today()) - when).days
+    return delta if delta >= 0 else None
+
+
+def render_gate_panel(row: JobRow, *, detail: bool = True) -> list[str]:
+    """Every gate's verdict, in fixed order, with what each one judged.
+
+    `detail=False` keeps the verdicts and drops the requirement text — the
+    panel's degraded form when a card would otherwise exceed Telegram's limit.
+    The verdicts themselves are never shed: the point of the panel is that the
+    reason a job is on the list is visible on the card that offers it.
+    """
+    e = html.escape
+    gates = row.gates if isinstance(row.gates, dict) else {}
+    enriched = bool((row.raw or {}).get("enriched"))
+
+    # The fixed order first, then anything else in the block that looks like a
+    # gate. A gate added to hard_gates.py and not to _GATE_ORDER still shows up
+    # here, rather than silently filtering jobs on a rule the card never names.
+    named = {name for name, _ in _GATE_ORDER}
+    extra = tuple((key, key.replace("_", " ").capitalize())
+                  for key, value in sorted(gates.items())
+                  if key not in named and isinstance(value, dict) and "verdict" in value)
+
+    tally = {"pass": 0, "fail": 0, "unverified": 0}
+    body: list[str] = []
+    for name, label in (*_GATE_ORDER, *extra):
+        block = gates.get(name)
+        block = block if isinstance(block, dict) else {}
+        verdict = _verdict(block.get("verdict"), enriched=enriched)
+        tally[verdict] += 1
+        line = f"{_GATE_ICON[verdict]} {e(label)}"
+        if detail:
+            line += f": {e(_clip(_gate_detail(name, block), GATE_DETAIL_CHARS))}"
+        body.append(line)
+
+    counts = " · ".join(f"{tally[word]} {word}"
+                        for word in ("pass", "fail", "unverified") if tally[word])
+    head = f"🚦 <b>Guardrails</b> — {counts}" if counts else (
+        "🚦 <b>Guardrails</b> — <i>no verdicts recorded</i>")
+
+    if detail:
+        # What the gates were allowed to read. This is the difference between
+        # "the posting says nothing about sponsorship" and "nobody fetched the
+        # posting", and without it every unverified line looks like the former.
+        source = gates.get("evidence_source")
+        chars = gates.get("evidence_chars")
+        if source:
+            note = f"📄 judged on {e(_clip(str(source), 40))}"
+            if isinstance(chars, int):
+                note += f", {chars:,} chars"
+            body.append(note)
+
+    return [head, *body]
+
+
 def render_job(row: JobRow) -> str:
-    """One job's message body, Telegram HTML.
+    """One job's card, Telegram HTML, guaranteed to fit MAX_MESSAGE_CHARS.
 
     Every interpolated field comes from scraped posting data, so all of it is
     html-escaped: a title containing '<' must not become markup.
+
+    The card is assembled from blocks ordered least-important first. If the
+    result would exceed Telegram's limit the leading block is dropped whole and
+    the card rebuilt, repeatedly; the header, the guardrail panel and the link
+    are never shed. A squeezed card therefore loses context, never verdicts, and
+    because only whole lines are ever dropped it never ends mid-tag.
     """
     e = html.escape
-    lines = [
-        f"<b>{row.idx + 1}. {e(row.company)}</b>",
-        e(row.title),
-        "",
-        f"📍 {e(row.location)}",
-        f"📊 score <b>{e(str(row.score))}</b> · fit <b>{e(row.tier)}</b>",
-        f"🔎 source {e(row.source)}",
-        f"🗣 language {e(row.language)} · 🧭 experience {e(row.experience)}",
-    ]
-    url = safe_url(row.url)
-    if url:
-        lines.append(f'\n<a href="{e(url, quote=True)}">open posting</a>')
+    facts = row.facts if isinstance(row.facts, dict) else {}
+    scores = row.scores if isinstance(row.scores, dict) else {}
+    unknown = getattr(_facts, "UNKNOWN", "unknown")
+
+    def fact(name: str) -> str:
+        value = (facts.get(name) or {}).get("value")
+        return str(value) if value else unknown
+
+    # Clipped because the header is the one block that is never shed: an
+    # 8000-character title (boards do emit them) would otherwise push the card
+    # past the limit with nothing left to drop, and the last-resort hard slice
+    # is the only path in this function that can sever a tag.
+    header = [f"<b>{row.idx + 1}. {e(_clip(row.company, 120))}</b>",
+              e(_clip(row.title, 200)), ""]
+
+    if row.date_posted:
+        age = _days_ago(row.date_posted)
+        posted = f"🗓 posted {e(_clip(row.date_posted, 40))}"
+        if age == 0:
+            posted += " (today)"
+        elif age == 1:
+            posted += " (yesterday)"
+        elif age is not None:
+            posted += f" ({age} days ago)"
     else:
-        lines.append("\n<i>no usable link</i>")
-    return "\n".join(lines)
+        posted = "🗓 posted unknown"
+
+    breakdown = " · ".join(
+        f"{name} {e(str(scores[name]))}"
+        for name in ("technical", "experience", "behavioral", "career")
+        if scores.get(name) is not None
+    )
+    overall = row.score if row.score is not None else "unknown"
+
+    #: (shed rank, lines) in *reading* order. Rank orders the squeeze, lowest
+    #: shed first, and is deliberately independent of position: source and
+    #: employment type go first because they are the least decision-changing,
+    #: and location goes last because a card without it barely describes a job.
+    #: Keeping the two orders separate is the whole point — the earlier version
+    #: reused one list for both and printed the card in shed order, so it read
+    #: source, salary, score, location, bottom-up.
+    blocks = [
+        (4, [f"📍 {e(row.location)} · 🏠 {e(fact('work_mode'))}"]),
+        (2, [f"💰 {e(_clip(fact('salary'), 80))}", posted]),
+        (0, [f"🔎 {e(row.source)}" + (f" · {e(_clip(row.employment, 40))}"
+                                      if row.employment else "")]),
+        (3, [f"📊 overall <b>{e(str(overall))}</b> · fit <b>{e(row.tier)}</b>"]),
+        (1, [f"   {breakdown}"] if breakdown else []),
+    ]
+    shed_levels = len({rank for rank, _ in blocks}) + 1
+
+    url = safe_url(row.url)
+    link = (f'🔗 <a href="{e(url, quote=True)}">open posting</a>' if url
+            else "🔗 <i>no usable link</i>")
+
+    def assemble(shed: int, *, detail: bool, gates: Optional[list[str]] = None) -> str:
+        kept = [line for rank, block in blocks if rank >= shed for line in block]
+        panel = gates if gates is not None else render_gate_panel(row, detail=detail)
+        return "\n".join([*header, *kept, "", *panel, "", link])
+
+    # Full gate detail with no context beats context with no gate detail, so
+    # detail is surrendered only after every context block has already gone.
+    # The inner loop restarts from shed=0 on the second pass because dropping
+    # the detail text frees far more room than the context lines occupied —
+    # without the restart a card with 40 gates lost its source, salary and
+    # location while sitting 3,000 characters under the limit.
+    for detail in (True, False):
+        for shed in range(shed_levels):
+            text = assemble(shed, detail=detail)
+            if len(text) <= MAX_MESSAGE_CHARS:
+                return text
+
+    # Even verdict-only does not fit: hide whole gate lines from the bottom and
+    # say how many. A card that silently showed seven of nine gates would be
+    # worse than one that admits it could not fit them.
+    full = render_gate_panel(row, detail=False)
+    panel = list(full)
+    while len(panel) > 1:
+        # Pop first, then count, so the marker reports gates actually removed.
+        panel.pop()
+        hidden = len(full) - len(panel)
+        marker = (f"⚠️ {hidden} more gate{'' if hidden == 1 else 's'} "
+                  "hidden (message limit)")
+        text = assemble(shed_levels, detail=False, gates=[*panel, marker])
+        if len(text) <= MAX_MESSAGE_CHARS:
+            return text
+    return text[:MAX_MESSAGE_CHARS]
 
 
 def toggle_label(selected: bool) -> str:

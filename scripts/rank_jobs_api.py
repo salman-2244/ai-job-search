@@ -414,6 +414,20 @@ def derive_outputs(
             "location_gate": decision["location_gate"],
             "language_gate": decision["language_gate"],
             "posting_text": job.get("description") or job.get("description_snippet") or "",
+            # Carried, not recomputed. hard_gates.evaluate() runs at prerank and
+            # writes all eight verdicts here; this record is what feeds the
+            # Telegram card (run_daily.sh passes $TOP5_FILE to the selector), and
+            # until now it dropped the block on the floor. telegram_select reads
+            # `prerank.gates` and was getting {}, so every card ever sent said
+            # "language unverified · experience unverified" — not because a gate
+            # was unsure, but because its answer never left Phase 1b.
+            "prerank": job.get("prerank") or {},
+            # Both are on the job record and neither survived either. The card
+            # states when a posting went up, and recency's own verdict is only
+            # half the story: "PASS" does not say whether that means two days old
+            # or forty-four.
+            "date_posted": job.get("date_posted"),
+            "employmentType": job.get("employmentType"),
         }
         if "repeat" in job:
             result["repeat"] = job["repeat"]

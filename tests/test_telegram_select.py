@@ -18,6 +18,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -170,7 +171,7 @@ class TestRenderJob(RanksetBase):
     def test_includes_every_field_the_list_promises(self):
         out = ts.render_job(self.one())
         for expected in ("ExampleCo", "AI Analyst", "Budapest", "100", "strong",
-                         "linkedin-alert", "language pass", "experience pass"):
+                         "linkedin-alert", "✅ Language", "✅ Experience"):
             with self.subTest(field=expected):
                 self.assertIn(expected, out)
         self.assertIn('href="https://example.com/jobs/1"', out)
@@ -196,6 +197,176 @@ class TestRenderJob(RanksetBase):
         out = ts.render_job(self.one(url="javascript:alert(1)"))
         self.assertIn("no usable link", out)
         self.assertNotIn("javascript:", out)
+
+
+def gated(**verdicts):
+    """A record whose gate block answers every gate, PASS unless overridden."""
+    block = {name: {"verdict": verdicts.get(name, "PASS")}
+             for name, _ in ts._GATE_ORDER}
+    block.update(overall="PASS", failed=[],
+                 evidence_source="description", evidence_chars=4321)
+    return rec(prerank={"score": 80, "hybrid_tier": "strong", "gates": block})
+
+
+class TestGuardrailPanel(RanksetBase):
+    """The panel is the reason the card exists: it says why a job is on the list.
+
+    Before this, the ranker discarded the prerank gate block, so `gates` arrived
+    empty and every card claimed "unverified" for jobs whose gates had in fact
+    returned concrete verdicts. These tests pin the two halves of the fix: the
+    verdicts reach the card, and an absent verdict still reads as unverified.
+    """
+
+    def test_every_gate_in_the_pipeline_is_named_on_the_card(self):
+        out = ts.render_job(self.one(prerank=gated()["prerank"]))
+        for _, label in ts._GATE_ORDER:
+            with self.subTest(gate=label):
+                self.assertIn(f"✅ {label}", out)
+
+    def test_a_failing_gate_is_marked_and_counted(self):
+        out = ts.render_job(self.one(prerank=gated(experience="FAIL")["prerank"]))
+        self.assertIn("❌ Experience", out)
+        self.assertIn("7 pass · 1 fail", out)
+
+    def test_an_unknown_gate_never_reads_as_a_pass(self):
+        out = ts.render_job(self.one(prerank=gated(sponsorship="UNKNOWN")["prerank"]))
+        self.assertIn("⬜ Sponsorship", out)
+        self.assertNotIn("✅ Sponsorship", out)
+
+    def test_a_missing_gate_block_is_unverified_not_absent(self):
+        """Eight verdicts always, even when the block never arrived."""
+        out = ts.render_job(self.one(prerank={"score": 1}))
+        self.assertEqual(out.count("⬜"), len(ts._GATE_ORDER))
+        self.assertIn("8 unverified", out)
+
+    def test_a_gate_the_display_order_does_not_know_still_appears(self):
+        """A new gate in hard_gates.py must not become an invisible filter."""
+        block = gated()["prerank"]["gates"]
+        block["clearance"] = {"verdict": "FAIL", "reason": "security clearance required"}
+        out = ts.render_job(self.one(prerank={"score": 80, "gates": block}))
+        self.assertIn("Clearance", out)
+        self.assertIn("security clearance required", out)
+
+    def test_gate_detail_reports_what_the_gate_measured(self):
+        block = gated()["prerank"]["gates"]
+        block["experience"] = {"verdict": "FAIL", "years_required": 5,
+                               "reason": "5+ years stated as a hard requirement"}
+        block["language"] = {"verdict": "PASS", "languages_required": ["English"]}
+        out = ts.render_job(self.one(prerank={"score": 80, "gates": block}))
+        self.assertIn("5 yrs demanded", out)
+        self.assertIn("English required", out)
+
+    def test_evidence_source_is_shown_so_unverified_is_interpretable(self):
+        out = ts.render_job(self.one(prerank=gated()["prerank"]))
+        self.assertIn("judged on description", out)
+        self.assertIn("4,321 chars", out)
+
+    def test_gate_text_from_a_posting_is_escaped(self):
+        block = gated()["prerank"]["gates"]
+        block["closed"] = {"verdict": "FAIL", "reason": "<script>alert(1)</script>"}
+        out = ts.render_job(self.one(prerank={"score": 80, "gates": block}))
+        self.assertNotIn("<script>", out)
+        self.assertIn("&lt;script&gt;", out)
+
+
+class TestCardFacts(RanksetBase):
+    """Salary, work mode and posting age — extracted, never guessed."""
+
+    def test_a_stated_salary_and_mode_are_surfaced(self):
+        out = ts.render_job(self.one(
+            posting_text="Fully remote role. We offer €60,000 - €80,000 per year."))
+        self.assertIn("60,000", out)
+        self.assertIn("🏠 remote", out)
+
+    def test_a_silent_posting_says_unknown_rather_than_guessing(self):
+        out = ts.render_job(self.one(posting_text="We are hiring an analyst."))
+        self.assertIn("💰 unknown", out)
+        self.assertIn("🏠 unknown", out)
+
+    def test_posting_age_is_computed_from_the_date(self):
+        self.assertEqual(ts._days_ago("2026-09-10", today=date(2026, 9, 13)), 3)
+        self.assertEqual(ts._days_ago("2026-09-13T08:00:00Z", today=date(2026, 9, 13)), 0)
+
+    def test_an_unreadable_or_future_date_yields_no_age(self):
+        for stamp in ("", "soon", "2026-13-45", "2026-09-20"):
+            with self.subTest(stamp=stamp):
+                self.assertIsNone(ts._days_ago(stamp, today=date(2026, 9, 13)))
+
+    def test_a_missing_date_says_unknown(self):
+        self.assertIn("🗓 posted unknown", ts.render_job(self.one()))
+
+    def test_the_ranker_score_wins_over_the_prerank_score(self):
+        """Both now reach the selector; the LLM's overall is the one shown."""
+        row = self.one(score=82, verdict="strong",
+                       scores={"technical": 85, "experience": 70,
+                               "behavioral": 80, "career": 88})
+        self.assertEqual(row.score, 82)
+        out = ts.render_job(row)
+        self.assertIn("overall <b>82</b>", out)
+        self.assertIn("technical 85", out)
+        self.assertNotIn("overall <b>100</b>", out)
+
+
+class TestCardFitsTelegram(RanksetBase):
+    """Telegram rejects a body over 4096 chars, so the card must fit by design."""
+
+    def big(self, gates_extra=0, **over):
+        block = gated()["prerank"]["gates"]
+        for i in range(gates_extra):
+            block[f"extra_gate_{i}"] = {
+                "verdict": "PASS",
+                "reason": "a long explanation of what this gate measured " * 3,
+            }
+        return self.one(prerank={"score": 80, "gates": block}, **over)
+
+    def test_a_normal_card_is_well_under_the_limit(self):
+        self.assertLess(len(ts.render_job(self.big())), ts.MAX_MESSAGE_CHARS)
+
+    def test_an_oversized_card_keeps_every_verdict_and_the_link(self):
+        out = ts.render_job(self.big(gates_extra=60))
+        self.assertLessEqual(len(out), ts.MAX_MESSAGE_CHARS)
+        self.assertEqual(out.count("✅") + out.count("❌") + out.count("⬜"),
+                         len(ts._GATE_ORDER) + 60)
+        self.assertIn("open posting", out)
+
+    def test_context_is_shed_before_the_guardrail_panel(self):
+        """32 extra gates: just over the limit, so the first block goes."""
+        out = ts.render_job(self.big(gates_extra=32))
+        self.assertLessEqual(len(out), ts.MAX_MESSAGE_CHARS)
+        self.assertNotIn("linkedin-alert", out)   # least important, shed first
+        self.assertIn("🚦", out)                   # panel survives
+        self.assertIn("long explanation", out)    # so does its detail text
+
+    def test_gate_detail_is_surrendered_before_any_verdict_is(self):
+        """Far past the limit: detail goes, all 68 verdicts stay."""
+        out = ts.render_job(self.big(gates_extra=60))
+        self.assertNotIn("long explanation", out)
+        self.assertIn("🚦", out)
+
+    def test_context_returns_once_dropping_detail_frees_room(self):
+        out = ts.render_job(self.big(gates_extra=60))
+        self.assertIn("linkedin-alert", out)
+        self.assertIn("📍 Budapest", out)
+
+    def test_hidden_gates_are_admitted_rather_than_dropped_silently(self):
+        out = ts.render_job(self.big(gates_extra=400))
+        self.assertLessEqual(len(out), ts.MAX_MESSAGE_CHARS)
+        self.assertIn("hidden (message limit)", out)
+        self.assertIn("open posting", out)
+
+    def test_a_monstrous_title_cannot_overflow_the_header(self):
+        out = ts.render_job(self.big(title="Senior " * 2000))
+        self.assertLessEqual(len(out), ts.MAX_MESSAGE_CHARS)
+        self.assertIn("🚦", out)
+
+    def test_callback_data_stays_inside_telegrams_64_byte_cap(self):
+        for idx in (0, 9, 99, 999):
+            payload = f"{ts.CB_TOGGLE}:{idx}"
+            with self.subTest(idx=idx):
+                self.assertLessEqual(len(payload.encode("utf-8")), 64)
+        for payload in (ts.CB_ALL, ts.CB_NONE, ts.CB_SUBMIT):
+            with self.subTest(payload=payload):
+                self.assertLessEqual(len(payload.encode("utf-8")), 64)
 
 
 class TestControls(unittest.TestCase):
