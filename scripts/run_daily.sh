@@ -994,7 +994,15 @@ rank_error_class() {
             # contain "quota", so a rejected credential was reported to Salman's
             # phone as an exhausted balance. Name one cause, not two.
             echo "non-retryable (auth)" ;;
-        *"credit balance"*|*"insufficient"*)
+        *"credit balance"*|*"insufficient"*|*"402"*|*"budget pool"*|\
+        *"quota has been exhausted"*|*"exceeded your current quota"*)
+            # 402 belongs here, not in the transient bucket below. On 2026-09-12 the
+            # gateway answered "Budget pool quota has been exhausted" and this
+            # function had no case for it, so it returned "unclassified": the run
+            # spent all three attempts with 40s backoffs on a balance that cannot
+            # refill mid-run, and orchestrator._classify_error then read the words
+            # "last classified unclassified", matched no marker, and reported the one
+            # genuine quota failure to Salman as "transient" — i.e. as retryable.
             echo "non-retryable (quota)" ;;
         *"503"*|*"no available channel"*)
             echo "gateway-unavailable" ;;

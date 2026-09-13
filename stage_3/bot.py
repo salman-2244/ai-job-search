@@ -34,6 +34,7 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -66,6 +67,16 @@ from .schedules import (
 #: only changes on meaningful log lines, so this bounds edit rate without a
 #: dedicated token bucket.
 EDITOR_POLL_SECONDS = 3.0
+#: Floor on the gap between two edits of the same card. Telegram throttles
+#: edit_message_text per chat, and render_run emits a once-per-second
+#: "last update Ns ago" line while a run is stalled — so every poll during a
+#: long phase produced different text and earned another edit. Run
+#: 20260912T073902Z spent its 40s ranking backoff doing exactly that until every
+#: call came back RetryAfter and the card froze at 63%.
+EDIT_MIN_INTERVAL_SECONDS = 5.0
+#: Never honour a server-supplied backoff longer than this in one sleep; the
+#: loop will simply come back round if the throttle is still in force.
+EDIT_MAX_BACKOFF_SECONDS = 60.0
 SCHEDULER_INTERVAL_SECONDS = 60.0
 
 LOGGER = logging.getLogger("stage_3.bot")
@@ -232,8 +243,9 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
     """Edit one message as the run progresses; owns its run's terminal update.
 
     Polls the handle (state only changes on meaningful log lines) and is woken
-    early by the handle's subscription. Edit failures are swallowed and retried
-    on the next tick — a transient Telegram hiccup must not kill the monitor.
+    early by the handle's subscription. A rejected edit leaves ``last_text``
+    untouched so the next tick retries that frame: the card must never be left
+    showing content Telegram refused to accept.
     """
     loop = asyncio.get_running_loop()
     wake = asyncio.Event()
@@ -243,8 +255,20 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
 
     handle.subscribe(_subscriber)
     last_text: str | None = None
+    next_edit_at = 0.0
 
-    async def _edit(text: str) -> None:
+    async def _edit(text: str) -> bool:
+        """Push one frame, returning True only if the card now shows ``text``.
+
+        The caller uses the verdict to decide whether the frame was delivered.
+        Reporting success unconditionally is what froze run 20260912T073902Z at
+        63%: every edit came back RetryAfter, each one was recorded as sent, and
+        nothing ever retried them.
+        """
+        nonlocal next_edit_at
+        delay = next_edit_at - loop.time()
+        if delay > 0:
+            await asyncio.sleep(delay)
         LOGGER.info(
             "telegram api call method=edit_message_text chat_id=%s message_id=%s preview=%s",
             chat_id, message_id, safe_preview(text),
@@ -254,25 +278,56 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
                 text, chat_id=chat_id, message_id=message_id,
                 parse_mode=ParseMode.HTML,
             )
-            LOGGER.info(
-                "telegram api success method=edit_message_text chat_id=%s message_id=%s result=%s",
-                chat_id, message_id, type(result).__name__,
+        except RetryAfter as exc:
+            # Respect the server's own number rather than guessing. retry_after is
+            # an int on python-telegram-bot v20 and a timedelta on some later
+            # builds, so accept either.
+            raw = getattr(exc, "retry_after", 0)
+            seconds = (
+                raw.total_seconds() if hasattr(raw, "total_seconds") else float(raw or 0)
             )
-        except Exception as exc:
+            backoff = min(max(seconds, EDIT_MIN_INTERVAL_SECONDS), EDIT_MAX_BACKOFF_SECONDS)
+            next_edit_at = loop.time() + backoff
+            LOGGER.warning(
+                "telegram api throttled method=edit_message_text chat_id=%s message_id=%s "
+                "backoff_seconds=%s preview=%s",
+                chat_id, message_id, backoff, safe_preview(text),
+            )
+            return False
+        except BadRequest as exc:
+            if "not modified" in str(exc).lower():
+                # The card already carries this text, so there is nothing to retry
+                # and nothing to resend. Treat it as delivered.
+                next_edit_at = loop.time() + EDIT_MIN_INTERVAL_SECONDS
+                return True
             LOGGER.warning(
                 "telegram api failure method=edit_message_text chat_id=%s message_id=%s "
                 "exception_type=%s preview=%s",
                 chat_id, message_id, type(exc).__name__, safe_preview(text),
                 exc_info=True,
             )
+            return False
+        except Exception as exc:  # noqa: BLE001 - a broken edit must not kill the monitor
+            LOGGER.warning(
+                "telegram api failure method=edit_message_text chat_id=%s message_id=%s "
+                "exception_type=%s preview=%s",
+                chat_id, message_id, type(exc).__name__, safe_preview(text),
+                exc_info=True,
+            )
+            return False
+        next_edit_at = loop.time() + EDIT_MIN_INTERVAL_SECONDS
+        LOGGER.info(
+            "telegram api success method=edit_message_text chat_id=%s message_id=%s result=%s",
+            chat_id, message_id, type(result).__name__,
+        )
+        return True
 
     try:
         while True:
             state = handle.state
             if state is not None:
                 text = render_run(state, now=time.monotonic())
-                if text != last_text:
-                    await _edit(text)
+                if text != last_text and await _edit(text):
                     last_text = text
             if not handle.is_running:
                 break
@@ -282,10 +337,13 @@ async def _progress_editor(bot, chat_id, message_id, handle, context) -> None:
             except asyncio.TimeoutError:
                 pass
         # Final render, so the last meaningful line is never lost to the throttle.
+        # This frame carries the terminal verdict, so keep retrying it past a
+        # throttle instead of dropping it the way an intermediate frame is dropped.
         if handle.state is not None:
             text = render_run(handle.state, now=time.monotonic())
-            if text != last_text:
-                await _edit(text)
+            for _ in range(3):
+                if text == last_text or await _edit(text):
+                    break
     except asyncio.CancelledError:
         raise
     finally:

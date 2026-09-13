@@ -80,6 +80,13 @@ _ERROR_CLASSES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("quota", ("quota", "rate limit", "429")),
     ("credit", ("credit", "billing", "payment")),
     ("timeout", ("timeout", "timed out")),
+    # Last, so every real class above still wins. run_daily.sh says
+    # "unclassified" when its own matcher recognised nothing, and that word has
+    # to survive the trip rather than being rounded up to "transient" by the
+    # fallback below: calling a failure transient asserts that waiting will fix
+    # it, and the one thing an unclassified failure tells us is that we do not
+    # know that. "unknown" is the honest label and points Salman at the log.
+    ("unknown", ("unclassified",)),
 )
 
 
